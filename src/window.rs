@@ -35,6 +35,7 @@ unsafe extern "system" {
 
 use crate::clipboard::{self, ClipboardHistory, ClipboardItem};
 use crate::clock::ClockEngine;
+use crate::config::AUTO_COLLAPSE_TIMER_ID;
 use crate::config::{
     ANIMATION_FRAME_INTERVAL_MS, ANIMATION_TIMER_ID, AnimationState, CLIPBOARD_SETTLE_MS,
     CLIPBOARD_TIMER_ID, CLOCK_TIMER_ID, MEDIA_FEEDBACK_FRAME_MS, MEDIA_FEEDBACK_TIMER_ID,
@@ -56,6 +57,9 @@ use crate::settings_window;
 use crate::space::{NottSettings, NottSpace, PANEL_SPACE, Scene};
 use windows::Win32::System::Ole::{
     OleInitialize, OleUninitialize, RegisterDragDrop, RevokeDragDrop,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GA_ROOT, GetAncestor, WM_INPUT, WM_MBUTTONDOWN, WM_RBUTTONDOWN, WindowFromPoint,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     HWND_NOTOPMOST, SET_WINDOW_POS_FLAGS, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
@@ -133,6 +137,10 @@ struct WindowState {
     settings: NottSettings,
     /// The Settings page is open over the active space (which stays selected).
     settings_open: bool,
+    /// Outside-click auto-collapse (see `GracePeriod`), and whether the Raw
+    /// Input sink that reports outside clicks is registered (expanded only).
+    grace: GracePeriod,
+    outside_watch: bool,
     /// The Clipboard space asks "Clear clipboard history?" (Cancel / Clear).
     /// Any view change (space, Settings page, collapse) cancels it.
     clear_pending: bool,
@@ -194,7 +202,9 @@ impl WindowState {
     /// Starts the short-lived control feedback timer if a hover/press level needs
     /// to animate. It stops itself once every level reaches its target.
     fn kick_feedback(&mut self, hwnd: HWND) {
-        if self.feedback_tick.is_none() && self.renderer.feedback().is_animating() {
+        let animating =
+            self.renderer.feedback().is_animating() || self.renderer.switches_animating();
+        if self.feedback_tick.is_none() && animating {
             self.feedback_tick = Some(std::time::Instant::now());
             unsafe {
                 let _ = SetTimer(
@@ -355,6 +365,8 @@ impl WindowState {
         self.renderer
             .set_settings(self.settings_open, self.settings);
         settings_window::sync(self.settings);
+        // The page's switch slides (control-feedback timer)
+        self.kick_feedback(hwnd);
         self.redraw(hwnd);
         notify_accessibility_state_changed(
             hwnd,
@@ -428,6 +440,51 @@ impl WindowState {
         }
     }
 
+    /// Feeds the outside-click grace period and carries out its decision:
+    /// (re)start or stop the one-shot timer, or collapse through the normal
+    /// (Phase 6.1) path.
+    fn grace(&mut self, hwnd: HWND, event: GraceEvent) {
+        match self.grace.handle(event, self.expanded_or_expanding()) {
+            GraceAction::None => {}
+            GraceAction::Arm => unsafe {
+                // Same id: re-arming restarts the countdown, for the
+                // currently selected duration
+                let ms = self.settings.collapse_delay.ms();
+                let _ = SetTimer(Some(hwnd), AUTO_COLLAPSE_TIMER_ID, ms, None);
+            },
+            GraceAction::Disarm => unsafe {
+                let _ = KillTimer(Some(hwnd), AUTO_COLLAPSE_TIMER_ID);
+            },
+            GraceAction::Collapse => {
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), AUTO_COLLAPSE_TIMER_ID);
+                }
+                self.reset_feedback(hwnd);
+                let _ = start_or_reverse_animation(hwnd, self);
+            }
+        }
+    }
+
+    /// Registers / removes the Raw Input sink that reports mouse buttons
+    /// anywhere (the notch never activates, so it is not told otherwise):
+    /// only while the notch is (becoming) expanded.
+    fn set_outside_watch(&mut self, hwnd: HWND, on: bool) {
+        if self.outside_watch != on && watch_outside_clicks(hwnd, on) {
+            self.outside_watch = on;
+        }
+    }
+
+    /// Uses a notch closing delay: a countdown already running restarts with
+    /// it; later outside clicks use it too.
+    fn set_collapse_delay(&mut self, hwnd: HWND, delay: crate::config::CollapseDelay) {
+        if std::mem::replace(&mut self.settings.collapse_delay, delay) != delay {
+            self.renderer
+                .set_settings(self.settings_open, self.settings);
+            settings_window::sync(self.settings);
+            self.grace(hwnd, GraceEvent::DelayChanged);
+        }
+    }
+
     /// Shows / dismisses the Clipboard space's clear confirmation (the caller
     /// redraws). Its buttons replace the rows: drop stale hover / press.
     fn set_clear_pending(&mut self, hwnd: HWND, pending: bool) {
@@ -482,6 +539,8 @@ impl WindowState {
         self.renderer
             .set_settings(self.settings_open, self.settings);
         settings_window::sync(self.settings);
+        // The page's switch slides (control-feedback timer)
+        self.kick_feedback(hwnd);
         self.redraw(hwnd);
         notify_accessibility_state_changed(
             hwnd,
@@ -631,6 +690,7 @@ impl WindowState {
         };
         match event {
             DragEvent::Enter { images, at } => {
+                self.grace(hwnd, GraceEvent::NottInteraction);
                 self.drag.enter(images);
                 over(self, at)
             }
@@ -751,6 +811,141 @@ fn clear_flow(hit: PanelHit, confirm: bool, pending: &mut bool, history: &mut Cl
     }
 }
 
+/// Outside-click auto-collapse. The expanded notch stays open until a click
+/// lands outside Nott; that starts a grace period (`AUTO_COLLAPSE_MS`), and a
+/// later outside click restarts it. Using Nott (a click in the notch, a drag
+/// onto it, the Settings window) cancels it; so does any expand / collapse.
+/// When it runs out the notch collapses through the normal path.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct GracePeriod {
+    pending: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraceEvent {
+    OutsideClick,
+    NottInteraction,
+    StateChanged,
+    TimerFired,
+    /// The closing delay setting changed.
+    DelayChanged,
+}
+
+/// What the window does for an event: (re)start the one-shot timer, stop
+/// it, collapse, or nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraceAction {
+    None,
+    Arm,
+    Disarm,
+    Collapse,
+}
+
+impl GracePeriod {
+    /// `expanded`: the notch is expanded or expanding.
+    pub fn handle(&mut self, event: GraceEvent, expanded: bool) -> GraceAction {
+        match event {
+            GraceEvent::OutsideClick if expanded => {
+                self.pending = true;
+                GraceAction::Arm
+            }
+            GraceEvent::OutsideClick => GraceAction::None,
+            GraceEvent::NottInteraction | GraceEvent::StateChanged => {
+                if std::mem::take(&mut self.pending) {
+                    GraceAction::Disarm
+                } else {
+                    GraceAction::None
+                }
+            }
+            // A new duration restarts a pending countdown with it
+            GraceEvent::DelayChanged if self.pending => GraceAction::Arm,
+            GraceEvent::DelayChanged => GraceAction::None,
+            // A fire with nothing pending is stale (cancelled meanwhile)
+            GraceEvent::TimerFired => {
+                if std::mem::take(&mut self.pending) && expanded {
+                    GraceAction::Collapse
+                } else {
+                    GraceAction::Disarm
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn pending(&self) -> bool {
+        self.pending
+    }
+}
+
+impl GraceEvent {
+    const ALL: [Self; 5] = [
+        Self::OutsideClick,
+        Self::NottInteraction,
+        Self::StateChanged,
+        Self::TimerFired,
+        Self::DelayChanged,
+    ];
+}
+
+/// Posted to the notch with a `GraceEvent` index (from Raw Input, the
+/// Settings window, or the timer) so it is applied through the state guard.
+pub const WM_APP_GRACE: u32 = WM_APP + 40;
+
+/// Whose a click is, by the top-level window under it: the notch itself
+/// (handled by its own mouse messages), Nott's Settings window (Nott in use),
+/// or anything else (outside). The notch's transparent margins pass clicks
+/// through, so they count as outside.
+fn classify_click(root: HWND, notch: HWND, settings: Option<HWND>) -> Option<GraceEvent> {
+    if root == notch {
+        None
+    } else if Some(root) == settings {
+        Some(GraceEvent::NottInteraction)
+    } else {
+        Some(GraceEvent::OutsideClick)
+    }
+}
+
+/// Registers (`on`) or removes this process's Raw Input mouse sink: button
+/// presses are reported to `hwnd` even while another app is in front.
+/// Read-only (input still reaches its target unchanged); true on success.
+fn watch_outside_clicks(hwnd: HWND, on: bool) -> bool {
+    use windows::Win32::UI::Input::{
+        RAWINPUTDEVICE, RIDEV_INPUTSINK, RIDEV_REMOVE, RegisterRawInputDevices,
+    };
+    let device = RAWINPUTDEVICE {
+        usUsagePage: 0x01, // generic desktop
+        usUsage: 0x02,     // mouse
+        dwFlags: if on { RIDEV_INPUTSINK } else { RIDEV_REMOVE },
+        hwndTarget: if on { hwnd } else { HWND::default() },
+    };
+    unsafe {
+        RegisterRawInputDevices(&[device], std::mem::size_of::<RAWINPUTDEVICE>() as u32).is_ok()
+    }
+}
+
+/// Whether a `WM_INPUT` is a mouse button going down (moves are ignored).
+fn raw_button_down(lparam: LPARAM) -> bool {
+    use windows::Win32::UI::Input::{
+        GetRawInputData, HRAWINPUT, RAWINPUT, RAWINPUTHEADER, RID_INPUT, RIM_TYPEMOUSE,
+    };
+    // Left, right, middle, X1, X2 down
+    const DOWNS: u16 = 0x0001 | 0x0004 | 0x0010 | 0x0040 | 0x0100;
+    let mut raw = RAWINPUT::default();
+    let mut size = std::mem::size_of::<RAWINPUT>() as u32;
+    let read = unsafe {
+        GetRawInputData(
+            HRAWINPUT(lparam.0 as *mut _),
+            RID_INPUT,
+            Some(&mut raw as *mut _ as *mut core::ffi::c_void),
+            &mut size,
+            std::mem::size_of::<RAWINPUTHEADER>() as u32,
+        )
+    };
+    read != u32::MAX
+        && raw.header.dwType == RIM_TYPEMOUSE.0
+        && unsafe { raw.data.mouse.Anonymous.Anonymous.usButtonFlags } & DOWNS != 0
+}
+
 /// The playback live timer's period: visualizer frames whenever bars can be on
 /// screen (collapsed, animating, or Music with its visualizer shown); the slow
 /// scrubber rate in the settled expanded Music space with the visualizer
@@ -770,13 +965,13 @@ fn live_period_ms(
 
 /// Animations run only when neither the user (Reduced motion) nor the system
 /// asked for reduced motion.
-fn motion_allowed(reduced_motion: bool, system_animations: bool) -> bool {
+pub(crate) fn motion_allowed(reduced_motion: bool, system_animations: bool) -> bool {
     system_animations && !reduced_motion
 }
 
 /// Checks if system-level client area animations are enabled.
 /// If disabled (user requested reduced motion), animations should complete instantly.
-fn is_client_animation_enabled() -> bool {
+pub(crate) fn is_client_animation_enabled() -> bool {
     let mut anim_enabled = windows::core::BOOL(1);
     let res = unsafe {
         SystemParametersInfoW(
@@ -967,6 +1162,11 @@ fn start_or_reverse_animation(hwnd: HWND, state: &mut WindowState) -> Result<()>
     if target_state == NotchState::Collapsed {
         state.set_clear_pending(hwnd, false);
     }
+    // Any expand / collapse ends a pending auto-collapse (a stale timer can
+    // never close a notch that has since reopened); outside clicks are only
+    // watched while expanded
+    state.grace(hwnd, GraceEvent::StateChanged);
+    state.set_outside_watch(hwnd, target_state == NotchState::Expanded);
 
     if !state.motion_enabled() {
         // Reduced motion requested: snap immediately to target state without timer
@@ -1342,7 +1542,65 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(MA_NOACTIVATE as isize)
         }
 
+        WM_INPUT => {
+            // Read now: the raw handle is only valid while this message is
+            // handled. Only button presses outside the notch matter.
+            if raw_button_down(lparam) {
+                let mut pt = POINT::default();
+                let event = unsafe { GetCursorPos(&mut pt) }.ok().and_then(|()| {
+                    let under = unsafe { WindowFromPoint(pt) };
+                    let root = unsafe { GetAncestor(under, GA_ROOT) };
+                    classify_click(root, hwnd, settings_window::handle())
+                });
+                if let Some(event) = event {
+                    unsafe {
+                        let _ = PostMessageW(
+                            Some(hwnd),
+                            WM_APP_GRACE,
+                            WPARAM(event as usize),
+                            LPARAM(0),
+                        );
+                    }
+                }
+            }
+            // Required for Raw Input cleanup
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
+        settings_window::WM_APP_SETTINGS_DELAY => {
+            // A closing delay chosen in the Settings window: applied by the notch
+            with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                if let Some(d) = crate::config::CollapseDelay::from_index(wparam.0) {
+                    state.set_collapse_delay(hwnd, d);
+                }
+            });
+            LRESULT(0)
+        }
+
+        WM_APP_GRACE => {
+            with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                if let Some(event) = GraceEvent::ALL.get(wparam.0) {
+                    state.grace(hwnd, *event);
+                }
+            });
+            LRESULT(0)
+        }
+
         WM_TIMER => {
+            if wparam.0 == AUTO_COLLAPSE_TIMER_ID {
+                // One-shot; applied as a message so a busy state replays it
+                // (timer messages would be dropped)
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), AUTO_COLLAPSE_TIMER_ID);
+                    let _ = PostMessageW(
+                        Some(hwnd),
+                        WM_APP_GRACE,
+                        WPARAM(GraceEvent::TimerFired as usize),
+                        LPARAM(0),
+                    );
+                }
+                return LRESULT(0);
+            }
             if wparam.0 == ANIMATION_TIMER_ID {
                 with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
                     let now = std::time::Instant::now();
@@ -1480,7 +1738,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         .map_or(MEDIA_FEEDBACK_FRAME_MS as f32, |t| {
                             now.duration_since(t).as_secs_f32() * 1000.0
                         });
-                    let animating = state.renderer.feedback().step(dt);
+                    // Control feedback and the Settings page's switches share
+                    // this timer (both step every tick)
+                    let feedback = state.renderer.feedback().step(dt);
+                    let switches = state.renderer.step_switches(dt);
+                    let animating = feedback || switches;
                     state.redraw(hwnd);
                     if !animating {
                         state.feedback_tick = None;
@@ -1655,8 +1917,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
 
+        WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
+            // Using the notch: a pending auto-collapse is cancelled
+            with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                state.grace(hwnd, GraceEvent::NottInteraction);
+            });
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
         WM_LBUTTONDOWN => {
             with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                // Cancel a pending auto-collapse first, then the click as
+                // always (a collapsing click still collapses)
+                state.grace(hwnd, GraceEvent::NottInteraction);
                 if let Some(control) = state.media_control_at(lparam) {
                     // Tactile compression; capture so the release is always seen
                     state.renderer.feedback().press(control);
@@ -2053,8 +2326,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = KillTimer(Some(hwnd), MEDIA_FEEDBACK_TIMER_ID);
                 let _ = KillTimer(Some(hwnd), MEDIA_LIVE_TIMER_ID);
                 let _ = KillTimer(Some(hwnd), CLIPBOARD_TIMER_ID);
+                let _ = KillTimer(Some(hwnd), AUTO_COLLAPSE_TIMER_ID);
                 PostQuitMessage(0);
             }
+            // Stop reporting outside clicks (no-op if never registered)
+            watch_outside_clicks(hwnd, false);
             clipboard::stop_listening(hwnd);
             // Releases OLE's reference to the drop target (no-op if never registered)
             unsafe {
@@ -2210,6 +2486,8 @@ fn run_window(ole: bool) -> Result<()> {
             settings: NottSettings::default(),
             settings_open: false,
             clear_pending: false,
+            grace: GracePeriod::default(),
+            outside_watch: false,
         });
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
 
@@ -2716,5 +2994,150 @@ mod tests {
                 MEDIA_LIVE_FRAME_MS
             );
         }
+    }
+
+    #[test]
+    fn test_grace_period_outside_click_lifecycle() {
+        use GraceAction::*;
+        use GraceEvent::*;
+        let mut g = GracePeriod::default();
+        // Expanded and untouched: nothing ever collapses it
+        assert!(!g.pending());
+        assert_eq!(
+            g.handle(TimerFired, true),
+            Disarm,
+            "no fire without a click"
+        );
+        // An outside click starts the countdown; another restarts it
+        assert_eq!(g.handle(OutsideClick, true), Arm);
+        assert_eq!(
+            g.handle(OutsideClick, true),
+            Arm,
+            "restart from the latest click"
+        );
+        assert!(g.pending());
+        // Running out collapses, once
+        assert_eq!(g.handle(TimerFired, true), Collapse);
+        assert_eq!(g.handle(TimerFired, true), Disarm, "a second fire is stale");
+        // A click in the notch (or the Settings window) cancels it first
+        g.handle(OutsideClick, true);
+        assert_eq!(g.handle(NottInteraction, true), Disarm);
+        assert_eq!(g.handle(TimerFired, true), Disarm, "cancelled: no collapse");
+        // An explicit collapse cancels; a stale fire after re-expanding is
+        // ignored
+        g.handle(OutsideClick, true);
+        assert_eq!(g.handle(StateChanged, false), Disarm, "explicit collapse");
+        assert_eq!(g.handle(StateChanged, true), None, "re-expanded");
+        assert_eq!(g.handle(TimerFired, true), Disarm, "stale fire ignored");
+        // Collapsed: outside clicks start nothing
+        assert_eq!(g.handle(OutsideClick, false), None);
+        assert!(!g.pending());
+        // Indices round-trip for the posted message
+        for (i, e) in GraceEvent::ALL.into_iter().enumerate() {
+            assert_eq!(e as usize, i);
+        }
+    }
+
+    #[test]
+    fn test_click_classification_and_raw_input_registration() {
+        let (notch, settings, other) = (
+            HWND(0x100 as *mut _),
+            HWND(0x200 as *mut _),
+            HWND(0x300 as *mut _),
+        );
+        assert_eq!(
+            classify_click(notch, notch, Some(settings)),
+            None,
+            "the notch handles its own"
+        );
+        assert_eq!(
+            classify_click(settings, notch, Some(settings)),
+            Some(GraceEvent::NottInteraction),
+            "using Settings never collapses the notch"
+        );
+        assert_eq!(
+            classify_click(other, notch, Some(settings)),
+            Some(GraceEvent::OutsideClick)
+        );
+        assert_eq!(
+            classify_click(other, notch, None),
+            Some(GraceEvent::OutsideClick)
+        );
+        // The sink registers on a real window and is removed again (as on
+        // collapse and shutdown), leaving nothing registered
+        use windows::Win32::UI::Input::{GetRegisteredRawInputDevices, RAWINPUTDEVICE};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
+        };
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                windows::core::w!("STATIC"),
+                None,
+                WINDOW_STYLE(0),
+                0,
+                0,
+                1,
+                1,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        let registered = || {
+            let mut n = 0u32;
+            unsafe {
+                GetRegisteredRawInputDevices(
+                    None,
+                    &mut n,
+                    std::mem::size_of::<RAWINPUTDEVICE>() as u32,
+                );
+            }
+            n
+        };
+        assert!(watch_outside_clicks(hwnd, true));
+        assert_eq!(registered(), 1);
+        assert!(watch_outside_clicks(hwnd, false));
+        assert_eq!(registered(), 0, "cleaned up");
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn test_collapse_delay_durations_and_restart_on_change() {
+        use crate::config::CollapseDelay;
+        use GraceAction::*;
+        use GraceEvent::*;
+        assert_eq!(NottSettings::default().collapse_delay, CollapseDelay::Five);
+        assert_eq!(
+            CollapseDelay::ALL.map(CollapseDelay::ms),
+            [5_000, 10_000, 15_000]
+        );
+        for (i, d) in CollapseDelay::ALL.into_iter().enumerate() {
+            assert_eq!(CollapseDelay::from_index(i), Some(d));
+        }
+        assert_eq!(CollapseDelay::from_index(3), Option::None);
+        let mut g = GracePeriod::default();
+        // Changing the delay with nothing pending starts nothing
+        assert_eq!(g.handle(DelayChanged, true), None);
+        // Pending: the countdown restarts (the window arms it with the new ms)
+        g.handle(OutsideClick, true);
+        assert_eq!(g.handle(DelayChanged, true), Arm);
+        assert!(g.pending());
+        // Later outside clicks restart it; inside clicks / Settings cancel it
+        assert_eq!(g.handle(OutsideClick, true), Arm);
+        assert_eq!(g.handle(NottInteraction, true), Disarm);
+        assert_eq!(
+            g.handle(DelayChanged, true),
+            None,
+            "cancelled stays cancelled"
+        );
+        // Explicit collapse cancels at once
+        g.handle(OutsideClick, true);
+        assert_eq!(g.handle(StateChanged, false), Disarm);
+        assert_eq!(g.handle(TimerFired, false), Disarm, "no late collapse");
     }
 }

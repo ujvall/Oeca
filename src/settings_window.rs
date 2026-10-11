@@ -30,8 +30,7 @@ use windows::Win32::Graphics::Direct2D::{
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_WEIGHT_SEMI_BOLD,
-    DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+    DWRITE_FONT_WEIGHT, DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
     DWRITE_PARAGRAPH_ALIGNMENT_FAR, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_WORD_WRAPPING_NO_WRAP,
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
 };
@@ -46,19 +45,20 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, IDC_ARROW, IsIconic,
-    LoadCursorW, MINMAXINFO, PostMessageW, RegisterClassExW, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE,
-    SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, WM_APP, WM_CAPTURECHANGED,
-    WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SIZE, WNDCLASSEXW, WS_EX_APPWINDOW,
-    WS_OVERLAPPEDWINDOW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, IDC_ARROW, ISMEX_NOTIFY,
+    ISMEX_SEND, InSendMessageEx, IsIconic, LoadCursorW, MINMAXINFO, PostMessageW, RegisterClassExW,
+    SET_WINDOW_POS_FLAGS, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, WINDOWPOS, WM_APP,
+    WM_CAPTURECHANGED, WM_DESTROY, WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_ERASEBKGND,
+    WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_NCLBUTTONDOWN, WM_PAINT, WM_SIZE, WM_SYSKEYDOWN, WM_WINDOWPOSCHANGED, WNDCLASSEXW,
+    WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{PCWSTR, Result, w};
 
 use crate::config::{
     AccentChoice, COLOR_SPACE_PILL_SELECTED, COLOR_TEXT_PRIMARY, COLOR_TEXT_SECONDARY,
-    COLOR_TEXT_TERTIARY, ClipboardCapacity, FONT_FAMILY_DISPLAY, FONT_FAMILY_FALLBACK,
-    FONT_FAMILY_PRIMARY, NOTCH_BG_COLOR,
+    COLOR_TEXT_TERTIARY, ClipboardCapacity, CollapseDelay, NOTCH_BG_COLOR, TextRole,
 };
 use crate::layout::RectF;
 use crate::renderer::{CLIPBOARD, GEAR, INFO, IconSeg, MUSIC_ALT, PALETTE, fill_glyph};
@@ -77,13 +77,23 @@ pub const WM_APP_SETTINGS_ACCENT: u32 = WM_APP + 31;
 /// Posted to the notch window when a history capacity is chosen (wParam: the
 /// `ClipboardCapacity` index). The notch applies it and calls `sync`.
 pub const WM_APP_SETTINGS_CAPACITY: u32 = WM_APP + 32;
+/// Posted to the notch window when a closing delay is chosen (wParam: the
+/// `CollapseDelay` index). The notch applies it and calls `sync`.
+pub const WM_APP_SETTINGS_DELAY: u32 = WM_APP + 33;
+/// The Settings window's switch-animation frame timer (runs only while a
+/// switch slides).
+const SWITCH_TIMER_ID: usize = 1;
+/// General's "Notch" section: the closing-delay row under the two switches.
+pub const CLOSING_TITLE: &str = "Notch closing behaviour";
+pub const CLOSING_DESCRIPTION: &str = "Delay after an outside click";
 
 /// Client area (DIP): initial size, and the minimum the window can shrink to
 /// (the sidebar plus a page column wide enough for the General rows).
 pub const CLIENT_SIZE: (f32, f32) = (820.0, 520.0);
-/// The minimum holds General: two sections of two rows, and the longest
+/// The minimum holds General: its "Notch" section (two switches and the
+/// closing-delay row) and "Window behavior" (two switches), and the longest
 /// setting title unclipped beside its switch.
-pub const MIN_CLIENT_SIZE: (f32, f32) = (640.0, 440.0);
+pub const MIN_CLIENT_SIZE: (f32, f32) = (640.0, 504.0);
 
 /// Sidebar (DIP): fixed width; category entries with an icon and a label.
 pub const SIDEBAR_WIDTH: f32 = 200.0;
@@ -327,6 +337,8 @@ pub enum Target {
     Accent(AccentChoice),
     /// A Clipboard history capacity segment.
     Capacity(ClipboardCapacity),
+    /// A General closing-delay segment.
+    Delay(CollapseDelay),
 }
 
 /// Navigation state: the selected page and keyboard focus. Separate from the
@@ -353,10 +365,25 @@ impl Nav {
     /// Tab order: the sidebar entries, then the current page's controls
     /// (General's switches, or Appearance's swatches).
     pub fn focus_order(self) -> Vec<Target> {
+        // General, in visual order: its first two switches, the closing-delay
+        // segments, then the "Window behavior" switches
+        let controls = self.category.controls();
+        let split = if self.category == Category::General {
+            2
+        } else {
+            controls.len()
+        };
+        let delays: &[CollapseDelay] = if self.category == Category::General {
+            &CollapseDelay::ALL
+        } else {
+            &[]
+        };
         Category::ALL
             .into_iter()
             .map(Target::Category)
-            .chain(self.category.controls().iter().map(|c| Target::Control(*c)))
+            .chain(controls[..split].iter().map(|c| Target::Control(*c)))
+            .chain(delays.iter().map(|d| Target::Delay(*d)))
+            .chain(controls[split..].iter().map(|c| Target::Control(*c)))
             .chain(self.category.accents().iter().map(|a| Target::Accent(*a)))
             .chain(
                 self.category
@@ -413,6 +440,9 @@ impl Nav {
             Target::Capacity(c) => Target::Capacity(
                 ClipboardCapacity::ALL[step(c.index(), ClipboardCapacity::ALL.len())],
             ),
+            Target::Delay(d) => {
+                Target::Delay(CollapseDelay::ALL[step(d.index(), CollapseDelay::ALL.len())])
+            }
         };
         self.focus_visible = true;
         self.focus
@@ -456,6 +486,23 @@ pub struct WindowLayout {
     pub capacity_description: RectF,
     pub capacity: [RectF; 3],
     pub clipboard_notes: [RectF; 2],
+    /// General's closing-delay row (title, description, whole row) and its
+    /// segments, in `CollapseDelay::ALL` order.
+    pub closing_title: RectF,
+    pub closing_description: RectF,
+    pub closing_row: RectF,
+    pub closing: [RectF; 3],
+}
+
+/// A three-segment selector at the right end of a row starting at `top`,
+/// and where the row's text must end.
+fn segments(right: f32, top: f32) -> ([RectF; 3], f32) {
+    const SEGMENT: (f32, f32) = (52.0, 28.0);
+    let segs = std::array::from_fn(|i| {
+        let x = right - (3 - i) as f32 * SEGMENT.0;
+        RectF::new(x, top + 18.0, x + SEGMENT.0, top + 18.0 + SEGMENT.1)
+    });
+    (segs, right - 3.0 * SEGMENT.0 - 16.0)
 }
 
 /// Lays the window out for a client size (DIP). The sidebar keeps its width;
@@ -476,9 +523,10 @@ pub fn layout(width: f32, height: f32) -> WindowLayout {
     });
     let left = SIDEBAR_WIDTH + PAGE_PADDING;
     let right = (width - PAGE_PADDING).max(left + 240.0);
-    // Each section: its heading, then its rows
+    // Each section: its heading, then its rows ("Notch" has three: two
+    // switches and the closing-delay row; "Window behavior" two)
     let section_top =
-        |k: usize| SECTION_TOP + k as f32 * (SECTION_HEIGHT + 2.0 * ROW_HEIGHT + SECTION_GAP);
+        |k: usize| SECTION_TOP + k as f32 * (SECTION_HEIGHT + 3.0 * ROW_HEIGHT + SECTION_GAP);
     let sections = std::array::from_fn(|k| {
         let top = section_top(k);
         RectF::new(left, top, right, top + SECTION_HEIGHT)
@@ -524,13 +572,8 @@ pub fn layout(width: f32, height: f32) -> WindowLayout {
     );
     // Clipboard: "History", one row with a three-segment selector at its
     // right end, then two informational lines
-    const SEGMENT: (f32, f32) = (52.0, 28.0);
     let row_top = SECTION_TOP + SECTION_HEIGHT;
-    let capacity = std::array::from_fn(|i| {
-        let x = right - (3 - i) as f32 * SEGMENT.0;
-        RectF::new(x, row_top + 18.0, x + SEGMENT.0, row_top + 18.0 + SEGMENT.1)
-    });
-    let text_right = right - 3.0 * SEGMENT.0 - 16.0;
+    let (capacity, text_right) = segments(right, row_top);
     let capacity_title = RectF::new(left, row_top + 12.0, text_right, row_top + 32.0);
     let capacity_description = RectF::new(left, row_top + 32.0, text_right, row_top + 52.0);
     let notes_top = row_top + ROW_HEIGHT + 16.0;
@@ -538,6 +581,13 @@ pub fn layout(width: f32, height: f32) -> WindowLayout {
         let top = notes_top + i as f32 * 20.0;
         RectF::new(left, top, right, top + 20.0)
     });
+    // General: the closing-delay row, third in "Notch"
+    let closing_top = section_top(0) + SECTION_HEIGHT + 2.0 * ROW_HEIGHT;
+    let (closing, closing_right) = segments(right, closing_top);
+    let closing_title = RectF::new(left, closing_top + 12.0, closing_right, closing_top + 32.0);
+    let closing_description =
+        RectF::new(left, closing_top + 32.0, closing_right, closing_top + 52.0);
+    let closing_row = RectF::new(left, closing_top, right, closing_top + ROW_HEIGHT);
     WindowLayout {
         sidebar: RectF::new(0.0, 0.0, SIDEBAR_WIDTH, height),
         items,
@@ -553,6 +603,10 @@ pub fn layout(width: f32, height: f32) -> WindowLayout {
         capacity_description,
         capacity,
         clipboard_notes,
+        closing_title,
+        closing_description,
+        closing_row,
+        closing,
     }
 }
 
@@ -579,6 +633,13 @@ pub fn hit(width: f32, height: f32, category: Category, x: f32, y: f32) -> Optio
         .find(|c| l.capacity[c.index()].contains(x, y))
     {
         return Some(Target::Capacity(*c));
+    }
+    if category == Category::General
+        && let Some(d) = CollapseDelay::ALL
+            .into_iter()
+            .find(|d| l.closing[d.index()].contains(x, y))
+    {
+        return Some(Target::Delay(d));
     }
     category
         .controls()
@@ -617,6 +678,15 @@ struct View {
     d2d: ID2D1Factory,
     formats: Formats,
     target: Option<ID2D1HwndRenderTarget>,
+    /// Where Nott placed the new window (outer top-left, px), until the user
+    /// takes over (a click, key, move/size or DPI change). While set, a move
+    /// made by another process is undone (`placement_correction`).
+    placement: Option<(i32, i32)>,
+    corrections: u8,
+    /// Each switch's slide (`Control::ALL` order), and the last frame of the
+    /// switch timer (Some only while it runs).
+    switches: [crate::renderer::SwitchAnim; 6],
+    switch_tick: Option<std::time::Instant>,
 }
 
 thread_local! {
@@ -631,6 +701,12 @@ fn with_view<R>(f: impl FnOnce(&mut View) -> R) -> Option<R> {
 /// Whether the Settings window exists.
 pub fn is_open() -> bool {
     with_view(|_| ()).is_some()
+}
+
+/// The open Settings window, if any (the notch treats clicks on it as Nott
+/// being used).
+pub fn handle() -> Option<HWND> {
+    window_handle()
 }
 
 fn window_handle() -> Option<HWND> {
@@ -661,8 +737,30 @@ pub fn open(notch: HWND, settings: NottSettings) -> Result<()> {
 
 /// Shows new settings values (after a change from either surface).
 pub fn sync(settings: NottSettings) {
+    // Flipped switches slide (at once under Reduced motion), on a frame timer
+    // that stops when they settle
+    let instant = !crate::window::motion_allowed(
+        settings.reduced_motion,
+        crate::window::is_client_animation_enabled(),
+    );
     let changed = with_view(|v| {
         let old = std::mem::replace(&mut v.settings, settings);
+        for c in Control::ALL {
+            if c.is_on(old) != c.is_on(settings) {
+                v.switches[c.index()].set(c.is_on(settings), instant);
+            }
+        }
+        if v.switch_tick.is_none() && v.switches.iter().any(|s| s.is_animating()) {
+            v.switch_tick = Some(std::time::Instant::now());
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
+                    Some(v.hwnd),
+                    SWITCH_TIMER_ID,
+                    crate::config::SWITCH_FRAME_MS,
+                    None,
+                );
+            }
+        }
         (v.hwnd, old)
     });
     if let Some((hwnd, old)) = changed {
@@ -744,13 +842,13 @@ fn create(notch: HWND, settings: NottSettings) -> Result<HWND> {
         let d2d: ID2D1Factory =
             unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)? };
         let dwrite: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
-        let format = |family, size, weight| text_format(&dwrite, family, size, weight);
+        let format = |role| role_format(&dwrite, role);
         let centred = |f: IDWriteTextFormat| -> Result<IDWriteTextFormat> {
             unsafe { f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)? };
             Ok(f)
         };
-        let item = |weight| -> Result<IDWriteTextFormat> {
-            let f = format(FONT_FAMILY_PRIMARY, 14.0, weight)?;
+        let item = |role| -> Result<IDWriteTextFormat> {
+            let f = format(role)?;
             unsafe { f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)? };
             Ok(f)
         };
@@ -763,20 +861,24 @@ fn create(notch: HWND, settings: NottSettings) -> Result<HWND> {
             pressed: None,
             d2d,
             formats: Formats {
-                heading: format(FONT_FAMILY_DISPLAY, 24.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
-                body: format(FONT_FAMILY_PRIMARY, 14.0, DWRITE_FONT_WEIGHT_REGULAR)?,
-                caption: format(FONT_FAMILY_PRIMARY, 12.0, DWRITE_FONT_WEIGHT_REGULAR)?,
+                heading: format(TextRole::PageTitle)?,
+                body: format(TextRole::SettingLabel)?,
+                caption: format(TextRole::SettingDescription)?,
                 section: {
-                    let f = format(FONT_FAMILY_PRIMARY, 13.0, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
+                    let f = format(TextRole::SectionHeading)?;
                     unsafe { f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_FAR)? };
                     f
                 },
-                item: item(DWRITE_FONT_WEIGHT_REGULAR)?,
-                item_selected: item(DWRITE_FONT_WEIGHT_SEMI_BOLD)?,
-                segment: centred(item(DWRITE_FONT_WEIGHT_REGULAR)?)?,
-                segment_selected: centred(item(DWRITE_FONT_WEIGHT_SEMI_BOLD)?)?,
+                item: item(TextRole::SidebarItem)?,
+                item_selected: item(TextRole::SidebarItemSelected)?,
+                segment: centred(item(TextRole::SidebarItem)?)?,
+                segment_selected: centred(item(TextRole::SidebarItemSelected)?)?,
             },
             target: None,
+            placement: Some((x, y)),
+            corrections: 0,
+            switches: Control::ALL.map(|c| crate::renderer::SwitchAnim::settled(c.is_on(settings))),
+            switch_tick: None,
         })
     })();
     match view {
@@ -843,6 +945,27 @@ pub fn initial_position(work: RECT, size: (i32, i32), clear_top: i32) -> (i32, i
     (x, y)
 }
 
+/// Most external corrections made for one window (guards against a
+/// repositioning tool that insists).
+const MAX_PLACEMENT_CORRECTIONS: u8 = 3;
+
+/// Where to put the window back after it moved to `moved_to`, if anywhere:
+/// only while Nott's placement still stands (`placement`, cleared once the
+/// user interacts), only for a move made by another process or thread
+/// (`external`; Nott's own moves and the user's are never undone), and at
+/// most `MAX_PLACEMENT_CORRECTIONS` times. Some shells re-centre a new window
+/// that opens without the foreground (as Nott's does: the notch never
+/// activates), which would put its title bar under the expanded notch.
+pub fn placement_correction(
+    placement: Option<(i32, i32)>,
+    corrections: u8,
+    moved_to: (i32, i32),
+    external: bool,
+) -> Option<(i32, i32)> {
+    let target = placement?;
+    (external && moved_to != target && corrections < MAX_PLACEMENT_CORRECTIONS).then_some(target)
+}
+
 /// Window size for a client size (DIP) at `dpi`, frame included.
 fn outer_size(client: (f32, f32), dpi: u32) -> (i32, i32) {
     let (w, h) = to_px(client, dpi);
@@ -876,9 +999,22 @@ fn text_format(
             locale,
         )
     };
-    let format = make(family).or_else(|_| make(FONT_FAMILY_FALLBACK))?;
+    // A missing family never fails here; `ui_font` resolved it beforehand
+    let format = make(family)?;
     unsafe { format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)? };
     Ok(format)
+}
+
+/// A role's format in Nott's typeface (sizes are DIP: the window draws at
+/// its own DPI).
+fn role_format(dwrite: &IDWriteFactory, role: TextRole) -> Result<IDWriteTextFormat> {
+    let style = role.style();
+    text_format(
+        dwrite,
+        crate::renderer::ui_font(dwrite).1,
+        style.size,
+        DWRITE_FONT_WEIGHT(style.weight),
+    )
 }
 
 fn scale(hwnd: HWND) -> f32 {
@@ -953,14 +1089,29 @@ fn request_capacity(capacity: ClipboardCapacity) {
     }
 }
 
+/// Asks the notch to use a closing delay (it owns the value and syncs back).
+fn request_delay(delay: CollapseDelay) {
+    if let Some(notch) = with_view(|v| v.notch) {
+        unsafe {
+            let _ = PostMessageW(
+                Some(notch),
+                WM_APP_SETTINGS_DELAY,
+                WPARAM(delay.index()),
+                LPARAM(0),
+            );
+        }
+    }
+}
+
 /// Click / Enter / Space on a target: show its page, flip its switch, or
-/// choose its accent / capacity.
+/// choose its accent / capacity / closing delay.
 fn activate(hwnd: HWND, target: Target) {
     match target {
         Target::Category(c) => navigate(hwnd, c),
         Target::Control(c) => request_toggle(c),
         Target::Accent(a) => request_accent(a),
         Target::Capacity(c) => request_capacity(c),
+        Target::Delay(d) => request_delay(d),
     }
 }
 
@@ -971,6 +1122,36 @@ fn invalidate(hwnd: HWND) {
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // The user (or a DPI change) takes over the position: Nott's initial
+    // placement is no longer defended
+    if matches!(
+        msg,
+        WM_ENTERSIZEMOVE
+            | WM_NCLBUTTONDOWN
+            | WM_LBUTTONDOWN
+            | WM_KEYDOWN
+            | WM_SYSKEYDOWN
+            | WM_DPICHANGED
+    ) {
+        with_view(|v| v.placement = None);
+    }
+    // Nott is in use: the notch's pending auto-collapse (if any) is cancelled
+    let activated =
+        msg == windows::Win32::UI::WindowsAndMessaging::WM_ACTIVATE && (wparam.0 & 0xFFFF) != 0;
+    if (activated || matches!(msg, WM_LBUTTONDOWN | WM_KEYDOWN | WM_SYSKEYDOWN))
+        && let Some(notch) = with_view(|v| v.notch)
+    {
+        {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(notch),
+                    crate::window::WM_APP_GRACE,
+                    WPARAM(crate::window::GraceEvent::NottInteraction as usize),
+                    LPARAM(0),
+                );
+            }
+        }
+    }
     match msg {
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
@@ -986,6 +1167,64 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
+        windows::Win32::UI::WindowsAndMessaging::WM_TIMER if wparam.0 == SWITCH_TIMER_ID => {
+            let moving = with_view(|v| {
+                let now = std::time::Instant::now();
+                let dt = v
+                    .switch_tick
+                    .replace(now)
+                    .map_or(0.0, |t| now.duration_since(t).as_secs_f32() * 1000.0);
+                let mut any = false;
+                for s in v.switches.iter_mut() {
+                    any |= s.step(dt);
+                }
+                if !any {
+                    v.switch_tick = None;
+                }
+                any
+            });
+            invalidate(hwnd);
+            // Settled (or the window is going): no more frames
+            if moving != Some(true) {
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(
+                        Some(hwnd),
+                        SWITCH_TIMER_ID,
+                    );
+                }
+            }
+            LRESULT(0)
+        }
+        WM_WINDOWPOSCHANGED => {
+            let wp = unsafe { &*(lparam.0 as *const WINDOWPOS) };
+            // Sent from another thread / process (Nott moves its own window
+            // on this thread only)
+            let external = unsafe { InSendMessageEx(None) } & (ISMEX_SEND | ISMEX_NOTIFY) != 0;
+            if wp.flags & SWP_NOMOVE == SET_WINDOW_POS_FLAGS(0) {
+                let back = with_view(|v| {
+                    let back =
+                        placement_correction(v.placement, v.corrections, (wp.x, wp.y), external);
+                    v.corrections += u8::from(back.is_some());
+                    back
+                })
+                .flatten();
+                if let Some((x, y)) = back {
+                    unsafe {
+                        let _ = SetWindowPos(
+                            hwnd,
+                            None,
+                            x,
+                            y,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
+                    }
+                }
+            }
+            // Default handling still sends WM_MOVE / WM_SIZE
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
         WM_SIZE => {
             let (w, h) = (
                 (lparam.0 & 0xFFFF) as u32,
@@ -1117,10 +1356,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let focus = with_view(|v| match key {
                     k if k == VK_TAB.0 => Some(v.nav.tab(shift)),
                     // Left / Right only along the swatch / segment rows
-                    k if k == VK_LEFT.0 || k == VK_RIGHT.0 => {
-                        matches!(v.nav.focus, Target::Accent(_) | Target::Capacity(_))
-                            .then(|| v.nav.arrow(k == VK_LEFT.0))
-                    }
+                    k if k == VK_LEFT.0 || k == VK_RIGHT.0 => matches!(
+                        v.nav.focus,
+                        Target::Accent(_) | Target::Capacity(_) | Target::Delay(_)
+                    )
+                    .then(|| v.nav.arrow(k == VK_LEFT.0)),
                     k => Some(v.nav.arrow(k == VK_UP.0)),
                 })
                 .flatten();
@@ -1251,10 +1491,54 @@ fn paint(v: &mut View) -> Result<()> {
             l.page_description,
             &tertiary,
         );
+        // Segmented selector: a quiet track; the chosen segment is a filled
+        // pill with a bold label (not color alone)
+        let segmented = |rects: [RectF; 3],
+                         labels: [&str; 3],
+                         chosen: usize,
+                         targets: [Target; 3]| {
+            let (first, last) = (rects[0], rects[2]);
+            let track = RectF::new(first.left, first.top, last.right, last.bottom);
+            rt.FillRoundedRectangle(&rounded(track, track.height() / 2.0), &hover_fill);
+            for i in 0..3 {
+                let (r, target) = (rects[i], targets[i]);
+                let pill = RectF::new(r.left + 2.0, r.top + 2.0, r.right - 2.0, r.bottom - 2.0);
+                if i == chosen {
+                    rt.FillRoundedRectangle(&rounded(pill, pill.height() / 2.0), &selected_fill);
+                } else if v.hover == Some(target) || v.pressed == Some(target) {
+                    rt.FillRoundedRectangle(&rounded(pill, pill.height() / 2.0), &hover_fill);
+                }
+                let (format, ink) = if i == chosen {
+                    (&v.formats.segment_selected, &primary)
+                } else {
+                    (&v.formats.segment, &secondary)
+                };
+                text(labels[i], format, r, ink);
+                if v.nav.focus_visible && v.nav.focus == target {
+                    focus_ring(r, r.height() / 2.0);
+                }
+            }
+        };
         if category == Category::General {
             for ((heading, _), r) in SECTIONS.iter().zip(l.sections) {
                 text(heading, &v.formats.section, r, &secondary);
             }
+            text(CLOSING_TITLE, &v.formats.body, l.closing_title, &primary);
+            text(
+                CLOSING_DESCRIPTION,
+                &v.formats.caption,
+                l.closing_description,
+                &tertiary,
+            );
+            segmented(
+                l.closing,
+                CollapseDelay::ALL.map(CollapseDelay::label),
+                v.settings.collapse_delay.index(),
+                CollapseDelay::ALL.map(Target::Delay),
+            );
+            let r = l.closing_row;
+            let line = RectF::new(r.left, r.bottom - 1.0, r.right, r.bottom);
+            rt.FillRectangle(&line.to_d2d_rect(), &separator);
         }
         if category == Category::Media {
             text(MEDIA_SECTION, &v.formats.section, l.sections[0], &secondary);
@@ -1273,32 +1557,12 @@ fn paint(v: &mut View) -> Result<()> {
                 l.capacity_description,
                 &tertiary,
             );
-            // Segmented selector: a quiet track; the chosen segment is a
-            // filled pill with a bold label (not color alone)
-            let (first, last) = (l.capacity[0], l.capacity[2]);
-            let track = RectF::new(first.left, first.top, last.right, last.bottom);
-            rt.FillRoundedRectangle(&rounded(track, track.height() / 2.0), &hover_fill);
-            let chosen = v.settings.clipboard_capacity;
-            for c in ClipboardCapacity::ALL {
-                let r = l.capacity[c.index()];
-                let target = Target::Capacity(c);
-                let pill = RectF::new(r.left + 2.0, r.top + 2.0, r.right - 2.0, r.bottom - 2.0);
-                if c == chosen {
-                    rt.FillRoundedRectangle(&rounded(pill, pill.height() / 2.0), &selected_fill);
-                } else if v.hover == Some(target) || v.pressed == Some(target) {
-                    rt.FillRoundedRectangle(&rounded(pill, pill.height() / 2.0), &hover_fill);
-                }
-                let label = c.entries().to_string();
-                let (format, ink) = if c == chosen {
-                    (&v.formats.segment_selected, &primary)
-                } else {
-                    (&v.formats.segment, &secondary)
-                };
-                text(&label, format, r, ink);
-                if v.nav.focus_visible && v.nav.focus == target {
-                    focus_ring(r, r.height() / 2.0);
-                }
-            }
+            segmented(
+                l.capacity,
+                ["5", "10", "20"],
+                v.settings.clipboard_capacity.index(),
+                ClipboardCapacity::ALL.map(Target::Capacity),
+            );
             let separator_line = RectF::new(
                 l.rows[0].row.left,
                 l.rows[0].row.bottom - 1.0,
@@ -1345,7 +1609,7 @@ fn paint(v: &mut View) -> Result<()> {
             let p = l.preview;
             rt.FillRoundedRectangle(&rounded(p, 14.0), &brush(&NOTCH_BG_COLOR)?);
             let sw = RectF::new(p.right - 56.0, p.top + 17.0, p.right - 16.0, p.top + 39.0);
-            crate::renderer::draw_switch(rt, sw, true, 3.0, 1.0, chosen)?;
+            crate::renderer::draw_switch(rt, sw, 1.0, 3.0, 1.0, chosen)?;
             let track = RectF::new(p.left + 18.0, p.top + 26.0, sw.left - 24.0, p.top + 30.0);
             rt.FillRoundedRectangle(&rounded(track, 2.0), &selected_fill);
             let played = RectF::new(
@@ -1384,7 +1648,7 @@ fn paint(v: &mut View) -> Result<()> {
             crate::renderer::draw_switch(
                 rt,
                 s,
-                control.is_on(v.settings),
+                v.switches[control.index()].level(),
                 3.0,
                 knob,
                 v.settings.accent,
@@ -1435,6 +1699,9 @@ pub enum Element {
     Capacity(ClipboardCapacity),
     /// A Clipboard informational line (index into `CLIPBOARD_NOTES`).
     Note(usize),
+    /// A General closing-delay segment (a radio button: selected = the
+    /// current delay).
+    Delay(CollapseDelay),
 }
 
 impl From<Target> for Element {
@@ -1444,6 +1711,7 @@ impl From<Target> for Element {
             Target::Control(c) => Self::Control(c),
             Target::Accent(a) => Self::Accent(a),
             Target::Capacity(c) => Self::Capacity(c),
+            Target::Delay(d) => Self::Delay(d),
         }
     }
 }
@@ -1461,8 +1729,12 @@ impl Element {
                     .enumerate()
                     .filter(|_| category == Category::General)
                     .flat_map(|(k, (_, controls))| {
+                        // "Notch" ends with the closing-delay segments
+                        let delays: &[CollapseDelay] =
+                            if k == 0 { &CollapseDelay::ALL } else { &[] };
                         std::iter::once(Self::Section(k))
                             .chain(controls.iter().map(|c| Self::Control(*c)))
+                            .chain(delays.iter().map(|d| Self::Delay(*d)))
                     }),
             )
             .chain(
@@ -1510,6 +1782,7 @@ impl Element {
             Self::Accent(a) => a.name(),
             Self::Capacity(c) => c.name(),
             Self::Note(i) => CLIPBOARD_NOTES[i],
+            Self::Delay(d) => d.name(),
         }
     }
 
@@ -1520,6 +1793,7 @@ impl Element {
             Self::Category(c) => c == showing,
             Self::Accent(a) => a == settings.accent,
             Self::Capacity(c) => c == settings.clipboard_capacity,
+            Self::Delay(d) => d == settings.collapse_delay,
             _ => false,
         }
     }
@@ -1533,6 +1807,7 @@ impl Element {
             Self::Accent(a) => 300 + a.index() as i32,
             Self::Capacity(c) => 400 + c.index() as i32,
             Self::Note(i) => 500 + i as i32,
+            Self::Delay(d) => 600 + d.index() as i32,
             Self::Control(c) => 200 + c.index() as i32,
         }
     }
@@ -1690,6 +1965,14 @@ mod access {
                 );
             }
         }
+        if old.collapse_delay != new.collapse_delay {
+            unsafe {
+                let _ = UiaRaiseAutomationEvent(
+                    &item(hwnd, Element::Delay(new.collapse_delay)),
+                    UIA_SelectionItem_ElementSelectedEventId,
+                );
+            }
+        }
         if old.clipboard_capacity != new.clipboard_capacity {
             unsafe {
                 let _ = UiaRaiseAutomationEvent(
@@ -1818,7 +2101,10 @@ mod access {
                 (self.element, id),
                 (Element::Control(_), UIA_TogglePatternId)
                     | (
-                        Element::Category(_) | Element::Accent(_) | Element::Capacity(_),
+                        Element::Category(_)
+                            | Element::Accent(_)
+                            | Element::Capacity(_)
+                            | Element::Delay(_),
                         UIA_SelectionItemPatternId
                     )
             );
@@ -1888,12 +2174,26 @@ mod access {
                 (Element::Capacity(_), UIA_HelpTextPropertyId) => {
                     var_str("Clipboard history: items to keep")
                 }
+                (Element::Delay(_), UIA_ControlTypePropertyId) => {
+                    var_i32(UIA_RadioButtonControlTypeId.0)
+                }
+                (Element::Delay(_), UIA_SelectionItemIsSelectedPropertyId) => {
+                    var_bool(with_view(|v| e.is_selected(showing, v.settings)) == Some(true))
+                }
+                (Element::Delay(d), UIA_HasKeyboardFocusPropertyId) => {
+                    var_bool(focus == Some(Target::Delay(d)))
+                }
+                (Element::Delay(d), UIA_AutomationIdPropertyId) => {
+                    var_str(&format!("CloseAfter{}", d.ms() / 1000))
+                }
+                (Element::Delay(_), UIA_HelpTextPropertyId) => var_str(CLOSING_TITLE),
                 (Element::Note(_), UIA_ControlTypePropertyId) => var_i32(UIA_TextControlTypeId.0),
                 (
                     Element::Category(_)
                     | Element::Control(_)
                     | Element::Accent(_)
-                    | Element::Capacity(_),
+                    | Element::Capacity(_)
+                    | Element::Delay(_),
                     UIA_IsKeyboardFocusablePropertyId,
                 ) => var_bool(true),
                 (_, UIA_IsEnabledPropertyId) => var_bool(true),
@@ -1954,6 +2254,7 @@ mod access {
                 Element::Section(k) if k < SECTIONS.len() => l.sections[k],
                 Element::Section(4 | 5) => l.sections[0],
                 Element::Capacity(c) => l.capacity[c.index()],
+                Element::Delay(d) => l.closing[d.index()],
                 Element::Note(i) => l.clipboard_notes[i],
                 Element::Section(k) => l.appearance_sections[k - SECTIONS.len()],
                 Element::Accent(a) => l.swatches[a.index()],
@@ -1979,6 +2280,7 @@ mod access {
                 Element::Control(c) => Target::Control(c),
                 Element::Accent(a) => Target::Accent(a),
                 Element::Capacity(c) => Target::Capacity(c),
+                Element::Delay(d) => Target::Delay(d),
                 Element::PageTitle | Element::Section(_) | Element::Note(_) => return Ok(()),
             };
             with_view(|v| v.nav.focus = target);
@@ -2029,6 +2331,10 @@ mod access {
                 }
                 Element::Capacity(c) => {
                     super::request_capacity(c);
+                    Ok(())
+                }
+                Element::Delay(d) => {
+                    super::request_delay(d);
                     Ok(())
                 }
                 _ => empty(),
@@ -2116,10 +2422,14 @@ mod tests {
         nav.select(Category::About);
         assert_eq!(nav.focus_order().len(), 5, "About: sidebar only");
         nav.select(Category::General);
-        assert_eq!(nav.focus_order().len(), 9);
+        assert_eq!(nav.focus_order().len(), 12, "4 switches + 3 closing delays");
         nav.focus = Target::Category(Category::About);
         assert_eq!(nav.tab(false), Target::Control(Control::AlwaysOnTop));
         assert_eq!(nav.tab(false), Target::Control(Control::ReducedMotion));
+        // Visual order: the closing-delay segments sit between the sections
+        for d in CollapseDelay::ALL {
+            assert_eq!(nav.tab(false), Target::Delay(d));
+        }
         assert_eq!(nav.tab(false), Target::Control(Control::CloseOnEscape));
         assert_eq!(
             nav.tab(false),
@@ -2159,8 +2469,8 @@ mod tests {
         assert!(CLIENT_SIZE.0 >= MIN_CLIENT_SIZE.0 && CLIENT_SIZE.1 >= MIN_CLIENT_SIZE.1);
         assert_eq!(to_px(CLIENT_SIZE, 96), (820, 520));
         assert_eq!(to_px(CLIENT_SIZE, 120), (1025, 650));
-        assert_eq!(to_px(MIN_CLIENT_SIZE, 96), (640, 440));
-        assert_eq!(to_px(MIN_CLIENT_SIZE, 120), (800, 550));
+        assert_eq!(to_px(MIN_CLIENT_SIZE, 96), (640, 504));
+        assert_eq!(to_px(MIN_CLIENT_SIZE, 120), (800, 630));
         let (w, h) = outer_size(CLIENT_SIZE, 120);
         assert!(w > 1025 && h > 650, "frame added on top of the client area");
     }
@@ -2273,6 +2583,9 @@ mod tests {
                         Element::Section(0),
                         Element::Control(Control::AlwaysOnTop),
                         Element::Control(Control::ReducedMotion),
+                        Element::Delay(CollapseDelay::Five),
+                        Element::Delay(CollapseDelay::Ten),
+                        Element::Delay(CollapseDelay::Fifteen),
                         Element::Section(1),
                         Element::Control(Control::CloseOnEscape),
                         Element::Control(Control::ConfirmClearClipboard),
@@ -2287,6 +2600,9 @@ mod tests {
                         "Notch",
                         "Always on top",
                         "Reduced motion",
+                        "5 seconds",
+                        "10 seconds",
+                        "15 seconds",
                         "Window behavior",
                         "Close Settings window with Escape",
                         "Confirm before clearing clipboard history",
@@ -2298,7 +2614,12 @@ mod tests {
                 let focusable: Vec<Element> = children
                     .iter()
                     .copied()
-                    .filter(|e| matches!(e, Element::Category(_) | Element::Control(_)))
+                    .filter(|e| {
+                        matches!(
+                            e,
+                            Element::Category(_) | Element::Control(_) | Element::Delay(_)
+                        )
+                    })
                     .collect();
                 assert_eq!(tab, focusable);
             } else if category == Category::Appearance {
@@ -2432,6 +2753,7 @@ mod tests {
             clipboard_capacity: ClipboardCapacity::Five,
             show_source_app: false,
             show_visualizer: false,
+            collapse_delay: CollapseDelay::Fifteen,
         };
         sync(changed);
         navigate(hwnd, Category::General);
@@ -2456,14 +2778,8 @@ mod tests {
     fn test_texts_fit_their_rows_at_the_minimum_width() {
         let dwrite: IDWriteFactory =
             unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }.unwrap();
-        let width_of = |s: &str, size: f32| {
-            let f = text_format(
-                &dwrite,
-                FONT_FAMILY_PRIMARY,
-                size,
-                DWRITE_FONT_WEIGHT_REGULAR,
-            )
-            .unwrap();
+        let width_of = |s: &str, role: TextRole| {
+            let f = role_format(&dwrite, role).unwrap();
             let s: Vec<u16> = s.encode_utf16().collect();
             let layout = unsafe { dwrite.CreateTextLayout(&s, &f, 10_000.0, 100.0) }.unwrap();
             let mut m = Default::default();
@@ -2471,19 +2787,30 @@ mod tests {
             m.widthIncludingTrailingWhitespace
         };
         let l = layout(MIN_CLIENT_SIZE.0, MIN_CLIENT_SIZE.1);
-        assert!(width_of(CAPACITY_TITLE, 14.0) <= l.capacity_title.width());
-        assert!(width_of(CAPACITY_DESCRIPTION, 12.0) <= l.capacity_description.width());
+        assert!(width_of(CAPACITY_TITLE, TextRole::SettingLabel) <= l.capacity_title.width());
+        assert!(width_of(CLOSING_TITLE, TextRole::SettingLabel) <= l.closing_title.width());
+        assert!(
+            width_of(CLOSING_DESCRIPTION, TextRole::SettingDescription)
+                <= l.closing_description.width()
+        );
+        assert!(
+            width_of(CAPACITY_DESCRIPTION, TextRole::SettingDescription)
+                <= l.capacity_description.width()
+        );
         for (note, r) in CLIPBOARD_NOTES.iter().zip(l.clipboard_notes) {
-            assert!(width_of(note, 12.0) <= r.width(), "{note}");
+            assert!(
+                width_of(note, TextRole::SettingDescription) <= r.width(),
+                "{note}"
+            );
         }
         for c in Control::ALL {
             let row = l.rows[c.index()];
             assert!(
-                width_of(c.title(), 14.0) <= row.title.width(),
+                width_of(c.title(), TextRole::SettingLabel) <= row.title.width(),
                 "{c:?} title"
             );
             assert!(
-                width_of(c.description(), 12.0) <= row.description.width(),
+                width_of(c.description(), TextRole::SettingDescription) <= row.description.width(),
                 "{c:?} description"
             );
         }
@@ -2910,6 +3237,25 @@ mod tests {
         let (x, y) = initial_position(left_monitor, size, clear);
         assert_eq!(x, -2560 + (2560 - size.0) / 2);
         assert!(y >= 40 && y == clear.max(40));
+        // Exactly the 16 DIP gap below the tallest expanded notch, at each DPI
+        for dpi in [96u32, 120, 144, 192] {
+            let tallest = crate::space::NottSpace::ALL
+                .into_iter()
+                .map(|s| {
+                    crate::layout::space_dimensions(crate::config::NotchState::Expanded, dpi, s)
+                        .height
+                })
+                .max()
+                .unwrap();
+            let gap = (16.0 * dpi as f32 / 96.0).round() as i32;
+            assert_eq!(notch_clear_top(0, dpi), tallest + gap, "{dpi}");
+        }
+        // Live inputs from this machine: 1920 x 1080 work area at 120 DPI
+        let live = rect(0, 0, 1920, 1080);
+        assert_eq!(
+            initial_position(live, outer_size(CLIENT_SIZE, 120), notch_clear_top(0, 120)),
+            ((1920 - outer_size(CLIENT_SIZE, 120).0) / 2, 281)
+        );
         // DPI scales the band: never physical-pixel constants
         assert!(notch_clear_top(0, 192) > notch_clear_top(0, 96));
         assert_eq!(notch_clear_top(100, 96), notch_clear_top(0, 96) + 100);
@@ -2970,6 +3316,277 @@ mod tests {
         assert!(toggle_requests().is_empty());
         unsafe {
             let _ = DestroyWindow(reopened);
+        }
+    }
+
+    #[test]
+    fn test_placement_correction_rules() {
+        let placed = Some((438, 281));
+        // An external move away from the placement is undone
+        assert_eq!(
+            placement_correction(placed, 0, (438, 191), true),
+            Some((438, 281))
+        );
+        // ...but never Nott's own moves, a move to the same spot, or once the
+        // user has taken over (placement cleared), or past the cap
+        assert_eq!(placement_correction(placed, 0, (438, 191), false), None);
+        assert_eq!(placement_correction(placed, 0, (438, 281), true), None);
+        assert_eq!(placement_correction(None, 0, (438, 191), true), None);
+        assert_eq!(
+            placement_correction(placed, MAX_PLACEMENT_CORRECTIONS, (438, 191), true),
+            None
+        );
+    }
+
+    /// Pumps this thread's messages until `done` (cross-thread SetWindowPos
+    /// calls are delivered while pumping).
+    fn pump_until(done: &std::sync::atomic::AtomicBool) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
+        };
+        let start = std::time::Instant::now();
+        while !done.load(std::sync::atomic::Ordering::SeqCst) {
+            let mut m = MSG::default();
+            while unsafe { PeekMessageW(&mut m, None, 0, 0, PM_REMOVE) }.as_bool() {
+                unsafe {
+                    let _ = TranslateMessage(&m);
+                    DispatchMessageW(&m);
+                }
+            }
+            assert!(start.elapsed().as_secs() < 5, "cross-thread move timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Moves the window from another thread, as a repositioning shell does.
+    fn external_move(hwnd: HWND, x: i32, y: i32) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let raw = hwnd.0 as isize;
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = done.clone();
+        let mover = std::thread::spawn(move || {
+            unsafe {
+                let _ = SetWindowPos(
+                    HWND(raw as *mut _),
+                    None,
+                    x,
+                    y,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            flag.store(true, Ordering::SeqCst);
+        });
+        pump_until(&done);
+        mover.join().unwrap();
+    }
+
+    fn top_left(hwnd: HWND) -> (i32, i32) {
+        let mut r = RECT::default();
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut r);
+        }
+        (r.left, r.top)
+    }
+
+    #[test]
+    fn test_external_recentre_is_undone_until_the_user_moves_it() {
+        use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+        let hwnd = create(HWND::default(), NottSettings::default()).unwrap();
+        let placed = top_left(hwnd);
+        assert_eq!(with_view(|v| v.placement), Some(Some(placed)));
+        // Another thread re-centres it: Nott puts it back
+        external_move(hwnd, placed.0, placed.1 - 90);
+        assert_eq!(top_left(hwnd), placed, "title bar stays clear of the notch");
+        // Nott's own moves are never fought
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                placed.0 + 5,
+                placed.1,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+        assert_eq!(top_left(hwnd), (placed.0 + 5, placed.1));
+        // The user starts moving it: from then on its position is theirs
+        unsafe {
+            SendMessageW(hwnd, WM_ENTERSIZEMOVE, None, None);
+        }
+        assert_eq!(with_view(|v| v.placement), Some(None));
+        external_move(hwnd, 100, 120);
+        assert_eq!(
+            top_left(hwnd),
+            (100, 120),
+            "a user-placed window is left alone"
+        );
+        // Reopening an open window does not move it either
+        open(HWND::default(), NottSettings::default()).unwrap();
+        assert_eq!(top_left(hwnd), (100, 120));
+        close();
+    }
+
+    #[test]
+    fn test_closing_delay_row_layout_hits_and_selection() {
+        assert_eq!(NottSettings::default().collapse_delay, CollapseDelay::Five);
+        for (w, h) in [MIN_CLIENT_SIZE, CLIENT_SIZE] {
+            let l = layout(w, h);
+            // Third row of "Notch", between the switches and "Window behavior"
+            assert_eq!(
+                l.closing_row.top,
+                l.rows[Control::ReducedMotion.index()].row.bottom
+            );
+            assert!(l.closing_row.bottom <= l.sections[1].top);
+            assert_eq!(
+                l.sections[1].bottom,
+                l.rows[Control::CloseOnEscape.index()].row.top
+            );
+            assert!(
+                l.rows[Control::ConfirmClearClipboard.index()].row.bottom <= h,
+                "fits at {w}x{h}"
+            );
+            for (i, r) in l.closing.iter().enumerate() {
+                assert!(r.top > l.closing_row.top && r.bottom < l.closing_row.bottom);
+                assert!(r.left > l.closing_title.right && r.right <= w - PAGE_PADDING);
+                if i > 0 {
+                    assert_eq!(l.closing[i - 1].right, r.left);
+                }
+            }
+            // Media keeps its rows (General's first section's places)
+            assert_eq!(l.rows[4], l.rows[0]);
+        }
+        let (w, h) = CLIENT_SIZE;
+        let l = layout(w, h);
+        for dpi in [96u32, 120, 144, 192] {
+            let s = dpi as f32 / 96.0;
+            for d in CollapseDelay::ALL {
+                let r = l.closing[d.index()];
+                let (x, y) = (
+                    ((r.left + r.right) / 2.0 * s).round() / s,
+                    ((r.top + r.bottom) / 2.0 * s).round() / s,
+                );
+                assert_eq!(
+                    hit(w, h, Category::General, x, y),
+                    Some(Target::Delay(d)),
+                    "{dpi}"
+                );
+                assert_eq!(hit(w, h, Category::Media, x, y), None, "General only");
+            }
+        }
+        // UIA: radio buttons named by duration; only the current one selected
+        let s = NottSettings {
+            collapse_delay: CollapseDelay::Ten,
+            ..NottSettings::default()
+        };
+        let selected: Vec<_> = Element::children(Category::General)
+            .into_iter()
+            .filter(|e| matches!(e, Element::Delay(_)) && e.is_selected(Category::General, s))
+            .collect();
+        assert_eq!(selected, [Element::Delay(CollapseDelay::Ten)]);
+        assert_eq!(
+            Element::Delay(CollapseDelay::Fifteen).name(Category::General),
+            "15 seconds"
+        );
+    }
+
+    /// The delay requests posted to the (null, so thread-queued) notch.
+    fn delay_requests() -> Vec<usize> {
+        use windows::Win32::UI::WindowsAndMessaging::{MSG, PM_REMOVE, PeekMessageW};
+        let mut out = Vec::new();
+        let mut msg = MSG::default();
+        while unsafe {
+            PeekMessageW(
+                &mut msg,
+                None,
+                WM_APP_SETTINGS_DELAY,
+                WM_APP_SETTINGS_DELAY,
+                PM_REMOVE,
+            )
+        }
+        .as_bool()
+        {
+            out.push(msg.wParam.0);
+        }
+        out
+    }
+
+    #[test]
+    fn test_closing_delay_keyboard_request_and_sync() {
+        let hwnd = create(HWND::default(), NottSettings::default()).unwrap();
+        delay_requests();
+        with_view(|v| v.nav.focus = Target::Control(Control::ReducedMotion));
+        key(hwnd, VK_TAB.0);
+        assert_eq!(
+            with_view(|v| v.nav.focus),
+            Some(Target::Delay(CollapseDelay::Five))
+        );
+        key(hwnd, VK_RIGHT.0);
+        key(hwnd, VK_RIGHT.0);
+        key(hwnd, VK_RIGHT.0);
+        assert_eq!(
+            with_view(|v| v.nav.focus),
+            Some(Target::Delay(CollapseDelay::Fifteen)),
+            "stops at the end"
+        );
+        assert!(delay_requests().is_empty(), "moving focus changes nothing");
+        key(hwnd, VK_SPACE.0);
+        assert_eq!(delay_requests(), [CollapseDelay::Fifteen.index()]);
+        // The notch applies it and syncs back; it survives page changes
+        let owned = NottSettings {
+            collapse_delay: CollapseDelay::Fifteen,
+            ..NottSettings::default()
+        };
+        sync(owned);
+        for c in Category::ALL {
+            navigate(hwnd, c);
+        }
+        assert_eq!(
+            with_view(|v| v.settings.collapse_delay),
+            Some(CollapseDelay::Fifteen)
+        );
+        close();
+    }
+
+    #[test]
+    fn test_window_switches_slide_and_stop_and_respect_reduced_motion() {
+        let hwnd = create(HWND::default(), NottSettings::default()).unwrap();
+        let level = |c: Control| with_view(|v| v.switches[c.index()].level()).unwrap();
+        let ticking = || with_view(|v| v.switch_tick.is_some()).unwrap();
+        assert_eq!(level(Control::AlwaysOnTop), 1.0, "starts settled on");
+        assert!(!ticking(), "no timer while settled");
+        // Turned off (motion allowed): it slides on a frame timer
+        let mut s = NottSettings {
+            always_on_top: false,
+            ..NottSettings::default()
+        };
+        sync(s);
+        let motion = crate::window::is_client_animation_enabled();
+        if motion {
+            assert!(ticking(), "frames only while sliding");
+            assert_eq!(level(Control::AlwaysOnTop), 1.0, "starts where it was");
+            with_view(|v| v.switches[0].step(60.0));
+            let mid = level(Control::AlwaysOnTop);
+            assert!(mid > 0.0 && mid < 1.0);
+            with_view(|v| v.switches[0].step(1000.0));
+        }
+        assert_eq!(level(Control::AlwaysOnTop), 0.0);
+        // Under Reduced motion a flip is immediate
+        s.reduced_motion = true;
+        sync(s);
+        assert_eq!(level(Control::ReducedMotion), 1.0, "Reduced motion snaps");
+        s.close_settings_on_escape = false;
+        sync(s);
+        assert_eq!(
+            level(Control::CloseOnEscape),
+            0.0,
+            "snapped while Reduced motion is on"
+        );
+        unsafe {
+            let _ = DestroyWindow(hwnd);
         }
     }
 }

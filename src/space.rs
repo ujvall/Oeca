@@ -54,6 +54,9 @@ pub struct NottSettings {
     /// The Music space's playback visualizer (Settings > Media). On by
     /// default; the collapsed notch keeps its own.
     pub show_visualizer: bool,
+    /// How long after an outside click the expanded notch collapses
+    /// (Settings > General). 5 s by default.
+    pub collapse_delay: crate::config::CollapseDelay,
 }
 
 impl Default for NottSettings {
@@ -67,6 +70,7 @@ impl Default for NottSettings {
             clipboard_capacity: crate::config::ClipboardCapacity::Twenty,
             show_source_app: true,
             show_visualizer: true,
+            collapse_delay: crate::config::CollapseDelay::Five,
         }
     }
 }

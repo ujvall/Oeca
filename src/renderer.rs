@@ -8,16 +8,19 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_BITMAP_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_NONE,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES,
     D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
-    D2D1CreateFactory, ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1Factory, ID2D1PathGeometry,
-    ID2D1RenderTarget,
+    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory, ID2D1Bitmap, ID2D1DCRenderTarget,
+    ID2D1Factory, ID2D1PathGeometry, ID2D1RenderTarget,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_MEASURING_MODE_NATURAL,
-    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_ALIGNMENT_CENTER,
-    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TRIMMING,
-    DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory,
-    IDWriteFactory, IDWriteTextFormat,
+    DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT,
+    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
+    DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
+};
+use windows::Win32::Graphics::DirectWrite::{
+    DWRITE_FONT_WEIGHT, DWRITE_GRID_FIT_MODE_DISABLED, DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
+    DWRITE_TEXT_RANGE, IDWriteFactory2, IDWriteRenderingParams,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
@@ -44,19 +47,17 @@ use crate::config::{
     BASE_DROP_OUTLINE_WIDTH, COLOR_DROP_ICON, COLOR_DROP_OUTLINE, DROP_OUTLINE_DASHES,
 };
 use crate::config::{
-    BASE_MEDIA_ARTIST_FONT_SIZE, BASE_MEDIA_ARTWORK_RADIUS_EXTRA, BASE_MEDIA_BADGE_OVERHANG,
-    BASE_MEDIA_BADGE_RING, BASE_MEDIA_BADGE_SIZE, BASE_MEDIA_DATE_FONT_SIZE, BASE_MEDIA_ICON_SIZE,
-    BASE_MEDIA_PLAY_ICON_SIZE, BASE_MEDIA_SOURCE_FONT_SIZE, BASE_MEDIA_TIME_FONT_SIZE,
-    BASE_MEDIA_TIMELINE_FONT_SIZE, BASE_MEDIA_TIMELINE_LABEL_GAP, BASE_MEDIA_TIMELINE_LABEL_WIDTH,
-    BASE_MEDIA_TIMELINE_MIN_TRACK, BASE_MEDIA_TIMELINE_TRACK, BASE_MEDIA_TITLE_FONT_SIZE,
-    BASE_MUSIC_ARTWORK_RADIUS, BASE_MUSIC_ICON_SIZE, BASE_MUSIC_PLAY_ICON_SIZE,
-    BASE_SPACE_ICON_SIZE, COLOR_ARTWORK_HAIRLINE, COLOR_BORDER_HOVER, COLOR_MEDIA_DIVIDER,
-    COLOR_MEDIA_TRACK_UNPLAYED, COLOR_SPACE_PILL_SELECTED, COLOR_TEXT_PRIMARY,
+    BASE_MEDIA_ARTWORK_RADIUS_EXTRA, BASE_MEDIA_BADGE_OVERHANG, BASE_MEDIA_BADGE_RING,
+    BASE_MEDIA_BADGE_SIZE, BASE_MEDIA_ICON_SIZE, BASE_MEDIA_PLAY_ICON_SIZE,
+    BASE_MEDIA_TIMELINE_LABEL_GAP, BASE_MEDIA_TIMELINE_LABEL_WIDTH, BASE_MEDIA_TIMELINE_MIN_TRACK,
+    BASE_MEDIA_TIMELINE_TRACK, BASE_MUSIC_ARTWORK_RADIUS, BASE_MUSIC_ICON_SIZE,
+    BASE_MUSIC_PLAY_ICON_SIZE, BASE_SPACE_ICON_SIZE, COLOR_ARTWORK_HAIRLINE, COLOR_BORDER_HOVER,
+    COLOR_MEDIA_DIVIDER, COLOR_MEDIA_TRACK_UNPLAYED, COLOR_SPACE_PILL_SELECTED, COLOR_TEXT_PRIMARY,
     COLOR_TEXT_SECONDARY, COLOR_TEXT_TERTIARY, COLOR_TRANSPARENT, CornerProfile,
-    FONT_FAMILY_DISPLAY, FONT_FAMILY_FALLBACK, FONT_FAMILY_PRIMARY, MEDIA_ICON_REST_OPACITY,
-    MEDIA_PRESS_ICON_SCALE, NOTCH_BG_COLOR, NOTCH_BORDER_COLOR, NotchDimensions,
-    SKIP_GLYPH_HALF_WIDTH,
+    FONT_FAMILY_FALLBACK, MEDIA_ICON_REST_OPACITY, MEDIA_PRESS_ICON_SCALE, NOTCH_BG_COLOR,
+    NOTCH_BORDER_COLOR, NotchDimensions, SKIP_GLYPH_HALF_WIDTH,
 };
+use crate::config::{TextRole, UI_FONT_CANDIDATES};
 #[cfg(test)]
 use crate::layout::resolve_media_layout;
 use crate::layout::{
@@ -204,8 +205,13 @@ pub struct Renderer {
     settings: Cell<NottSettings>,
     /// The Clipboard space shows its clear confirmation (mirrors `WindowState`).
     clear_pending: Cell<bool>,
+    /// The Settings page's switches (Always on top, Reduced motion) as they
+    /// slide; stepped on the control-feedback timer.
+    switches: RefCell<[SwitchAnim; 2]>,
     /// Round-capped dashes of the drop page outline (device independent).
     drop_stroke: ID2D1StrokeStyle,
+    /// Text rendering for the layered surface (see `notch_text_params`).
+    text_params: IDWriteRenderingParams,
     /// Solid round caps and joins (the outline copy icon).
     round_stroke: ID2D1StrokeStyle,
     /// Clipboard space rows, rebuilt only when the history changes.
@@ -262,9 +268,11 @@ struct MediaFormats {
     /// remaining (trailing), aligned with the cover and visualizer edges
     elapsed: IDWriteTextFormat,
     remaining: IDWriteTextFormat,
-    /// Space selector labels (centered in their capsules)
     /// Music space without a session (centered)
     empty: IDWriteTextFormat,
+    /// Expanded Home clock without media: numerals and date line (centred).
+    clock_display: IDWriteTextFormat,
+    date_line: IDWriteTextFormat,
 }
 
 /// Music space empty state (no media session): a quiet label, never metadata.
@@ -315,6 +323,100 @@ fn resample_area(src: &Artwork, px: u32) -> Artwork {
     Artwork::new(d as u32, d as u32, out).unwrap_or_else(|| src.clone())
 }
 
+/// Nott's typeface: the first `UI_FONT_CANDIDATES` family installed (system
+/// and per-user fonts), else the documented `FONT_FAMILY_FALLBACK`. Resolved
+/// once per process; shared by the notch and the Settings window.
+pub(crate) fn ui_font(dwrite: &IDWriteFactory) -> (&'static str, windows::core::PCWSTR) {
+    static CHOICE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let choice = *CHOICE.get_or_init(|| {
+        let families = UI_FONT_CANDIDATES.map(|(_, f)| f);
+        first_installed(dwrite, &families)
+    });
+    match choice {
+        Some(i) => UI_FONT_CANDIDATES[i],
+        None => (
+            crate::config::FONT_FAMILY_FALLBACK_NAME,
+            FONT_FAMILY_FALLBACK,
+        ),
+    }
+}
+
+/// Index of the first of `families` installed, if any.
+pub(crate) fn first_installed(
+    dwrite: &IDWriteFactory,
+    families: &[windows::core::PCWSTR],
+) -> Option<usize> {
+    let mut collection = None;
+    unsafe { dwrite.GetSystemFontCollection(&mut collection, false) }.ok()?;
+    let collection = collection?;
+    families.iter().position(|family| {
+        let (mut index, mut exists) = (0u32, windows::core::BOOL(0));
+        unsafe { collection.FindFamilyName(*family, &mut index, &mut exists) }.is_ok()
+            && exists.as_bool()
+    })
+}
+
+/// Text rendering for the notch's layered surface: the system's own gamma
+/// and contrast (so the user's ClearType tuning still applies), greyscale
+/// (no ClearType: the surface is transparent, premultiplied), symmetric
+/// natural rendering and no vertical grid-fitting, so glyphs keep their true
+/// outlines at fractional DPIs instead of snapping into uneven, stepped
+/// stems.
+pub(crate) fn notch_text_params(dwrite: &IDWriteFactory) -> Result<IDWriteRenderingParams> {
+    unsafe {
+        let system = dwrite.CreateRenderingParams()?;
+        let factory: IDWriteFactory2 = windows::core::Interface::cast(dwrite)?;
+        let grayscale_contrast = windows::core::Interface::cast::<
+            windows::Win32::Graphics::DirectWrite::IDWriteRenderingParams1,
+        >(&system)
+        .map_or(0.0, |p| p.GetGrayscaleEnhancedContrast());
+        let params = factory.CreateCustomRenderingParams(
+            system.GetGamma(),
+            system.GetEnhancedContrast(),
+            grayscale_contrast,
+            0.0,
+            windows::Win32::Graphics::DirectWrite::DWRITE_PIXEL_GEOMETRY_FLAT,
+            DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
+            DWRITE_GRID_FIT_MODE_DISABLED,
+        )?;
+        windows::core::Interface::cast(&params)
+    }
+}
+
+/// UTF-16 (start, length) of a time's day-period marker ("AM", "p.m.",
+/// "下午"...) at its start or end, including the space that separates it
+/// from the numerals; None for 24-hour times.
+pub fn meridiem_range(time: &str) -> Option<(u32, u32)> {
+    let units: Vec<char> = time.chars().collect();
+    let is_mark = |c: char| c.is_alphabetic() || c == '.';
+    let len16 = |cs: &[char]| cs.iter().map(|c| c.len_utf16() as u32).sum::<u32>();
+    // Trailing marker: letters at the end, plus the whitespace before them
+    let mut end = units.len();
+    while end > 0 && is_mark(units[end - 1]) {
+        end -= 1;
+    }
+    if end < units.len() && units[..end].iter().any(char::is_ascii_digit) {
+        let mut start = end;
+        while start > 0 && units[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        return Some((len16(&units[..start]), len16(&units[start..])));
+    }
+    // Leading marker: letters at the start, plus the whitespace after them
+    let mut start = 0;
+    while start < units.len() && is_mark(units[start]) {
+        start += 1;
+    }
+    if start > 0 && units[start..].iter().any(char::is_ascii_digit) {
+        let mut end = start;
+        while end < units.len() && units[end].is_whitespace() {
+            end += 1;
+        }
+        return Some((0, len16(&units[..end])));
+    }
+    None
+}
+
 /// Fills a UIcons glyph (`IconSeg` path) in a `u`-sized box centred on (cx, cy);
 /// shared by the notch and the Settings window.
 pub(crate) fn fill_glyph(
@@ -352,28 +454,88 @@ pub(crate) fn fill_glyph(
     Ok(())
 }
 
+/// A switch's animated state: its knob travel `level()` from 0 (OFF) to 1
+/// (ON), eased in and out over `SWITCH_TRAVEL_MS` for a full travel. A new
+/// target mid-way starts from the current level (no jump) and takes only the
+/// remaining distance's share of the time. Stepped by its owner's timer only
+/// while `is_animating()`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SwitchAnim {
+    from: f32,
+    to: f32,
+    /// Progress through the current travel, 0..=1.
+    t: f32,
+}
+
+impl SwitchAnim {
+    pub fn settled(on: bool) -> Self {
+        let v = f32::from(u8::from(on));
+        Self {
+            from: v,
+            to: v,
+            t: 1.0,
+        }
+    }
+
+    pub fn level(&self) -> f32 {
+        let t = self.t.clamp(0.0, 1.0);
+        let eased = t * t * (3.0 - 2.0 * t);
+        self.from + (self.to - self.from) * eased
+    }
+
+    pub fn is_animating(&self) -> bool {
+        self.t < 1.0
+    }
+
+    /// Heads for `on`: animated, or at once when `instant` (Reduced motion).
+    pub fn set(&mut self, on: bool, instant: bool) {
+        let target = f32::from(u8::from(on));
+        if instant {
+            *self = Self::settled(on);
+        } else if target != self.to {
+            *self = Self {
+                from: self.level(),
+                to: target,
+                t: 0.0,
+            };
+        }
+    }
+
+    /// Advances by `dt_ms`; true while still moving.
+    pub fn step(&mut self, dt_ms: f32) -> bool {
+        if self.t < 1.0 {
+            let span = (self.to - self.from).abs().max(0.05) * crate::config::SWITCH_TRAVEL_MS;
+            self.t = (self.t + dt_ms / span).min(1.0);
+        }
+        self.is_animating()
+    }
+}
+
 /// A switch, shared by the notch Settings page and the Settings window: white
 /// track with a black knob at the right when on; a faint track with a white
 /// knob at the left when off. `knob_scale` < 1 tucks the knob in (pressed).
 pub(crate) fn draw_switch(
     rt: &ID2D1RenderTarget,
     t: RectF,
-    on: bool,
+    level: f32,
     inset: f32,
     knob_scale: f32,
     accent: AccentChoice,
 ) -> Result<()> {
+    // `level`: 0 = OFF, 1 = ON (in between while it animates); the track
+    // colour and knob colour blend with the knob's travel
+    let level = level.clamp(0.0, 1.0);
+    let mix = |a: &D2D1_COLOR_F, b: &D2D1_COLOR_F| D2D1_COLOR_F {
+        r: a.r + (b.r - a.r) * level,
+        g: a.g + (b.g - a.g) * level,
+        b: a.b + (b.b - a.b) * level,
+        a: a.a + (b.a - a.a) * level,
+    };
     unsafe {
         // On: the accent track with the knob at the right (position, not
         // color alone, shows the state)
-        let track = rt.CreateSolidColorBrush(
-            &if on {
-                accent.color()
-            } else {
-                COLOR_SPACE_PILL_SELECTED
-            },
-            None,
-        )?;
+        let track =
+            rt.CreateSolidColorBrush(&mix(&COLOR_SPACE_PILL_SELECTED, &accent.color()), None)?;
         rt.FillRoundedRectangle(
             &D2D1_ROUNDED_RECT {
                 rect: t.to_d2d_rect(),
@@ -383,25 +545,16 @@ pub(crate) fn draw_switch(
             &track,
         );
         let full = t.height() - 2.0 * inset;
-        let left = if on {
-            t.right - inset - full
-        } else {
-            t.left + inset
-        };
+        let (off_left, on_left) = (t.left + inset, t.right - inset - full);
+        let left = off_left + (on_left - off_left) * level;
         let (cx, cy, d) = (
             left + full / 2.0,
             t.top + inset + full / 2.0,
             full * knob_scale,
         );
         let knob = RectF::new(cx - d / 2.0, cy - d / 2.0, cx + d / 2.0, cy + d / 2.0);
-        let knob_brush = rt.CreateSolidColorBrush(
-            if on {
-                &NOTCH_BG_COLOR
-            } else {
-                &COLOR_TEXT_PRIMARY
-            },
-            None,
-        )?;
+        let knob_brush =
+            rt.CreateSolidColorBrush(&mix(&COLOR_TEXT_PRIMARY, &NOTCH_BG_COLOR), None)?;
         rt.FillRoundedRectangle(
             &D2D1_ROUNDED_RECT {
                 rect: knob.to_d2d_rect(),
@@ -683,8 +836,40 @@ impl Renderer {
 
     /// Mirrors the Settings page state and the settings values.
     pub fn set_settings(&self, open: bool, settings: NottSettings) {
-        self.settings_open.set(open);
-        self.settings.set(settings);
+        let was_open = self.settings_open.replace(open);
+        let old = self.settings.replace(settings);
+        // A value flipped while the page shows slides its switch (at once
+        // under Reduced motion); a page that is hidden or just opening simply
+        // shows the current values
+        let instant = !crate::window::motion_allowed(
+            settings.reduced_motion,
+            crate::window::is_client_animation_enabled(),
+        );
+        let pairs = [
+            (old.always_on_top, settings.always_on_top),
+            (old.reduced_motion, settings.reduced_motion),
+        ];
+        for (anim, (was, now)) in self.switches.borrow_mut().iter_mut().zip(pairs) {
+            if !open || !was_open {
+                *anim = SwitchAnim::settled(now);
+            } else if was != now {
+                anim.set(now, instant);
+            }
+        }
+    }
+
+    /// Advances the Settings page's switches; true while any still moves.
+    pub fn step_switches(&self, dt_ms: f32) -> bool {
+        let mut any = false;
+        for anim in self.switches.borrow_mut().iter_mut() {
+            any |= anim.step(dt_ms);
+        }
+        any
+    }
+
+    /// Whether a Settings page switch is still sliding.
+    pub fn switches_animating(&self) -> bool {
+        self.switches.borrow().iter().any(SwitchAnim::is_animating)
     }
 
     /// Shows / hides the Clipboard space's clear confirmation (caller redraws).
@@ -771,6 +956,7 @@ impl Renderer {
             unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)? };
         let dwrite_factory: IDWriteFactory =
             unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
+        let text_params = notch_text_params(&dwrite_factory)?;
         let round_stroke = unsafe {
             d2d_factory.CreateStrokeStyle(
                 &D2D1_STROKE_STYLE_PROPERTIES {
@@ -829,7 +1015,15 @@ impl Renderer {
             settings_open: Cell::new(false),
             settings: Cell::new(NottSettings::default()),
             clear_pending: Cell::new(false),
+            switches: RefCell::new({
+                let s = NottSettings::default();
+                [
+                    SwitchAnim::settled(s.always_on_top),
+                    SwitchAnim::settled(s.reduced_motion),
+                ]
+            }),
             drop_stroke,
+            text_params,
         })
     }
 
@@ -945,6 +1139,11 @@ impl Renderer {
             };
 
             let rt = self.d2d_factory.CreateDCRenderTarget(&rt_props)?;
+            // Greyscale is what a transparent, premultiplied layered surface
+            // can blend correctly (ClearType would fall back to it anyway);
+            // the params keep outlines true instead of grid-snapped
+            rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            rt.SetTextRenderingParams(&self.text_params);
 
             self.cached_screen_dc.set(screen_dc);
             self.cached_mem_dc.set(mem_dc);
@@ -959,14 +1158,30 @@ impl Renderer {
         Ok(())
     }
 
-    /// Creates a DirectWrite text format with primary font family and graceful fallback.
+    /// A DirectWrite text format in Nott's typeface (`ui_font`).
     fn create_text_format(
         &self,
         font_size: f32,
         weight: windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT,
         style: windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STYLE,
     ) -> Result<IDWriteTextFormat> {
-        self.create_text_format_in(FONT_FAMILY_PRIMARY, font_size, weight, style)
+        self.create_text_format_in(ui_font(&self.dwrite_factory).1, font_size, weight, style)
+    }
+
+    /// A role's single-line format at `scale`, aligned `align`.
+    fn role_format(
+        &self,
+        role: TextRole,
+        scale: f32,
+        align: DWRITE_TEXT_ALIGNMENT,
+    ) -> Result<IDWriteTextFormat> {
+        let style = role.style();
+        self.create_line_format(
+            ui_font(&self.dwrite_factory).1,
+            style.size * scale,
+            DWRITE_FONT_WEIGHT(style.weight),
+            align,
+        )
     }
 
     /// Text format in `family`, falling back to Segoe UI if it is not installed.
@@ -990,21 +1205,9 @@ impl Renderer {
             )
         };
 
-        match format_result {
-            Ok(fmt) => Ok(fmt),
-            Err(_) => unsafe {
-                // Fallback to standard Segoe UI if Segoe UI Variable Text is absent
-                self.dwrite_factory.CreateTextFormat(
-                    FONT_FAMILY_FALLBACK,
-                    None,
-                    weight,
-                    style,
-                    DWRITE_FONT_STRETCH_NORMAL,
-                    font_size,
-                    windows::core::PCWSTR(locale.as_ptr()),
-                )
-            },
-        }
+        // A missing family does not fail here (DirectWrite substitutes at
+        // draw time), so the family is resolved beforehand (`ui_font`)
+        format_result
     }
 
     /// Mathematically generates a hardware-notch path geometry with smooth
@@ -1567,7 +1770,7 @@ impl Renderer {
         {
             let format = self.create_text_format(
                 dimensions.font_size_clock,
-                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                DWRITE_FONT_WEIGHT(TextRole::ClockCompact.style().weight),
                 DWRITE_FONT_STYLE_NORMAL,
             )?;
             unsafe {
@@ -1966,7 +2169,6 @@ impl Renderer {
             return Ok(());
         };
         let formats = self.media_formats(dimensions)?;
-        let settings = self.settings.get();
         let px = |v: f32| (v * dimensions.scale).round();
         let text = |s: &str, f: &IDWriteTextFormat, r: RectF, b| unsafe {
             let s: Vec<u16> = s.encode_utf16().collect();
@@ -1983,23 +2185,24 @@ impl Renderer {
             let primary = rt.CreateSolidColorBrush(&COLOR_TEXT_PRIMARY, None)?;
             let tertiary = rt.CreateSolidColorBrush(&COLOR_TEXT_TERTIARY, None)?;
             text(SETTINGS_LABEL, &formats.source, l.label, &tertiary);
-            for (row, title, description, on) in [
+            let levels = self.switches.borrow().map(|a| a.level());
+            for (row, title, description, level) in [
                 (
                     l.always_on_top,
                     ALWAYS_ON_TOP_TITLE,
                     ALWAYS_ON_TOP_DESCRIPTION,
-                    settings.always_on_top,
+                    levels[0],
                 ),
                 (
                     l.reduced_motion,
                     REDUCED_MOTION_TITLE,
                     REDUCED_MOTION_DESCRIPTION,
-                    settings.reduced_motion,
+                    levels[1],
                 ),
             ] {
                 text(title, &formats.artist, row.title, &primary);
                 text(description, &formats.source, row.description, &tertiary);
-                self.draw_switch(rt, row.toggle, on, px(BASE_SETTINGS_TOGGLE_KNOB_INSET))?;
+                self.draw_switch(rt, row.toggle, level, px(BASE_SETTINGS_TOGGLE_KNOB_INSET))?;
             }
             // Action row: text, and a chevron at the right content edge
             let secondary = rt.CreateSolidColorBrush(&COLOR_TEXT_SECONDARY, None)?;
@@ -2030,8 +2233,8 @@ impl Renderer {
     }
 
     /// A switch (see `draw_switch`).
-    fn draw_switch(&self, rt: &ID2D1RenderTarget, t: RectF, on: bool, inset: f32) -> Result<()> {
-        draw_switch(rt, t, on, inset, 1.0, self.settings.get().accent)
+    fn draw_switch(&self, rt: &ID2D1RenderTarget, t: RectF, level: f32, inset: f32) -> Result<()> {
+        draw_switch(rt, t, level, inset, 1.0, self.settings.get().accent)
     }
 
     /// Home <-> Music with a session: cover, text and controls move between
@@ -2444,47 +2647,27 @@ impl Renderer {
             rt.PushAxisAlignedClip(&clip_rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         }
 
-        // 1. Primary live time (approx 28 DIP, Semibold, COLOR_TEXT_PRIMARY)
-        let time_format = self.create_text_format(
-            dimensions.font_size_expanded_time,
-            DWRITE_FONT_WEIGHT_SEMI_BOLD,
-            DWRITE_FONT_STYLE_NORMAL,
-        )?;
-        unsafe {
-            time_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
-            time_format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-        }
-        let time_utf16: Vec<u16> = formatted_time.encode_utf16().collect();
-        let time_rect = layout.time_bounds.to_d2d_rect();
+        // 1. Live time: display numerals with a smaller, lighter AM/PM
+        let formats = self.media_formats(dimensions)?;
         let primary_brush = unsafe { rt.CreateSolidColorBrush(&COLOR_TEXT_PRIMARY, None)? };
-        unsafe {
-            rt.DrawText(
-                &time_utf16,
-                &time_format,
-                &time_rect,
-                &primary_brush,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
-        }
-
-        // 2. Secondary live date (approx 12 DIP, Regular, COLOR_TEXT_SECONDARY)
-        let date_format = self.create_text_format(
-            dimensions.font_size_expanded_date,
-            DWRITE_FONT_WEIGHT_REGULAR,
-            DWRITE_FONT_STYLE_NORMAL,
+        self.draw_clock_display(
+            rt,
+            formatted_time,
+            &formats.clock_display,
+            TextRole::ClockDisplay.style().size * dimensions.scale,
+            layout.time_bounds,
+            &primary_brush,
         )?;
-        unsafe {
-            date_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
-            date_format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-        }
+
+        // 2. Date line
+        let date_format = &formats.date_line;
         let date_utf16: Vec<u16> = formatted_date.encode_utf16().collect();
         let date_rect = layout.date_bounds.to_d2d_rect();
         let secondary_brush = unsafe { rt.CreateSolidColorBrush(&COLOR_TEXT_SECONDARY, None)? };
         unsafe {
             rt.DrawText(
                 &date_utf16,
-                &date_format,
+                date_format,
                 &date_rect,
                 &secondary_brush,
                 D2D1_DRAW_TEXT_OPTIONS_NONE,
@@ -2493,6 +2676,50 @@ impl Renderer {
             rt.PopAxisAlignedClip();
         }
 
+        Ok(())
+    }
+
+    /// The expanded Home time in `rect` (centred): its numerals in `format`
+    /// (`size` px), and an AM/PM (or locale equivalent, with the space before
+    /// it) at `CLOCK_MERIDIEM_SCALE` of that size in `CLOCK_MERIDIEM_WEIGHT`,
+    /// sharing the numerals' baseline.
+    fn draw_clock_display(
+        &self,
+        rt: &ID2D1RenderTarget,
+        text: &str,
+        format: &IDWriteTextFormat,
+        size: f32,
+        rect: RectF,
+        brush: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
+    ) -> Result<()> {
+        let utf16: Vec<u16> = text.encode_utf16().collect();
+        unsafe {
+            // DrawText builds the same layout internally; building it here
+            // only adds the meridiem's range
+            let layout = self.dwrite_factory.CreateTextLayout(
+                &utf16,
+                format,
+                rect.width().max(1.0),
+                rect.height().max(1.0),
+            )?;
+            if let Some((start, length)) = meridiem_range(text) {
+                let range = DWRITE_TEXT_RANGE {
+                    startPosition: start,
+                    length,
+                };
+                layout.SetFontSize(size * crate::config::CLOCK_MERIDIEM_SCALE, range)?;
+                layout.SetFontWeight(
+                    DWRITE_FONT_WEIGHT(crate::config::CLOCK_MERIDIEM_WEIGHT),
+                    range,
+                )?;
+            }
+            // The origin's vector type, reached like `set_offset`'s matrix
+            let mut origin =
+                windows::Win32::Graphics::Direct2D::D2D1_POINT_DESCRIPTION::default().point;
+            origin.X = rect.left;
+            origin.Y = rect.top;
+            rt.DrawTextLayout(origin, &layout, brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+        }
         Ok(())
     }
 
@@ -2533,54 +2760,18 @@ impl Renderer {
             .is_none_or(|(dpi, _)| *dpi != dimensions.dpi);
         if stale {
             let s = dimensions.scale;
-            let line = |size: f32, weight, align| {
-                self.create_line_format(FONT_FAMILY_PRIMARY, size * s, weight, align)
-            };
-            // Display optical size for the larger, bolder lines
-            let display = |size: f32, weight, align| {
-                self.create_line_format(FONT_FAMILY_DISPLAY, size * s, weight, align)
-            };
+            let role = |role, align| self.role_format(role, s, align);
             let formats = MediaFormats {
-                title: display(
-                    BASE_MEDIA_TITLE_FONT_SIZE,
-                    DWRITE_FONT_WEIGHT_SEMI_BOLD,
-                    DWRITE_TEXT_ALIGNMENT_LEADING,
-                )?,
-                artist: line(
-                    BASE_MEDIA_ARTIST_FONT_SIZE,
-                    DWRITE_FONT_WEIGHT_REGULAR,
-                    DWRITE_TEXT_ALIGNMENT_LEADING,
-                )?,
-                source: line(
-                    BASE_MEDIA_SOURCE_FONT_SIZE,
-                    DWRITE_FONT_WEIGHT_REGULAR,
-                    DWRITE_TEXT_ALIGNMENT_LEADING,
-                )?,
-                time: display(
-                    BASE_MEDIA_TIME_FONT_SIZE,
-                    DWRITE_FONT_WEIGHT_SEMI_BOLD,
-                    DWRITE_TEXT_ALIGNMENT_TRAILING,
-                )?,
-                date: line(
-                    BASE_MEDIA_DATE_FONT_SIZE,
-                    DWRITE_FONT_WEIGHT_REGULAR,
-                    DWRITE_TEXT_ALIGNMENT_TRAILING,
-                )?,
-                elapsed: line(
-                    BASE_MEDIA_TIMELINE_FONT_SIZE,
-                    DWRITE_FONT_WEIGHT_REGULAR,
-                    DWRITE_TEXT_ALIGNMENT_LEADING,
-                )?,
-                remaining: line(
-                    BASE_MEDIA_TIMELINE_FONT_SIZE,
-                    DWRITE_FONT_WEIGHT_REGULAR,
-                    DWRITE_TEXT_ALIGNMENT_TRAILING,
-                )?,
-                empty: line(
-                    BASE_MEDIA_ARTIST_FONT_SIZE,
-                    DWRITE_FONT_WEIGHT_REGULAR,
-                    DWRITE_TEXT_ALIGNMENT_CENTER,
-                )?,
+                title: role(TextRole::MediaTitle, DWRITE_TEXT_ALIGNMENT_LEADING)?,
+                artist: role(TextRole::MediaArtist, DWRITE_TEXT_ALIGNMENT_LEADING)?,
+                source: role(TextRole::MediaMeta, DWRITE_TEXT_ALIGNMENT_LEADING)?,
+                time: role(TextRole::ClockColumn, DWRITE_TEXT_ALIGNMENT_TRAILING)?,
+                date: role(TextRole::DateCompact, DWRITE_TEXT_ALIGNMENT_TRAILING)?,
+                elapsed: role(TextRole::Timestamp, DWRITE_TEXT_ALIGNMENT_LEADING)?,
+                remaining: role(TextRole::Timestamp, DWRITE_TEXT_ALIGNMENT_TRAILING)?,
+                empty: role(TextRole::EmptyState, DWRITE_TEXT_ALIGNMENT_CENTER)?,
+                clock_display: role(TextRole::ClockDisplay, DWRITE_TEXT_ALIGNMENT_CENTER)?,
+                date_line: role(TextRole::DateLine, DWRITE_TEXT_ALIGNMENT_CENTER)?,
             };
             *self.media_formats.borrow_mut() = Some((dimensions.dpi, formats));
         }
@@ -7055,5 +7246,232 @@ mod tests {
             };
             assert_ne!(mask(sel.home), mask(sel.music), "distinct icons at {dpi}");
         }
+    }
+
+    #[test]
+    fn test_ui_font_resolution_and_fallback() {
+        use windows::core::w;
+        let renderer = Renderer::new().expect("renderer");
+        let dw = &renderer.dwrite_factory;
+        // First installed wins; nothing installed is reported, not guessed
+        assert_eq!(
+            first_installed(dw, &[w!("No Such Font 7f3a"), w!("Bahnschrift")]),
+            Some(1)
+        );
+        assert_eq!(first_installed(dw, &[w!("No Such Font 7f3a")]), None);
+        // The chosen face is a candidate that exists here, or the named
+        // fallback; Bahnschrift ships with Windows, so it is never needed
+        let (name, family) = ui_font(dw);
+        let candidates: Vec<&str> = UI_FONT_CANDIDATES.iter().map(|(n, _)| *n).collect();
+        assert!(candidates.contains(&name), "{name}");
+        assert_eq!(
+            first_installed(dw, &[family]),
+            Some(0),
+            "{name} is installed"
+        );
+        assert_eq!(ui_font(dw), (name, family), "resolved once, stable");
+    }
+
+    #[test]
+    fn test_meridiem_range_across_locales() {
+        let r = |s: &str| meridiem_range(s);
+        assert_eq!(r("12:47 AM"), Some((5, 3)), "space + AM");
+        assert_eq!(r("9:05 p.m."), Some((4, 5)));
+        assert_eq!(r("AM 12:47"), Some((0, 3)), "leading, with its space");
+        assert_eq!(r("\u{4e0b}\u{5348} 5:49"), Some((0, 3)), "CJK day period");
+        assert_eq!(r("오후 5:49"), Some((0, 3)));
+        assert_eq!(r("17:42"), None, "24-hour");
+        assert_eq!(r("17.42"), None);
+        assert_eq!(r(""), None);
+        assert_eq!(r("AM"), None, "no numerals");
+    }
+
+    #[test]
+    fn test_text_resources_are_shared_and_rendering_is_greyscale() {
+        use windows::Win32::Graphics::Direct2D::D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE;
+        use windows::core::Interface;
+        let renderer = Renderer::new().expect("renderer");
+        for dpi in [96u32, 120, 137, 144, 168, 192, 288] {
+            let dims = NotchDimensions::from_state_and_dpi(NotchState::Expanded, dpi);
+            // One format set per DPI, reused frame after frame
+            let a = renderer.media_formats(&dims).unwrap().title.as_raw();
+            let b = renderer.media_formats(&dims).unwrap().title.as_raw();
+            assert_eq!(a, b, "formats reused at {dpi}");
+            let f = renderer.media_formats(&dims).unwrap();
+            let size = unsafe { f.title.GetFontSize() };
+            assert!((size - TextRole::MediaTitle.style().size * dims.scale).abs() < 1e-3);
+            assert!(
+                unsafe { f.source.GetFontSize() } >= 10.0,
+                "small text >= 10 px at {dpi}"
+            );
+        }
+        // The layered surface draws greyscale text with the custom params
+        let dims = NotchDimensions::from_state_and_dpi(NotchState::Expanded, 120);
+        renderer.ensure_buffer(dims.width, dims.height).unwrap();
+        let rt = renderer.cached_rt.borrow();
+        let rt = rt.as_ref().unwrap();
+        unsafe {
+            assert_eq!(
+                rt.GetTextAntialiasMode(),
+                D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE
+            );
+            let params = rt.GetTextRenderingParams().unwrap();
+            assert_eq!(params.as_raw(), renderer.text_params.as_raw());
+            let p2: windows::Win32::Graphics::DirectWrite::IDWriteRenderingParams2 =
+                renderer.text_params.cast().unwrap();
+            assert_eq!(
+                p2.GetGridFitMode(),
+                windows::Win32::Graphics::DirectWrite::DWRITE_GRID_FIT_MODE_DISABLED
+            );
+            assert_eq!(p2.GetClearTypeLevel(), 0.0);
+        }
+    }
+
+    #[test]
+    fn test_clock_meridiem_is_smaller_than_the_numerals() {
+        let renderer = Renderer::new().expect("renderer");
+        for dpi in [96u32, 120, 144, 192] {
+            let dims = NotchDimensions::from_state_and_dpi(NotchState::Expanded, dpi);
+            let ResolvedLayout::Expanded { components, .. } = resolve_layout(&dims) else {
+                unreachable!()
+            };
+            let clock = ClockDateState::from_pure_components(2026, 10, 6, 1, 0, 47, 0, 0, false);
+            renderer.set_media(None);
+            let (px, stride) = render_custom_frame(&renderer, &dims, |rt| {
+                renderer
+                    .render_expanded_content(
+                        rt,
+                        &components,
+                        &dims,
+                        &clock.formatted_time,
+                        &clock.formatted_date,
+                    )
+                    .unwrap()
+            });
+            // Lit columns inside the time box, grouped into glyph runs
+            let t = components.time_bounds;
+            let column = |x: usize| -> Option<(usize, usize)> {
+                let ys: Vec<usize> = (t.top as usize..t.bottom as usize)
+                    .filter(|&y| (px[y * stride + x] & 0xFF) > 90)
+                    .collect();
+                Some((*ys.first()?, *ys.last()?))
+            };
+            let cols: Vec<(usize, Option<(usize, usize)>)> = (t.left as usize..t.right as usize)
+                .map(|x| (x, column(x)))
+                .collect();
+            let lit: Vec<&(usize, Option<(usize, usize)>)> =
+                cols.iter().filter(|(_, c)| c.is_some()).collect();
+            let (first_x, last_x) = (lit.first().unwrap().0, lit.last().unwrap().0);
+            let height = |x0: usize, x1: usize| {
+                let spans: Vec<(usize, usize)> = cols
+                    .iter()
+                    .filter(|(x, c)| *x >= x0 && *x <= x1 && c.is_some())
+                    .map(|(_, c)| c.unwrap())
+                    .collect();
+                spans.iter().map(|s| s.1).max().unwrap() - spans.iter().map(|s| s.0).min().unwrap()
+            };
+            let w = last_x - first_x;
+            // Numerals at the left, the meridiem in the last fifth
+            let digits = height(first_x, first_x + w / 5);
+            let meridiem = height(last_x - w / 5, last_x);
+            assert!(
+                (meridiem as f32) < digits as f32 * 0.7,
+                "AM {meridiem} px vs digits {digits} px at {dpi}"
+            );
+            // Same baseline: the marker's bottom sits on the numerals' bottom
+            let bottom = |x0: usize, x1: usize| {
+                cols.iter()
+                    .filter(|(x, c)| *x >= x0 && *x <= x1 && c.is_some())
+                    .map(|(_, c)| c.unwrap().1)
+                    .max()
+                    .unwrap()
+            };
+            let (db, mb) = (
+                bottom(first_x, first_x + w / 5),
+                bottom(last_x - w / 5, last_x),
+            );
+            assert!(
+                db.abs_diff(mb) <= 1 + dpi as usize / 96,
+                "baseline at {dpi}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_switch_anim_endpoints_reversal_and_settling() {
+        let mut a = SwitchAnim::settled(false);
+        assert_eq!(a.level(), 0.0);
+        assert!(!a.is_animating(), "settled: no work");
+        a.set(true, false);
+        assert!(a.is_animating());
+        // Monotonic ease to exactly ON within the travel time
+        let mut prev = a.level();
+        let mut t = 0.0;
+        while a.step(8.0) {
+            assert!(a.level() >= prev - 1e-6);
+            prev = a.level();
+            t += 8.0;
+            assert!(t <= crate::config::SWITCH_TRAVEL_MS + 8.0);
+        }
+        assert_eq!(a.level(), 1.0);
+        assert!((140.0..=200.0).contains(&crate::config::SWITCH_TRAVEL_MS));
+        // Reverse mid-way: continues from where it is (no jump), back to OFF
+        // in less than a full travel
+        a.set(false, false);
+        a.step(60.0);
+        let mid = a.level();
+        a.set(true, false);
+        assert!((a.level() - mid).abs() < 1e-6, "no jump on retarget");
+        let mut steps = 0;
+        while a.step(8.0) {
+            steps += 1;
+        }
+        assert_eq!(a.level(), 1.0);
+        assert!(
+            (steps as f32) * 8.0 < crate::config::SWITCH_TRAVEL_MS,
+            "shorter: partial travel"
+        );
+        // Same target again: nothing restarts; instant snaps
+        a.set(true, false);
+        assert!(!a.is_animating());
+        a.set(false, true);
+        assert_eq!((a.level(), a.is_animating()), (0.0, false));
+    }
+
+    #[test]
+    fn test_notch_page_switches_slide_on_toggle_and_snap_otherwise() {
+        let renderer = Renderer::new().expect("renderer");
+        let on = NottSettings::default();
+        let off = NottSettings {
+            always_on_top: false,
+            ..on
+        };
+        // Page hidden: values just show
+        renderer.set_settings(false, off);
+        assert!(!renderer.switches_animating());
+        assert_eq!(renderer.switches.borrow()[0].level(), 0.0);
+        // Opening shows current values, no slide
+        renderer.set_settings(true, on);
+        assert!(!renderer.switches_animating());
+        assert_eq!(renderer.switches.borrow()[0].level(), 1.0);
+        // Flipped while showing: slides (unless the system disables motion)
+        renderer.set_settings(true, off);
+        if crate::window::is_client_animation_enabled() {
+            assert!(renderer.switches_animating());
+            while renderer.step_switches(16.0) {}
+        }
+        assert_eq!(renderer.switches.borrow()[0].level(), 0.0);
+        assert!(
+            !renderer.switches_animating(),
+            "settled: the timer can stop"
+        );
+        // Under Reduced motion the flip is immediate
+        let reduced = NottSettings {
+            reduced_motion: true,
+            ..off
+        };
+        renderer.set_settings(true, reduced);
+        assert!(!renderer.switches_animating());
+        assert_eq!(renderer.switches.borrow()[1].level(), 1.0);
     }
 }

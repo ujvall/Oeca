@@ -112,10 +112,116 @@ pub const BASE_PADDING_H: f32 = BASE_COLLAPSED_PADDING_H;
 pub const BASE_PADDING_V: f32 = BASE_COLLAPSED_PADDING_V;
 pub const BASE_SPACING: f32 = 8.0;
 
-// Typography tokens (logical point / DIP sizes)
-pub const FONT_FAMILY_PRIMARY: PCWSTR = w!("Segoe UI Variable Text");
-pub const FONT_FAMILY_FALLBACK: PCWSTR = w!("Segoe UI");
-pub const FONT_FAMILY_DISPLAY: PCWSTR = w!("Segoe UI Variable Display");
+// ── Typography ──────────────────────────────────────────────────────────
+//
+// One typeface for everything, resolved once at run time
+// (`renderer::ui_font`): the first of these installed. General Sans and
+// Satoshi (Fontshare) are used only when the user has installed them, never
+// bundled; Bahnschrift ships with every Windows 10 / 11, so it is the
+// guaranteed fallback. To try another face, put it first.
+pub const UI_FONT_CANDIDATES: [(&str, PCWSTR); 3] = [
+    ("General Sans", w!("General Sans")),
+    ("Satoshi", w!("Satoshi")),
+    ("Bahnschrift", w!("Bahnschrift")),
+];
+/// Last resort when none of the candidates is installed (reported by
+/// `ui_font`, never substituted silently by DirectWrite).
+pub const FONT_FAMILY_FALLBACK_NAME: &str = "Segoe UI Variable Text";
+pub const FONT_FAMILY_FALLBACK: PCWSTR = w!("Segoe UI Variable Text");
+
+/// A typographic role: every piece of text in Nott is drawn in one of these,
+/// so size and weight live here, not at the call sites. Sizes are DIP (the
+/// notch scales them by its DPI; the Settings window draws in DIP).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextRole {
+    /// Collapsed notch clock.
+    ClockCompact,
+    /// Expanded Home clock (no media); its AM/PM is drawn at
+    /// `CLOCK_MERIDIEM_SCALE` of this size in `CLOCK_MERIDIEM_WEIGHT`.
+    ClockDisplay,
+    /// Home media layout: the clock column's time and short date.
+    ClockColumn,
+    DateCompact,
+    /// Expanded Home date (no media).
+    DateLine,
+    /// Track title / artist / tertiary metadata (source app, Settings scene
+    /// captions, clipboard image captions).
+    MediaTitle,
+    MediaArtist,
+    MediaMeta,
+    /// Music scrubber elapsed / remaining.
+    Timestamp,
+    /// Quiet centred empty-state labels.
+    EmptyState,
+    /// Settings window: page title, section heading, setting label,
+    /// supporting description, sidebar entry (regular / selected) and the
+    /// compact capacity segments.
+    PageTitle,
+    SectionHeading,
+    SettingLabel,
+    SettingDescription,
+    SidebarItem,
+    SidebarItemSelected,
+}
+
+/// Size (DIP) and weight (100..900) of a role.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextStyle {
+    pub size: f32,
+    pub weight: i32,
+}
+
+impl TextRole {
+    pub const ALL: [Self; 16] = [
+        Self::ClockCompact,
+        Self::ClockDisplay,
+        Self::ClockColumn,
+        Self::DateCompact,
+        Self::DateLine,
+        Self::MediaTitle,
+        Self::MediaArtist,
+        Self::MediaMeta,
+        Self::Timestamp,
+        Self::EmptyState,
+        Self::PageTitle,
+        Self::SectionHeading,
+        Self::SettingLabel,
+        Self::SettingDescription,
+        Self::SidebarItem,
+        Self::SidebarItemSelected,
+    ];
+
+    /// Restrained weights: semibold carries emphasis (titles, numerals),
+    /// regular carries reading text, and medium keeps the smallest grey text
+    /// (10-11 DIP) from thinning out on black.
+    pub fn style(self) -> TextStyle {
+        let (size, weight) = match self {
+            Self::ClockCompact => (BASE_FONT_SIZE_CLOCK, 600),
+            Self::ClockDisplay => (BASE_EXPANDED_FONT_SIZE_TIME, 600),
+            Self::ClockColumn => (BASE_MEDIA_TIME_FONT_SIZE, 600),
+            Self::DateCompact => (BASE_MEDIA_DATE_FONT_SIZE, 500),
+            Self::DateLine => (BASE_EXPANDED_FONT_SIZE_DATE, 400),
+            Self::MediaTitle => (BASE_MEDIA_TITLE_FONT_SIZE, 600),
+            Self::MediaArtist => (BASE_MEDIA_ARTIST_FONT_SIZE, 400),
+            Self::MediaMeta => (BASE_MEDIA_SOURCE_FONT_SIZE, 500),
+            Self::Timestamp => (BASE_MEDIA_TIMELINE_FONT_SIZE, 500),
+            Self::EmptyState => (BASE_MEDIA_ARTIST_FONT_SIZE, 400),
+            Self::PageTitle => (24.0, 600),
+            Self::SectionHeading => (13.0, 600),
+            Self::SettingLabel => (14.0, 400),
+            Self::SettingDescription => (12.0, 400),
+            Self::SidebarItem => (14.0, 400),
+            Self::SidebarItemSelected => (14.0, 600),
+        };
+        TextStyle { size, weight }
+    }
+}
+
+/// The expanded Home clock's AM/PM (or locale equivalent): a smaller, lighter
+/// companion to the numerals on the same baseline.
+pub const CLOCK_MERIDIEM_SCALE: f32 = 0.5;
+pub const CLOCK_MERIDIEM_WEIGHT: i32 = 500;
+
 pub const BASE_FONT_SIZE_PRIMARY: f32 = 13.0;
 pub const BASE_FONT_SIZE_SECONDARY: f32 = 10.5;
 pub const BASE_FONT_SIZE_MUTED: f32 = 9.0;
@@ -232,6 +338,66 @@ pub const CLIPBOARD_MAX_TEXT_UNITS: usize = 256 * 1024;
 /// finishes rendering/flushing its data first, and bursts coalesce into one
 /// read. The timer exists only between an update and its read.
 pub const CLIPBOARD_TIMER_ID: usize = 1005;
+/// One-shot: the expanded notch collapses `CollapseDelay` after a click
+/// outside Nott, unless Nott is used again first (restarted by each outside
+/// click).
+pub const AUTO_COLLAPSE_TIMER_ID: usize = 1006;
+
+/// How long after an outside click the expanded notch collapses (Settings >
+/// General > Notch closing behaviour). 5 s is the default (the original
+/// behaviour).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CollapseDelay {
+    #[default]
+    Five,
+    Ten,
+    Fifteen,
+}
+
+impl CollapseDelay {
+    pub const ALL: [Self; 3] = [Self::Five, Self::Ten, Self::Fifteen];
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    pub fn from_index(i: usize) -> Option<Self> {
+        Self::ALL.get(i).copied()
+    }
+
+    /// The countdown (ms).
+    pub fn ms(self) -> u32 {
+        match self {
+            Self::Five => 5_000,
+            Self::Ten => 10_000,
+            Self::Fifteen => 15_000,
+        }
+    }
+
+    /// Accessible name ("5 seconds") and compact segment label ("5s").
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Five => "5 seconds",
+            Self::Ten => "10 seconds",
+            Self::Fifteen => "15 seconds",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Five => "5s",
+            Self::Ten => "10s",
+            Self::Fifteen => "15s",
+        }
+    }
+}
+
+/// A settings switch's knob travel, OFF -> ON, and how long a full travel
+/// takes (a reversal mid-way travels only the remaining distance).
+pub const SWITCH_TRAVEL_MS: f32 = 170.0;
+/// Frame period of the Settings window's switch animation (it has no other
+/// timer; the notch's switches ride its control-feedback timer).
+pub const SWITCH_FRAME_MS: u32 = 16;
 pub const CLIPBOARD_SETTLE_MS: u32 = 150;
 
 pub const MEDIA_FEEDBACK_TIMER_ID: usize = 1003;
@@ -1892,7 +2058,7 @@ mod tests {
         assert_eq!(dims_150.spacing, (8.0f32 * 1.5).round());
 
         // Font family strings are non-empty
-        assert!(!FONT_FAMILY_PRIMARY.is_null());
+        assert!(UI_FONT_CANDIDATES.iter().all(|(_, f)| !f.is_null()));
         assert!(!FONT_FAMILY_FALLBACK.is_null());
         assert_eq!(BASE_ICON_STROKE_WIDTH, 1.2);
     }
@@ -2199,7 +2365,6 @@ mod tests {
         assert!(BASE_HEADER_HEIGHT > 0.0);
         assert!(BASE_SEPARATOR_MARGIN_TOP >= 0.0);
         assert!(BASE_PREVIEW_MARGIN_TOP >= 0.0);
-        assert!(!FONT_FAMILY_PRIMARY.is_null());
         assert!(!FONT_FAMILY_FALLBACK.is_null());
 
         // Relative font size hierarchy
@@ -3241,5 +3406,41 @@ mod tests {
                 assert_eq!(*f.last().unwrap(), geometry_for(to, size));
             }
         }
+    }
+
+    #[test]
+    fn test_typography_roles_hierarchy_and_dpi_floor() {
+        use TextRole::*;
+        let st = |r: TextRole| r.style();
+        // Restrained, available weights only (regular, medium, semibold)
+        for r in TextRole::ALL {
+            assert!([400, 500, 600].contains(&st(r).weight), "{r:?}");
+            // Nothing below 10 DIP: at 96 DPI that is the smallest crisp size
+            assert!(st(r).size >= 10.0, "{r:?}");
+        }
+        // Notch: numerals lead, then title, artist, metadata
+        assert!(st(ClockDisplay).size > st(MediaTitle).size);
+        assert!(st(MediaTitle).size > st(MediaArtist).size);
+        assert!(st(MediaArtist).size > st(MediaMeta).size);
+        assert!(st(MediaMeta).size >= st(Timestamp).size);
+        assert!(st(MediaTitle).weight > st(MediaArtist).weight);
+        assert!(st(DateLine).size < st(ClockDisplay).size / 2.0);
+        // Settings window: page title > section > label > description
+        assert!(st(PageTitle).size > st(SettingLabel).size);
+        assert!(st(SettingLabel).size > st(SectionHeading).size);
+        assert!(st(SectionHeading).weight > st(SettingLabel).weight);
+        assert!(st(SettingLabel).size > st(SettingDescription).size);
+        assert_eq!(st(SidebarItem).size, st(SidebarItemSelected).size);
+        assert!(st(SidebarItemSelected).weight > st(SidebarItem).weight);
+        // The meridiem stays readable but secondary
+        let m = st(ClockDisplay).size * CLOCK_MERIDIEM_SCALE;
+        assert!((10.0..st(ClockDisplay).size * 0.6).contains(&m));
+        // The smallest text keeps at least 10 physical px at every DPI
+        for dpi in [96u32, 120, 137, 144, 168, 192, 288] {
+            let px = st(Timestamp).size * dpi as f32 / 96.0;
+            assert!(px >= 10.0, "{dpi}");
+        }
+        // Bahnschrift (ships with Windows) is the guaranteed last candidate
+        assert_eq!(UI_FONT_CANDIDATES.last().unwrap().0, "Bahnschrift");
     }
 }
