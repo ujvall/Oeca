@@ -62,19 +62,21 @@ cargo build --release
 
 ## Windows Installer
 
-`installer/Oeca.iss` builds `Oeca-Setup.exe` with [Inno Setup 6](https://jrsoftware.org/isinfo.php) from the release executable. Build the executable first, then compile the script (the path below is Inno Setup's per-user install location; adjust it if Inno Setup is installed elsewhere):
+`installer/Oeca.iss` builds `Oeca-Setup.exe` with [Inno Setup](https://jrsoftware.org/isinfo.php) **6.7.0 or later** (its dark wizard style and custom wizard colours need 6.7; built and tested with 6.7.3) from the release executable. Build the executable first, then compile the script (the path below is Inno Setup's per-user install location; adjust it if Inno Setup is installed elsewhere):
 
 ```powershell
 cargo build --release --locked
 & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" installer\Oeca.iss
 ```
 
-Output: `target\installer\Oeca-Setup.exe`. The product version comes from the executable's version resource (`Cargo.toml`).
+Output: `target\installer\Oeca-Setup.exe`. The product version comes from the executable's version resource (`Cargo.toml`). The compiler refuses to package a `target\release\Oeca.exe` that is older than the sources, so rebuild it first.
 
 - Installs for the current user only, without administrator rights, to `%LOCALAPPDATA%\Programs\Oeca`.
 - Optional Start Menu (on by default) and Desktop (off by default) shortcuts.
-- Registers Oeca in Settings → Apps → Installed apps; uninstalling there removes the installed files, shortcuts and that entry, and nothing else.
-- Adds no startup entry, service or scheduled task. The installer is not code-signed.
+- Registers Oeca in Settings → Apps → Installed apps. Adds no startup entry, service or scheduled task. The installer is not code-signed.
+- Upgrading or reinstalling asks a running Oeca to quit, then replaces it in place: settings, clipboard history and Start on launch are kept, and nothing is duplicated.
+- Uninstalling asks a running Oeca to quit and removes the installed files, shortcuts, the Installed Apps entry and Oeca's Start on launch entry. Your data in `%LOCALAPPDATA%\Oeca` (`settings.ini`, and clipboard history, which already clears itself at the next sign-in) is kept; delete that folder yourself to remove it.
+- Because uninstalling removes the Start on launch entry, a later reinstall starts with Start on launch off (the switch always shows the real registration), even though your other settings are kept. Turn it on again in Settings → General if you want it.
 
 ---
 
@@ -93,4 +95,4 @@ Located under `assets/branding/`, designed by the author:
 
 ## Licence scope
 
-Oeca's source code is released under the [MIT License](LICENSE). It does not cover the third-party icons credited above, which remain under their own licences, or the Oeca icon and branding assets (`assets/branding/`), which remain the property of the author.
+Oeca's source code is released under the [MIT License](LICENSE). It does not cover the third-party icons credited above, which remain under their own licences, or the Oeca icon and branding assets, which remain the property of the author: `assets/branding/` and the images rendered from the Oeca icon, including the installer's `installer/images/`.

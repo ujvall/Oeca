@@ -295,7 +295,7 @@ pub fn wipe_for_session_end() {
     }
 }
 
-fn local_app_data() -> Option<PathBuf> {
+pub(crate) fn local_app_data() -> Option<PathBuf> {
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::UI::Shell::{FOLDERID_LocalAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
     unsafe {

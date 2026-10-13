@@ -28,7 +28,8 @@ pub enum Scene {
 /// space's settled size, whichever space is active (so they cannot drift).
 pub const PANEL_SPACE: OecaSpace = OecaSpace::Clipboard;
 
-/// In-memory user settings (every launch starts from the defaults).
+/// User settings: saved to `%LOCALAPPDATA%\Oeca\settings.ini` on every
+/// change and restored at launch (`settings_store`); defaults for a new user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OecaSettings {
     /// Topmost band (above normal windows). On by default: Oeca has always
@@ -57,6 +58,9 @@ pub struct OecaSettings {
     /// How long after an outside click the expanded notch collapses
     /// (Settings > General). 5 s by default.
     pub collapse_delay: crate::config::CollapseDelay,
+    /// Oeca starts when the user signs in (a per-user Run entry; Settings >
+    /// General). Off by default; always mirrors the actual registration.
+    pub start_on_launch: bool,
 }
 
 impl Default for OecaSettings {
@@ -71,6 +75,7 @@ impl Default for OecaSettings {
             show_source_app: true,
             show_visualizer: true,
             collapse_delay: crate::config::CollapseDelay::Five,
+            start_on_launch: false,
         }
     }
 }

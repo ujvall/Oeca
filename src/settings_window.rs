@@ -89,11 +89,11 @@ pub const CLOSING_DESCRIPTION: &str = "Delay after an outside click";
 
 /// Client area (DIP): initial size, and the minimum the window can shrink to
 /// (the sidebar plus a page column wide enough for the General rows).
-pub const CLIENT_SIZE: (f32, f32) = (820.0, 520.0);
+pub const CLIENT_SIZE: (f32, f32) = (820.0, 568.0);
 /// The minimum holds General: its "Notch" section (two switches and the
-/// closing-delay row) and "Window behavior" (two switches), and the longest
-/// setting title unclipped beside its switch.
-pub const MIN_CLIENT_SIZE: (f32, f32) = (640.0, 504.0);
+/// closing-delay row) and "Window behavior" (three switches), and the
+/// longest setting title unclipped beside its switch.
+pub const MIN_CLIENT_SIZE: (f32, f32) = (640.0, 568.0);
 
 /// Sidebar (DIP): fixed width; category entries with an icon and a label.
 pub const SIDEBAR_WIDTH: f32 = 200.0;
@@ -194,8 +194,8 @@ impl Category {
     /// The switches on this page, in page order.
     pub fn controls(self) -> &'static [Control] {
         match self {
-            Self::General => &Control::ALL[..4],
-            Self::Media => &Control::ALL[4..],
+            Self::General => &Control::ALL[..5],
+            Self::Media => &Control::ALL[5..],
             _ => &[],
         }
     }
@@ -226,37 +226,43 @@ pub const MEDIA_SECTION: &str = "Now playing";
 pub const CAPACITY_TITLE: &str = "Items to keep";
 pub const CAPACITY_DESCRIPTION: &str = "Oldest items are removed first";
 pub const CLIPBOARD_NOTES: [&str; 2] = [
-    "History stays in memory and is never saved to disk.",
+    "History is kept until you sign out or restart Windows.",
     "Clearing it never changes the Windows clipboard.",
 ];
 
 /// A setting shown in the window (all switches). `ALL` is the page and
-/// focus order: General's four, then Media's two.
+/// focus order: General's five, then Media's two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Control {
     AlwaysOnTop,
     ReducedMotion,
     CloseOnEscape,
     ConfirmClearClipboard,
+    StartOnLaunch,
     ShowSourceApp,
     ShowVisualizer,
 }
 
 /// General's sections: a heading over its rows (in `Control::ALL` order).
-pub const SECTIONS: [(&str, [Control; 2]); 2] = [
-    ("Notch", [Control::AlwaysOnTop, Control::ReducedMotion]),
+pub const SECTIONS: [(&str, &[Control]); 2] = [
+    ("Notch", &[Control::AlwaysOnTop, Control::ReducedMotion]),
     (
         "Window behavior",
-        [Control::CloseOnEscape, Control::ConfirmClearClipboard],
+        &[
+            Control::CloseOnEscape,
+            Control::ConfirmClearClipboard,
+            Control::StartOnLaunch,
+        ],
     ),
 ];
 
 impl Control {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::AlwaysOnTop,
         Self::ReducedMotion,
         Self::CloseOnEscape,
         Self::ConfirmClearClipboard,
+        Self::StartOnLaunch,
         Self::ShowSourceApp,
         Self::ShowVisualizer,
     ];
@@ -275,6 +281,7 @@ impl Control {
             Self::ReducedMotion => "Reduced motion",
             Self::CloseOnEscape => "Close Settings window with Escape",
             Self::ConfirmClearClipboard => "Confirm before clearing clipboard history",
+            Self::StartOnLaunch => "Start on launch",
             Self::ShowSourceApp => "Show source app",
             Self::ShowVisualizer => "Show visualizer",
         }
@@ -286,6 +293,7 @@ impl Control {
             Self::ReducedMotion => "Minimize Oeca's interface transitions",
             Self::CloseOnEscape => "Press Esc to close this window",
             Self::ConfirmClearClipboard => "Ask before Clear forgets Oeca's copied items",
+            Self::StartOnLaunch => "Open Oeca when you sign in to Windows",
             Self::ShowSourceApp => "App icon on the Home artwork",
             Self::ShowVisualizer => "Animated bars in the Music space",
         }
@@ -297,6 +305,7 @@ impl Control {
             Self::ReducedMotion => "ReducedMotion",
             Self::CloseOnEscape => "CloseOnEscape",
             Self::ConfirmClearClipboard => "ConfirmClearClipboard",
+            Self::StartOnLaunch => "StartOnLaunch",
             Self::ShowSourceApp => "ShowSourceApp",
             Self::ShowVisualizer => "ShowVisualizer",
         }
@@ -309,6 +318,7 @@ impl Control {
             Self::ReducedMotion => &mut settings.reduced_motion,
             Self::CloseOnEscape => &mut settings.close_settings_on_escape,
             Self::ConfirmClearClipboard => &mut settings.confirm_clear_clipboard,
+            Self::StartOnLaunch => &mut settings.start_on_launch,
             Self::ShowSourceApp => &mut settings.show_source_app,
             Self::ShowVisualizer => &mut settings.show_visualizer,
         };
@@ -322,6 +332,7 @@ impl Control {
             Self::ReducedMotion => settings.reduced_motion,
             Self::CloseOnEscape => settings.close_settings_on_escape,
             Self::ConfirmClearClipboard => settings.confirm_clear_clipboard,
+            Self::StartOnLaunch => settings.start_on_launch,
             Self::ShowSourceApp => settings.show_source_app,
             Self::ShowVisualizer => settings.show_visualizer,
         }
@@ -471,7 +482,7 @@ pub struct WindowLayout {
     pub sections: [RectF; 2],
     /// The switch rows, in `Control::ALL` order: General's two sections,
     /// then Media's (in General's first section's place).
-    pub rows: [Row; 6],
+    pub rows: [Row; 7],
     /// Appearance's section headings, in `APPEARANCE_SECTIONS` order.
     pub appearance_sections: [RectF; 2],
     /// Appearance's swatches (each a square hit target), in
@@ -523,8 +534,8 @@ pub fn layout(width: f32, height: f32) -> WindowLayout {
     });
     let left = SIDEBAR_WIDTH + PAGE_PADDING;
     let right = (width - PAGE_PADDING).max(left + 240.0);
-    // Each section: its heading, then its rows ("Notch" has three: two
-    // switches and the closing-delay row; "Window behavior" two)
+    // Each section: its heading, then three rows ("Notch": two switches and
+    // the closing-delay row; "Window behavior": three switches)
     let section_top =
         |k: usize| SECTION_TOP + k as f32 * (SECTION_HEIGHT + 3.0 * ROW_HEIGHT + SECTION_GAP);
     let sections = std::array::from_fn(|k| {
@@ -532,9 +543,14 @@ pub fn layout(width: f32, height: f32) -> WindowLayout {
         RectF::new(left, top, right, top + SECTION_HEIGHT)
     });
     let rows = std::array::from_fn(|i| {
-        // Media's rows (4, 5) sit where General's first section's do
-        let i = if i < 4 { i } else { i - 4 };
-        let top = section_top(i / 2) + SECTION_HEIGHT + (i % 2) as f32 * ROW_HEIGHT;
+        // "Notch" holds rows 0-1, "Window behavior" 2-4; Media's rows (5, 6)
+        // sit where General's first section's do
+        let (section, slot) = match i {
+            0 | 1 => (0, i),
+            2..=4 => (1, i - 2),
+            _ => (0, i - 5),
+        };
+        let top = section_top(section) + SECTION_HEIGHT + slot as f32 * ROW_HEIGHT;
         let switch = RectF::new(right - 40.0, top + 21.0, right, top + 43.0);
         let text_right = switch.left - 16.0;
         Row {
@@ -685,7 +701,7 @@ struct View {
     corrections: u8,
     /// Each switch's slide (`Control::ALL` order), and the last frame of the
     /// switch timer (Some only while it runs).
-    switches: [crate::renderer::SwitchAnim; 6],
+    switches: [crate::renderer::SwitchAnim; 7],
     switch_tick: Option<std::time::Instant>,
 }
 
@@ -2374,9 +2390,9 @@ mod tests {
             assert_eq!(c.index(), i);
             assert!(!c.description().is_empty());
         }
-        // Switches: General's four, then Media's two; Clipboard has the
+        // Switches: General's five, then Media's two; Clipboard has the
         // capacity choices, Appearance the swatches; About nothing
-        assert_eq!(Category::General.controls(), &Control::ALL[..4]);
+        assert_eq!(Category::General.controls(), &Control::ALL[..5]);
         assert_eq!(
             Category::Media.controls(),
             [Control::ShowSourceApp, Control::ShowVisualizer]
@@ -2422,7 +2438,7 @@ mod tests {
         nav.select(Category::About);
         assert_eq!(nav.focus_order().len(), 5, "About: sidebar only");
         nav.select(Category::General);
-        assert_eq!(nav.focus_order().len(), 12, "4 switches + 3 closing delays");
+        assert_eq!(nav.focus_order().len(), 13, "5 switches + 3 closing delays");
         nav.focus = Target::Category(Category::About);
         assert_eq!(nav.tab(false), Target::Control(Control::AlwaysOnTop));
         assert_eq!(nav.tab(false), Target::Control(Control::ReducedMotion));
@@ -2435,11 +2451,9 @@ mod tests {
             nav.tab(false),
             Target::Control(Control::ConfirmClearClipboard)
         );
+        assert_eq!(nav.tab(false), Target::Control(Control::StartOnLaunch));
         assert_eq!(nav.tab(false), Target::Category(Category::General), "wraps");
-        assert_eq!(
-            nav.tab(true),
-            Target::Control(Control::ConfirmClearClipboard)
-        );
+        assert_eq!(nav.tab(true), Target::Control(Control::StartOnLaunch));
         assert!(nav.focus_visible);
         // Arrows move within the focused group and stop at its ends
         nav.focus = Target::Category(Category::General);
@@ -2454,12 +2468,16 @@ mod tests {
             nav.arrow(false),
             Target::Control(Control::ConfirmClearClipboard)
         );
+        assert_eq!(nav.arrow(false), Target::Control(Control::StartOnLaunch));
         assert_eq!(
             nav.arrow(false),
-            Target::Control(Control::ConfirmClearClipboard),
+            Target::Control(Control::StartOnLaunch),
             "stops at the last switch"
         );
-        assert_eq!(nav.arrow(true), Target::Control(Control::CloseOnEscape));
+        assert_eq!(
+            nav.arrow(true),
+            Target::Control(Control::ConfirmClearClipboard)
+        );
         // Moving focus never changes the page
         assert_eq!(nav.category, Category::General);
     }
@@ -2467,12 +2485,12 @@ mod tests {
     #[test]
     fn test_sizes_and_dpi_scaling() {
         assert!(CLIENT_SIZE.0 >= MIN_CLIENT_SIZE.0 && CLIENT_SIZE.1 >= MIN_CLIENT_SIZE.1);
-        assert_eq!(to_px(CLIENT_SIZE, 96), (820, 520));
-        assert_eq!(to_px(CLIENT_SIZE, 120), (1025, 650));
-        assert_eq!(to_px(MIN_CLIENT_SIZE, 96), (640, 504));
-        assert_eq!(to_px(MIN_CLIENT_SIZE, 120), (800, 630));
+        assert_eq!(to_px(CLIENT_SIZE, 96), (820, 568));
+        assert_eq!(to_px(CLIENT_SIZE, 120), (1025, 710));
+        assert_eq!(to_px(MIN_CLIENT_SIZE, 96), (640, 568));
+        assert_eq!(to_px(MIN_CLIENT_SIZE, 120), (800, 710));
         let (w, h) = outer_size(CLIENT_SIZE, 120);
-        assert!(w > 1025 && h > 650, "frame added on top of the client area");
+        assert!(w > 1025 && h > 710, "frame added on top of the client area");
     }
 
     #[test]
@@ -2500,24 +2518,27 @@ mod tests {
             }
             // Rows stack in `Control::ALL` order; each section heading sits
             // right above its first row, below the previous section
-            for i in 1..4 {
+            for i in 1..5 {
                 assert!(l.rows[i - 1].row.bottom <= l.rows[i].row.top);
             }
             // Media's two rows take General's first section's places
-            assert_eq!(l.rows[4], l.rows[0]);
-            assert_eq!(l.rows[5], l.rows[1]);
+            assert_eq!(l.rows[5], l.rows[0]);
+            assert_eq!(l.rows[6], l.rows[1]);
             for (k, (_, controls)) in SECTIONS.iter().enumerate() {
                 let first = l.rows[controls[0].index()].row;
                 assert_eq!(l.sections[k].bottom, first.top);
                 assert!(l.page_description.bottom <= l.sections[k].top);
                 if k > 0 {
-                    let prev = l.rows[SECTIONS[k - 1].1[1].index()].row;
+                    let prev = l.rows[SECTIONS[k - 1].1.last().unwrap().index()].row;
                     assert!(prev.bottom < l.sections[k].top);
                 }
             }
         }
         // Sections cover every control once, in page order
-        let flat: Vec<Control> = SECTIONS.iter().flat_map(|(_, c)| *c).collect();
+        let flat: Vec<Control> = SECTIONS
+            .iter()
+            .flat_map(|(_, c)| c.iter().copied())
+            .collect();
         assert_eq!(flat, Category::General.controls());
         // The page column grows with the window; the sidebar does not
         let (small, large) = (layout(MIN_CLIENT_SIZE.0, 400.0), layout(1400.0, 400.0));
@@ -2589,6 +2610,7 @@ mod tests {
                         Element::Section(1),
                         Element::Control(Control::CloseOnEscape),
                         Element::Control(Control::ConfirmClearClipboard),
+                        Element::Control(Control::StartOnLaunch),
                     ]
                 );
                 assert_eq!(
@@ -2606,6 +2628,7 @@ mod tests {
                         "Window behavior",
                         "Close Settings window with Escape",
                         "Confirm before clearing clipboard history",
+                        "Start on launch",
                     ]
                 );
                 // Accessible order matches keyboard (Tab) order
@@ -2706,8 +2729,8 @@ mod tests {
         let d = OecaSettings::default();
         assert_eq!(
             Control::ALL.map(|c| c.is_on(d)),
-            [true, false, true, true, true, true],
-            "Always on top on, Reduced motion off, Escape closes on, Confirm clear on,              source app shown, visualizer shown"
+            [true, false, true, true, false, true, true],
+            "Always on top on, Reduced motion off, Escape closes on, Confirm clear on, Start on launch off,              source app shown, visualizer shown"
         );
         // Each switch flips exactly its own value, and back
         for c in Control::ALL {
@@ -2754,6 +2777,7 @@ mod tests {
             show_source_app: false,
             show_visualizer: false,
             collapse_delay: CollapseDelay::Fifteen,
+            start_on_launch: true,
         };
         sync(changed);
         navigate(hwnd, Category::General);
@@ -3215,18 +3239,28 @@ mod tests {
         let clear = notch_clear_top(0, 120);
         let (x, y) = initial_position(work, size, clear);
         assert_eq!(x, (1920 - size.0) / 2, "centred");
-        assert_eq!(y, clear, "below the expanded notch");
         assert!(y + size.1 <= work.bottom);
-        // The band covers the tallest expanded notch at that DPI
+        // The band covers the tallest expanded notch at that DPI. The window
+        // (General's three-row "Window behavior" makes it taller) moves up
+        // into the gap above `clear` to fit this short work area, but never
+        // onto the expanded notch itself
         for space in crate::space::OecaSpace::ALL {
             let d =
                 crate::layout::space_dimensions(crate::config::NotchState::Expanded, 120, space);
             assert!(clear > d.height, "{space:?}");
+            assert!(y >= d.height, "{space:?}: window clears the notch ({y})");
         }
+        // With room to spare it sits exactly at `clear`
+        let tall = rect(0, 0, 1920, 1400);
+        assert_eq!(
+            initial_position(tall, size, clear).1,
+            clear,
+            "below the expanded notch"
+        );
         // Short work area: moved up just enough, never above its top
         let short = rect(0, 0, 1366, 720);
         let (_, y) = initial_position(short, size, clear);
-        assert_eq!(y, 720 - size.1);
+        assert_eq!(y, (720 - size.1).max(0));
         let tiny = rect(0, 0, 800, 500);
         let (x, y) = initial_position(tiny, size, clear);
         assert_eq!((x, y), (0, 0), "larger than the work area: its top-left");
@@ -3457,7 +3491,7 @@ mod tests {
                 }
             }
             // Media keeps its rows (General's first section's places)
-            assert_eq!(l.rows[4], l.rows[0]);
+            assert_eq!(l.rows[5], l.rows[0]);
         }
         let (w, h) = CLIENT_SIZE;
         let l = layout(w, h);

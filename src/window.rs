@@ -136,9 +136,12 @@ struct WindowState {
     /// Windows session only through `clip_store`.
     clipboard: ClipboardHistory,
     clip_store: crate::clipboard_store::ClipboardStore,
+    /// The persistent settings file (`settings` is saved to it on change).
+    settings_store: crate::settings_store::SettingsStore,
     /// Active OLE drag over the notch (image-file drops into the history).
     drag: DragSession,
-    /// User settings (memory only; every launch starts from the defaults).
+    /// User settings: restored from `settings.ini` at launch (defaults for a
+    /// new user) and saved through `settings_store` on every change.
     settings: OecaSettings,
     /// The Settings page is open over the active space (which stays selected).
     settings_open: bool,
@@ -398,6 +401,7 @@ impl WindowState {
         self.renderer
             .set_settings(self.settings_open, self.settings);
         settings_window::sync(self.settings);
+        self.persist_settings();
         // Timer presentations snap (and the done pulse stops) from now on
         self.refresh_timer_presence(hwnd);
         // The page's switch slides (control-feedback timer)
@@ -414,6 +418,27 @@ impl WindowState {
             self.settings_title(),
             self.timer_title().as_deref(),
         );
+    }
+
+    /// Saves the settings after a change (from the notch page or the Settings
+    /// window). A failure keeps the change for this run only; the next change
+    /// tries again. Nothing is logged but the error kind.
+    fn persist_settings(&mut self) {
+        let _saved = self.settings_store.save(&self.settings);
+        #[cfg(debug_assertions)]
+        if let Err(e) = &_saved {
+            eprintln!("[settings] not saved: {:?}", e.kind());
+        }
+    }
+
+    /// Start on launch flipped in the Settings window: registers or removes
+    /// the per-user Run entry, then shows what actually happened (a failed
+    /// registration leaves the switch where it was).
+    fn toggle_start_on_launch(&mut self) {
+        let want = !self.settings.start_on_launch;
+        self.settings.start_on_launch = crate::startup::set_enabled(want);
+        settings_window::sync(self.settings);
+        self.persist_settings();
     }
 
     /// "Open Full Settings": opens (or focuses) the native Settings window.
@@ -449,7 +474,9 @@ impl WindowState {
                 self.renderer
                     .set_settings(self.settings_open, self.settings);
                 settings_window::sync(self.settings);
+                self.persist_settings();
             }
+            settings_window::Control::StartOnLaunch => self.toggle_start_on_launch(),
             // Presentation only: redraw; the live timer follows the
             // visualizer (fast with bars, slow for a lone scrubber)
             settings_window::Control::ShowSourceApp | settings_window::Control::ShowVisualizer => {
@@ -457,6 +484,7 @@ impl WindowState {
                 self.renderer
                     .set_settings(self.settings_open, self.settings);
                 settings_window::sync(self.settings);
+                self.persist_settings();
                 self.redraw(hwnd);
                 self.kick_live(hwnd);
             }
@@ -471,6 +499,7 @@ impl WindowState {
             self.renderer
                 .set_settings(self.settings_open, self.settings);
             settings_window::sync(self.settings);
+            self.persist_settings();
             self.redraw(hwnd);
         }
     }
@@ -484,6 +513,7 @@ impl WindowState {
         self.renderer
             .set_settings(self.settings_open, self.settings);
         settings_window::sync(self.settings);
+        self.persist_settings();
         if trimmed {
             self.clipboard_changed(hwnd);
         }
@@ -530,6 +560,7 @@ impl WindowState {
             self.renderer
                 .set_settings(self.settings_open, self.settings);
             settings_window::sync(self.settings);
+            self.persist_settings();
             self.grace(hwnd, GraceEvent::DelayChanged);
         }
     }
@@ -602,6 +633,7 @@ impl WindowState {
         self.renderer
             .set_settings(self.settings_open, self.settings);
         settings_window::sync(self.settings);
+        self.persist_settings();
         // The page's switch slides (control-feedback timer)
         self.kick_feedback(hwnd);
         self.redraw(hwnd);
@@ -3114,6 +3146,13 @@ fn handle_drag(hwnd: HWND, event: DragEvent) -> bool {
 }
 
 pub fn run() -> Result<()> {
+    // One Oeca per sign-in session: a second launch (Start on launch plus a
+    // manual start, a double click) opens the running one and exits, so
+    // there is never a second notch or tray icon
+    let Some(_instance) = SingleInstance::acquire() else {
+        SingleInstance::open_existing();
+        return Ok(());
+    };
     // OLE drag-and-drop needs this (UI) thread in a single-threaded apartment.
     // Failure is non-fatal: Oeca simply runs without being a drop target.
     let ole = unsafe { OleInitialize(None) }.is_ok();
@@ -3122,6 +3161,58 @@ pub fn run() -> Result<()> {
         unsafe { OleUninitialize() };
     }
     result
+}
+
+/// The per-session single-instance mutex, held for the process's life.
+struct SingleInstance(windows::Win32::Foundation::HANDLE);
+
+impl SingleInstance {
+    const NAME: windows::core::PCWSTR = windows::core::w!("Local\\Oeca.SingleInstance");
+
+    /// The mutex if this is the first Oeca in the session; None if another
+    /// one already holds it. If the mutex cannot be made at all, Oeca runs
+    /// (as before) rather than refusing to start.
+    fn acquire() -> Option<Self> {
+        use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+        let handle =
+            unsafe { windows::Win32::System::Threading::CreateMutexW(None, false, Self::NAME) };
+        match handle {
+            Ok(h) if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS => {
+                unsafe {
+                    let _ = windows::Win32::Foundation::CloseHandle(h);
+                }
+                None
+            }
+            Ok(h) => Some(Self(h)),
+            Err(_) => Some(Self(windows::Win32::Foundation::HANDLE::default())),
+        }
+    }
+
+    /// Asks the running Oeca to open (as its tray's Open Oeca does).
+    fn open_existing() {
+        unsafe {
+            if let Ok(hwnd) =
+                windows::Win32::UI::WindowsAndMessaging::FindWindowW(WINDOW_CLASS_NAME, None)
+            {
+                let _ = PostMessageW(
+                    Some(hwnd),
+                    WM_COMMAND,
+                    WPARAM(crate::tray::Command::Open as usize),
+                    LPARAM(0),
+                );
+            }
+        }
+    }
+}
+
+impl Drop for SingleInstance {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
 }
 
 fn run_window(ole: bool) -> Result<()> {
@@ -3161,7 +3252,17 @@ fn run_window(ole: bool) -> Result<()> {
         let y = 0;
 
         // 3. Create Borderless, Layered, Topmost, Toolwindow
-        let ex_style = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+        // Saved settings first, so the notch never shows with the defaults.
+        // Start on launch mirrors the real registration (it may have been
+        // removed elsewhere, e.g. in Task Manager)
+        let mut settings_store = crate::settings_store::SettingsStore::open();
+        let mut settings = settings_store.load().unwrap_or_default();
+        settings.start_on_launch = crate::startup::is_enabled();
+        let ex_style = if settings.always_on_top {
+            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+        } else {
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+        };
         let hwnd = CreateWindowExW(
             ex_style,
             WINDOW_CLASS_NAME,
@@ -3188,7 +3289,7 @@ fn run_window(ole: bool) -> Result<()> {
             let new_x = calculate_notch_x(screen_width, dims.width);
             let _ = SetWindowPos(
                 hwnd,
-                Some(HWND_TOPMOST),
+                Some(z_band(settings.always_on_top)),
                 new_x,
                 y,
                 dims.width,
@@ -3225,10 +3326,16 @@ fn run_window(ole: bool) -> Result<()> {
         // session; see clipboard_store.rs)
         let clip_store = crate::clipboard_store::ClipboardStore::open();
         let mut clipboard = ClipboardHistory::default();
+        clipboard.set_capacity(settings.clipboard_capacity);
         if let Ok(items) = clip_store.load() {
             crate::clipboard_store::restore(&mut clipboard, items);
         }
         renderer.set_clipboard(&clipboard);
+        renderer.set_settings(false, settings);
+        // Records the settings as applied (the first launch writes the
+        // defaults), but never over a settings file that could not be used,
+        // e.g. one from a newer Oeca: only a setting change replaces that
+        let _ = settings_store.initialize(&settings);
         let state = Box::new(WindowState {
             renderer,
             high_res_timer: HighResTimer::default(),
@@ -3249,7 +3356,8 @@ fn run_window(ole: bool) -> Result<()> {
             clipboard,
             clip_store,
             drag: DragSession::default(),
-            settings: OecaSettings::default(),
+            settings,
+            settings_store,
             settings_open: false,
             clear_pending: false,
             grace: GracePeriod::default(),
