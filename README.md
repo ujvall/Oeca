@@ -7,8 +7,13 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ujvall/Oeca/releases"><b>Download for Windows</b></a>
-  &nbsp;·&nbsp; Windows 10 or later, 64-bit &nbsp;·&nbsp; version 0.1.0
+  <a href="https://github.com/ujvall/Oeca/releases/latest/download/Oeca-Setup.exe"><img src="assets/readme/button-download.png" alt="Download for Windows" height="44"></a>
+  <img src="assets/readme/chip-windows.png" alt="Windows 10 or later, 64-bit" height="44">
+  <img src="assets/readme/chip-version.png" alt="Version 0.1.0" height="44">
+</p>
+
+<p align="center">
+  <sub>Downloads <code>Oeca-Setup.exe</code> from the latest release · <a href="https://github.com/ujvall/Oeca/releases">All releases</a></sub>
 </p>
 
 ---
@@ -24,7 +29,7 @@
 **Clipboard.** Remembers copied text and images (5, 10 or 20 items). Click an item to copy it again, delete items one by one or clear the history. Image files dragged onto the notch are added too. History survives restarting Oeca and is cleared when you sign out or restart Windows.
 
 <p align="center">
-  <img src="assets/readme/clipboard.png" alt="The expanded notch showing the Clipboard space with four items" width="550">
+  <img src="assets/readme/clipboard.png" alt="The expanded notch showing the Clipboard space with four items" width="680">
   <br>
   <sub>The Clipboard space, captured from the running app (example clipboard items).</sub>
 </p>
@@ -95,3 +100,4 @@ Oeca's source code is released under the [MIT License](LICENSE). It does not cov
 - Clipboard, House blank, Music-alt, Palette, Info, Settings and Trash icons: [Uicons by Flaticon](https://www.flaticon.com/uicons), used under the Flaticon free licence (with attribution).
 - Drop page icon: "Inbox" by Jivan from [Noun Project](https://thenounproject.com/icon/1052548/), used under the Noun Project free licence (with attribution).
 - The Oeca wordmark is set in General Sans by the Indian Type Foundry ([Fontshare](https://www.fontshare.com)); the font itself is not included in this repository.
+- The screenshot's background is a desktop wallpaper from [wallhaven](https://wallhaven.cc); it remains its creator's and is not covered by the MIT License.
