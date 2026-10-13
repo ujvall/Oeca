@@ -41,6 +41,8 @@ Desktop Window Manager Blit (UpdateLayeredWindow into 32-bit premultiplied ARGB 
 
 ## Building and Testing
 
+Prerequisites: Rust (MSVC toolchain, `x86_64-pc-windows-msvc`) and the Windows 10/11 SDK, which ships with the Visual Studio C++ build tools. `build.rs` compiles `assets/windows/oeca.rc` (the executable's icon and version information) with the SDK's `rc.exe`; set `RC` to point at a specific `rc.exe` if needed.
+
 ```powershell
 # Format check
 cargo fmt --check
@@ -58,13 +60,29 @@ cargo build --release
 
 ---
 
+## Windows Installer
+
+`installer/Oeca.iss` builds `Oeca-Setup.exe` with [Inno Setup 6](https://jrsoftware.org/isinfo.php) from the release executable. Build the executable first, then compile the script (the path below is Inno Setup's per-user install location; adjust it if Inno Setup is installed elsewhere):
+
+```powershell
+cargo build --release --locked
+& "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" installer\Oeca.iss
+```
+
+Output: `target\installer\Oeca-Setup.exe`. The product version comes from the executable's version resource (`Cargo.toml`).
+
+- Installs for the current user only, without administrator rights, to `%LOCALAPPDATA%\Programs\Oeca`.
+- Optional Start Menu (on by default) and Desktop (off by default) shortcuts.
+- Registers Oeca in Settings → Apps → Installed apps; uninstalling there removes the installed files, shortcuts and that entry, and nothing else.
+- Adds no startup entry, service or scheduled task. The installer is not code-signed.
+
+---
+
 ## Branding & Packaging Assets
 
-- `Oeca.png` (repository root): the official Oeca icon, featuring the minimalist hardware-notch cutout. Designed by the author.
-
-Located under `assets/branding/`:
-- `Oeca.ico`: Multi-resolution Windows icon (16x16, 32x32, 48x48, 64x64, 128x128, 256x256) ready for release packaging and executable embedding.
-- `Oeca.png`: copy of the root `Oeca.png`.
+Located under `assets/branding/`, designed by the author:
+- `Oeca.png`: the official Oeca icon, featuring the minimalist hardware-notch cutout.
+- `Oeca.ico`: Multi-resolution Windows icon (16x16, 32x32, 48x48, 64x64, 128x128, 256x256), embedded in the executable at build time.
 
 ---
 
@@ -75,4 +93,4 @@ Located under `assets/branding/`:
 
 ## Licence scope
 
-Oeca's source code is released under the [MIT License](LICENSE). It does not cover the third-party icons credited above, which remain under their own licences, or the Oeca icon and branding assets (`Oeca.png`, `assets/branding/`), which remain the property of the author.
+Oeca's source code is released under the [MIT License](LICENSE). It does not cover the third-party icons credited above, which remain under their own licences, or the Oeca icon and branding assets (`assets/branding/`), which remain the property of the author.

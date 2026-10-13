@@ -11,17 +11,17 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_STATECHANGE, GWLP_USERDATA, GetClientRect, GetCursorPos,
-    GetMessageW, GetSystemMetrics, GetWindowLongPtrW, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST,
-    IDC_ARROW, KillTimer, LoadCursorW, MA_NOACTIVATE, MSG, OBJID_CLIENT, PBT_APMRESUMEAUTOMATIC,
-    PBT_APMRESUMESUSPEND, PostMessageW, PostQuitMessage, RegisterClassExW, SM_CXSCREEN,
-    SPI_GETCLIENTAREAANIMATION, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
-    ShowWindow, SystemParametersInfoW, TranslateMessage, UnregisterClassW, WM_APP,
-    WM_CAPTURECHANGED, WM_CLIPBOARDUPDATE, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCDESTROY, WM_NCHITTEST,
-    WM_POWERBROADCAST, WM_TIMECHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    ENDSESSION_CLOSEAPP, EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_STATECHANGE, GWLP_USERDATA,
+    GetClientRect, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, HTCLIENT,
+    HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, KillTimer, LoadCursorW, MA_NOACTIVATE, MSG,
+    OBJID_CLIENT, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SM_CXSCREEN, SPI_GETCLIENTAREAANIMATION, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
+    SWP_SHOWWINDOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage, UnregisterClassW, WM_APP,
+    WM_CAPTURECHANGED, WM_CLIPBOARDUPDATE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_ENDSESSION, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
+    WM_NCDESTROY, WM_NCHITTEST, WM_POWERBROADCAST, WM_TIMECHANGE, WM_TIMER, WNDCLASSEXW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{Error, Result};
 
@@ -132,8 +132,10 @@ struct WindowState {
     /// its current period.
     live_tick: Option<std::time::Instant>,
     live_ms: u32,
-    /// Clipboard history (in memory only; filled on `WM_CLIPBOARDUPDATE`).
+    /// Clipboard history (filled on `WM_CLIPBOARDUPDATE`), saved for this
+    /// Windows session only through `clip_store`.
     clipboard: ClipboardHistory,
+    clip_store: crate::clipboard_store::ClipboardStore,
     /// Active OLE drag over the notch (image-file drops into the history).
     drag: DragSession,
     /// User settings (memory only; every launch starts from the defaults).
@@ -162,6 +164,8 @@ struct WindowState {
     /// A drag along the Music scrubber: where it is (0..1 of the track). The
     /// notch holds the mouse capture for the whole gesture.
     scrub: Option<f32>,
+    /// The notification-area icon (removed when this state is freed).
+    tray: crate::tray::TrayIcon,
 }
 
 /// `SetWindowPos` z-order arguments for routine moves and resizes: topmost
@@ -417,6 +421,19 @@ impl WindowState {
     fn open_full_settings(&mut self, hwnd: HWND) {
         // A failure leaves the notch untouched (nothing to show)
         let _ = settings_window::open(hwnd, self.settings);
+    }
+
+    /// Tray "Open Oeca" (or a left click on the icon): the notch shown and
+    /// expanded through the usual spring, keeping its space, media and timer.
+    /// Already open or opening: nothing changes.
+    fn open_from_tray(&mut self, hwnd: HWND) {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+        if !self.expanded_or_expanding() {
+            self.reset_feedback(hwnd);
+            let _ = start_or_reverse_animation(hwnd, self);
+        }
     }
 
     /// A switch in the Settings window: the same change as on the notch page.
@@ -820,6 +837,13 @@ impl WindowState {
     /// After any history change: rebuild the Clipboard rows, and if that space
     /// is on screen, redraw it and refresh its accessible title.
     fn clipboard_changed(&mut self, hwnd: HWND) {
+        // Saved at once (a crash loses nothing); a failure only means this
+        // change is not kept across a relaunch. Contents are never logged.
+        let _saved = self.clip_store.save(&self.clipboard);
+        #[cfg(debug_assertions)]
+        if let Err(e) = &_saved {
+            eprintln!("[clipboard] history not saved: {:?}", e.kind());
+        }
         self.renderer.set_clipboard(&self.clipboard);
         if self.state == NotchState::Expanded && self.space == OecaSpace::Clipboard {
             self.redraw(hwnd);
@@ -2958,11 +2982,69 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // destroyed with it anyway)
             let _ = with_state(hwnd, |state| {
                 state.high_res_timer.set(false);
+                state.tray.remove();
                 if let Some(bubble) = state.bubble.take() {
                     unsafe {
                         let _ = DestroyWindow(bubble);
                     }
                 }
+            });
+            LRESULT(0)
+        }
+
+        // Windows is shutting down, restarting or signing the user out: drop
+        // the saved history now (best effort; a new session never loads it
+        // anyway). Not when an installer's Restart Manager only closes Oeca.
+        WM_ENDSESSION => {
+            if wparam.0 != 0 && lparam.0 as u32 & ENDSESSION_CLOSEAPP == 0 {
+                crate::clipboard_store::wipe_for_session_end();
+            }
+            LRESULT(0)
+        }
+
+        crate::tray::WM_APP_TRAY => {
+            match crate::tray::decode(wparam, lparam) {
+                // Shown without holding the state: the menu's modal loop keeps
+                // the notch's own messages flowing while it is open
+                Some(crate::tray::Event::Menu { x, y }) => crate::tray::show_menu(hwnd, x, y),
+                Some(crate::tray::Event::Activate) => {
+                    with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                        state.open_from_tray(hwnd)
+                    })
+                }
+                None => {}
+            }
+            LRESULT(0)
+        }
+
+        WM_COMMAND => match crate::tray::Command::from_id(wparam.0 & 0xFFFF) {
+            Some(crate::tray::Command::Open) => {
+                with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                    state.open_from_tray(hwnd)
+                });
+                LRESULT(0)
+            }
+            Some(crate::tray::Command::Settings) => {
+                with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                    state.open_full_settings(hwnd)
+                });
+                LRESULT(0)
+            }
+            // The usual shutdown: WM_CLOSE -> DestroyWindow -> WM_DESTROY
+            // (tray icon, Settings window, timers) -> WM_QUIT
+            Some(crate::tray::Command::Quit) => {
+                unsafe {
+                    let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                }
+                LRESULT(0)
+            }
+            None => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        },
+
+        // Explorer (re)started: every tray icon is gone; add ours again
+        _ if msg == crate::tray::taskbar_created() => {
+            with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                state.tray.restore(hwnd);
             });
             LRESULT(0)
         }
@@ -3139,6 +3221,14 @@ fn run_window(ole: bool) -> Result<()> {
             .collect();
         let _ = SetWindowTextW(hwnd, windows::core::PCWSTR(title_wide.as_ptr()));
 
+        // This Windows session's saved clipboard history (none in a new
+        // session; see clipboard_store.rs)
+        let clip_store = crate::clipboard_store::ClipboardStore::open();
+        let mut clipboard = ClipboardHistory::default();
+        if let Ok(items) = clip_store.load() {
+            crate::clipboard_store::restore(&mut clipboard, items);
+        }
+        renderer.set_clipboard(&clipboard);
         let state = Box::new(WindowState {
             renderer,
             high_res_timer: HighResTimer::default(),
@@ -3156,7 +3246,8 @@ fn run_window(ole: bool) -> Result<()> {
             feedback_tick: None,
             live_tick: None,
             live_ms: MEDIA_LIVE_FRAME_MS,
-            clipboard: ClipboardHistory::default(),
+            clipboard,
+            clip_store,
             drag: DragSession::default(),
             settings: OecaSettings::default(),
             settings_open: false,
@@ -3171,6 +3262,7 @@ fn run_window(ole: bool) -> Result<()> {
             timer_drag: false,
             timer_shown: Countdown::default(),
             scrub: None,
+            tray: crate::tray::TrayIcon::default(),
         });
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
 
@@ -3209,6 +3301,11 @@ fn run_window(ole: bool) -> Result<()> {
 
         // 7. Display window without stealing focus
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+
+        // Notification-area icon: without a taskbar yet it is simply absent
+        // until Explorer announces itself (TaskbarCreated)
+        let _ = crate::tray::taskbar_created();
+        let _ = with_state(hwnd, |state| state.tray.add(hwnd));
 
         // 8. Event-driven message loop: blocks until messages arrive (0% idle CPU)
         let mut msg = MSG::default();

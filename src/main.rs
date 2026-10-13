@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod clipboard;
+mod clipboard_store;
 mod clock;
 mod config;
 mod dragdrop;
@@ -10,6 +11,7 @@ mod renderer;
 mod settings_window;
 mod space;
 mod timer;
+mod tray;
 mod window;
 
 fn main() {

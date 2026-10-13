@@ -5625,28 +5625,6 @@ mod tests {
                 "Pixel to the left of the notch body should be transparent"
             );
 
-            // Save rendered notch bitmap to artifact directory for visual verification
-            let bmp_path = r"C:\Users\ujval\.gemini\antigravity-ide\brain\402578f9-d9e5-44d8-9b61-4772077cf14b\notch_hardware_notch.bmp";
-            let mut file_bytes = Vec::with_capacity(54 + pixel_slice.len());
-            file_bytes.extend_from_slice(b"BM");
-            let file_size = (54 + pixel_slice.len()) as u32;
-            file_bytes.extend_from_slice(&file_size.to_le_bytes());
-            file_bytes.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes.extend_from_slice(&54u32.to_le_bytes());
-            file_bytes.extend_from_slice(&40u32.to_le_bytes());
-            file_bytes.extend_from_slice(&width.to_le_bytes());
-            file_bytes.extend_from_slice(&(-height).to_le_bytes());
-            file_bytes.extend_from_slice(&1u16.to_le_bytes());
-            file_bytes.extend_from_slice(&32u16.to_le_bytes());
-            file_bytes.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes.extend_from_slice(&(pixel_slice.len() as u32).to_le_bytes());
-            file_bytes.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes.extend_from_slice(pixel_slice);
-            let _ = std::fs::write(bmp_path, file_bytes);
-
             SelectObject(mem_dc, old_bitmap);
             let _ = DeleteObject(dib.into());
             let _ = DeleteDC(mem_dc);
@@ -5850,28 +5828,6 @@ mod tests {
                 "Left padding area should be pure black (no stray text pixels)"
             );
 
-            // Save rendered expanded notch bitmap to artifact directory for visual verification
-            let bmp_path = r"C:\Users\ujval\.gemini\antigravity-ide\brain\402578f9-d9e5-44d8-9b61-4772077cf14b\notch_expanded.bmp";
-            let mut file_bytes = Vec::with_capacity(54 + pixel_slice.len());
-            file_bytes.extend_from_slice(b"BM");
-            let file_size = (54 + pixel_slice.len()) as u32;
-            file_bytes.extend_from_slice(&file_size.to_le_bytes());
-            file_bytes.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes.extend_from_slice(&54u32.to_le_bytes());
-            file_bytes.extend_from_slice(&40u32.to_le_bytes());
-            file_bytes.extend_from_slice(&width.to_le_bytes());
-            file_bytes.extend_from_slice(&(-height).to_le_bytes());
-            file_bytes.extend_from_slice(&1u16.to_le_bytes());
-            file_bytes.extend_from_slice(&32u16.to_le_bytes());
-            file_bytes.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes.extend_from_slice(&(pixel_slice.len() as u32).to_le_bytes());
-            file_bytes.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes.extend_from_slice(pixel_slice);
-            let _ = std::fs::write(bmp_path, file_bytes);
-
             SelectObject(mem_dc, old_bitmap);
             let _ = DeleteObject(dib.into());
             let _ = DeleteDC(mem_dc);
@@ -5903,6 +5859,15 @@ mod tests {
                 .render(hwnd, 0, 0, &dims_negative, false, &clock)
                 .is_ok()
         );
+    }
+
+    /// A rendered frame (top-down premultiplied BGRA, `w` x `h`) shows the
+    /// notch: its opaque black body at the top centre and nothing outside its
+    /// rounded bottom-left corner.
+    fn assert_notch_frame(px: &[u8], w: i32, h: i32, what: &str) {
+        let at = |x: i32, y: i32| &px[((y * w + x) * 4) as usize..][..4];
+        assert_eq!(at(w / 2, 1), [0, 0, 0, 255], "{what}: notch body");
+        assert_eq!(at(0, h - 1)[3], 0, "{what}: transparent outside the corner");
     }
 
     #[test]
@@ -6011,28 +5976,6 @@ mod tests {
                 "Outside must be transparent"
             );
 
-            // Save rendered hover bitmap
-            let bmp_path = r"C:\Users\ujval\.gemini\antigravity-ide\brain\402578f9-d9e5-44d8-9b61-4772077cf14b\notch_hovered_collapsed.bmp";
-            let mut file_bytes = Vec::with_capacity(54 + pixel_slice.len());
-            file_bytes.extend_from_slice(b"BM");
-            let file_size = (54 + pixel_slice.len()) as u32;
-            file_bytes.extend_from_slice(&file_size.to_le_bytes());
-            file_bytes.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes.extend_from_slice(&54u32.to_le_bytes());
-            file_bytes.extend_from_slice(&40u32.to_le_bytes());
-            file_bytes.extend_from_slice(&width.to_le_bytes());
-            file_bytes.extend_from_slice(&(-height).to_le_bytes());
-            file_bytes.extend_from_slice(&1u16.to_le_bytes());
-            file_bytes.extend_from_slice(&32u16.to_le_bytes());
-            file_bytes.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes.extend_from_slice(&(pixel_slice.len() as u32).to_le_bytes());
-            file_bytes.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes.extend_from_slice(pixel_slice);
-            let _ = std::fs::write(bmp_path, file_bytes);
-
             SelectObject(mem_dc, old_bmp);
             let _ = DeleteObject(dib_hover.into());
 
@@ -6119,27 +6062,7 @@ mod tests {
             let pixel_slice_exp =
                 std::slice::from_raw_parts(bits_exp as *const u8, (w_exp * h_exp * 4) as usize);
 
-            // Save rendered expanded hover bitmap
-            let bmp_path_exp = r"C:\Users\ujval\.gemini\antigravity-ide\brain\402578f9-d9e5-44d8-9b61-4772077cf14b\notch_hovered_expanded.bmp";
-            let mut file_bytes_exp = Vec::with_capacity(54 + pixel_slice_exp.len());
-            file_bytes_exp.extend_from_slice(b"BM");
-            let file_size_exp = (54 + pixel_slice_exp.len()) as u32;
-            file_bytes_exp.extend_from_slice(&file_size_exp.to_le_bytes());
-            file_bytes_exp.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes_exp.extend_from_slice(&54u32.to_le_bytes());
-            file_bytes_exp.extend_from_slice(&40u32.to_le_bytes());
-            file_bytes_exp.extend_from_slice(&w_exp.to_le_bytes());
-            file_bytes_exp.extend_from_slice(&(-h_exp).to_le_bytes());
-            file_bytes_exp.extend_from_slice(&1u16.to_le_bytes());
-            file_bytes_exp.extend_from_slice(&32u16.to_le_bytes());
-            file_bytes_exp.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes_exp.extend_from_slice(&(pixel_slice_exp.len() as u32).to_le_bytes());
-            file_bytes_exp.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes_exp.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes_exp.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes_exp.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes_exp.extend_from_slice(pixel_slice_exp);
-            let _ = std::fs::write(bmp_path_exp, file_bytes_exp);
+            assert_notch_frame(pixel_slice_exp, w_exp, h_exp, "hovered expanded");
 
             SelectObject(mem_dc, old_bmp_exp);
             let _ = DeleteObject(dib_exp.into());
@@ -6253,27 +6176,7 @@ mod tests {
             let pixel_slice =
                 std::slice::from_raw_parts(bits as *const u8, (w_exp * h_exp * 4) as usize);
 
-            // Save expanding animation frame bitmap
-            let bmp_path = r"C:\Users\ujval\.gemini\antigravity-ide\brain\402578f9-d9e5-44d8-9b61-4772077cf14b\notch_animating_expanding.bmp";
-            let mut file_bytes = Vec::with_capacity(54 + pixel_slice.len());
-            file_bytes.extend_from_slice(b"BM");
-            let file_size = (54 + pixel_slice.len()) as u32;
-            file_bytes.extend_from_slice(&file_size.to_le_bytes());
-            file_bytes.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes.extend_from_slice(&54u32.to_le_bytes());
-            file_bytes.extend_from_slice(&40u32.to_le_bytes());
-            file_bytes.extend_from_slice(&w_exp.to_le_bytes());
-            file_bytes.extend_from_slice(&(-h_exp).to_le_bytes());
-            file_bytes.extend_from_slice(&1u16.to_le_bytes());
-            file_bytes.extend_from_slice(&32u16.to_le_bytes());
-            file_bytes.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes.extend_from_slice(&(pixel_slice.len() as u32).to_le_bytes());
-            file_bytes.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes.extend_from_slice(pixel_slice);
-            let _ = std::fs::write(bmp_path, file_bytes);
+            assert_notch_frame(pixel_slice, w_exp, h_exp, "expanding frame");
 
             SelectObject(mem_dc, old_bmp);
             let _ = DeleteObject(dib.into());
@@ -6377,27 +6280,7 @@ mod tests {
             let pixel_slice_col =
                 std::slice::from_raw_parts(bits_col as *const u8, (w_col * h_col * 4) as usize);
 
-            // Save collapsing animation frame bitmap
-            let bmp_path_col = r"C:\Users\ujval\.gemini\antigravity-ide\brain\402578f9-d9e5-44d8-9b61-4772077cf14b\notch_animating_collapsing.bmp";
-            let mut file_bytes_col = Vec::with_capacity(54 + pixel_slice_col.len());
-            file_bytes_col.extend_from_slice(b"BM");
-            let file_size_col = (54 + pixel_slice_col.len()) as u32;
-            file_bytes_col.extend_from_slice(&file_size_col.to_le_bytes());
-            file_bytes_col.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes_col.extend_from_slice(&54u32.to_le_bytes());
-            file_bytes_col.extend_from_slice(&40u32.to_le_bytes());
-            file_bytes_col.extend_from_slice(&w_col.to_le_bytes());
-            file_bytes_col.extend_from_slice(&(-h_col).to_le_bytes());
-            file_bytes_col.extend_from_slice(&1u16.to_le_bytes());
-            file_bytes_col.extend_from_slice(&32u16.to_le_bytes());
-            file_bytes_col.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes_col.extend_from_slice(&(pixel_slice_col.len() as u32).to_le_bytes());
-            file_bytes_col.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes_col.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes_col.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes_col.extend_from_slice(&0u32.to_le_bytes());
-            file_bytes_col.extend_from_slice(pixel_slice_col);
-            let _ = std::fs::write(bmp_path_col, file_bytes_col);
+            assert_notch_frame(pixel_slice_col, w_col, h_col, "collapsing frame");
 
             SelectObject(mem_dc, old_bmp_col);
             let _ = DeleteObject(dib_col.into());
