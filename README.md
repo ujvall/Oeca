@@ -8,25 +8,12 @@
 
 <p align="center">
   <a href="https://github.com/ujvall/Oeca/releases/latest/download/Oeca-Setup.exe"><img src="assets/readme/button-download.png" alt="Download for Windows" height="44"></a>
+  <a href="https://github.com/ujvall/Oeca/releases"><img src="assets/readme/button-releases.png" alt="All releases" height="44"></a>
   <img src="assets/readme/chip-windows.png" alt="Windows 10 or later, 64-bit" height="44">
   <img src="assets/readme/chip-version.png" alt="Version 0.1.0" height="44">
 </p>
 
-<p align="center">
-  <sub>Downloads <code>Oeca-Setup.exe</code> from the latest release · <a href="https://github.com/ujvall/Oeca/releases">All releases</a></sub>
-</p>
-
----
-
-## Features
-
-**Notch.** A small black notch at the top centre of the screen. Collapsed, it shows the time, the current track's artwork, a playback visualizer and a running countdown. Click it to open; it closes again a few seconds after you click elsewhere (5, 10 or 15 s).
-
-**Media.** Works with any app that reports to Windows' media controls. Shows title, artist and artwork with play/pause, previous and next; the Music space adds a scrubber for seeking and the visualizer.
-
-**Timer.** A countdown from 5 seconds to 12 hours, with pause and resume. While it runs, it stays visible in the collapsed notch.
-
-**Clipboard.** Remembers copied text and images (5, 10 or 20 items). Click an item to copy it again, delete items one by one or clear the history. Image files dragged onto the notch are added too. History survives restarting Oeca and is cleared when you sign out or restart Windows.
+<br>
 
 <p align="center">
   <img src="assets/readme/clipboard.png" alt="The expanded notch showing the Clipboard space with four items" width="680">
@@ -34,9 +21,30 @@
   <sub>The Clipboard space, captured from the running app (example clipboard items).</sub>
 </p>
 
-**Settings.** Accent colour, always on top, reduced motion, start on sign-in and more, in the notch itself or the full Settings window. Settings are saved and restored. A tray icon offers Open, Settings and Quit.
+## Features
+
+<p align="center">
+  <img src="assets/readme/card-notch.png" alt="Notch: the time, track artwork, a visualizer and a running timer at a glance. Click to open; it closes again 5, 10 or 15 seconds after you click elsewhere." width="300">
+  <img src="assets/readme/card-media.png" alt="Media: play, pause, previous, next and seek in any app that uses the Windows media controls." width="300">
+  <img src="assets/readme/card-timer.png" alt="Timer: a countdown from five seconds to twelve hours, with pause and resume. Stays visible in the collapsed notch." width="300">
+  <br>
+  <img src="assets/readme/card-clipboard.png" alt="Clipboard: copied text and images, 5, 10 or 20 items. Copy an item again, delete it or clear the history; drag image files onto the notch to add them. Kept across restarts until you sign out." width="300">
+  <img src="assets/readme/card-settings.png" alt="Settings: accent colour, always on top, reduced motion and start on launch, in the notch or the full Settings window. Saved and restored." width="300">
+  <img src="assets/readme/card-native.png" alt="Native: one small Rust executable on Win32 and Direct2D, with no runtime and no web view." width="300">
+</p>
+
+Click an item in the Clipboard space to copy it again, or drag image files onto the notch to add them. A notification-area icon offers **Open**, **Settings** and **Quit**.
 
 ## How it is built
+
+<p>
+  <img src="assets/readme/chip-rust.png" alt="Rust 2024" height="36">
+  <img src="assets/readme/chip-win32.png" alt="Win32" height="36">
+  <img src="assets/readme/chip-d2d.png" alt="Direct2D" height="36">
+  <img src="assets/readme/chip-dwrite.png" alt="DirectWrite" height="36">
+  <img src="assets/readme/chip-smtc.png" alt="Windows media controls" height="36">
+  <img src="assets/readme/chip-noruntime.png" alt="No runtime" height="36">
+</p>
 
 Oeca is a single Rust executable whose only dependencies are Microsoft's [`windows`](https://crates.io/crates/windows) and `windows-core` crates: no runtime, UI framework or web view.
 
@@ -81,17 +89,29 @@ The output is `target\installer\Oeca-Setup.exe`, and its version comes from `Car
 
 ## Project structure
 
-| Path | Contents |
-| --- | --- |
-| `src/window.rs` | Window, message loop, gestures, single instance, lifecycle |
-| `src/renderer.rs` | Direct2D / DirectWrite rendering |
-| `src/layout.rs`, `src/config.rs` | DPI-scaled geometry, springs, colours |
-| `src/media.rs` | Media sessions, artwork, visualizer |
-| `src/clipboard.rs`, `src/clipboard_store.rs`, `src/dragdrop.rs` | Clipboard history, session storage, drag and drop |
-| `src/timer.rs`, `src/clock.rs` | Countdown and clock |
-| `src/settings_window.rs`, `src/settings_store.rs`, `src/startup.rs` | Settings window, settings file, Start on launch |
-| `src/tray.rs` | Notification area icon and menu |
-| `installer/` | Inno Setup script and wizard images |
+```text
+Oeca/
+├── src/
+│   ├── main.rs                Entry point
+│   ├── window.rs              Window, message loop, gestures, single instance, lifecycle
+│   ├── renderer.rs            Direct2D and DirectWrite rendering
+│   ├── layout.rs              DPI-scaled layout
+│   ├── config.rs              Geometry, springs and colours
+│   ├── space.rs               Spaces and the settings model
+│   ├── media.rs               Media sessions, artwork and visualizer
+│   ├── clock.rs               Clock
+│   ├── timer.rs               Countdown timer
+│   ├── clipboard.rs           Clipboard history
+│   ├── clipboard_store.rs     Session-scoped history storage
+│   ├── dragdrop.rs            Image drag and drop
+│   ├── settings_window.rs     Settings window
+│   ├── settings_store.rs      Settings file
+│   ├── startup.rs             Start on launch
+│   └── tray.rs                Notification area icon and menu
+├── assets/                    Icon, version resource and README images
+├── installer/                 Inno Setup script and wizard images
+└── build.rs                   Embeds the icon and version information
+```
 
 ## License and credits
 
