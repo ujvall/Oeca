@@ -6,7 +6,7 @@
 /// The active space. Adding a variant is a compile error at every exhaustive
 /// `match`, so an unknown space cannot appear by accident.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum NottSpace {
+pub enum OecaSpace {
     #[default]
     Home,
     Music,
@@ -18,7 +18,7 @@ pub enum NottSpace {
 /// dragged over it. Animations blend between two scenes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scene {
-    Space(NottSpace),
+    Space(OecaSpace),
     /// The Settings page, over the active space (which stays selected).
     Settings,
     Drop,
@@ -26,12 +26,12 @@ pub enum Scene {
 
 /// The one panel size: the drop page and Settings always take the Clipboard
 /// space's settled size, whichever space is active (so they cannot drift).
-pub const PANEL_SPACE: NottSpace = NottSpace::Clipboard;
+pub const PANEL_SPACE: OecaSpace = OecaSpace::Clipboard;
 
 /// In-memory user settings (every launch starts from the defaults).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NottSettings {
-    /// Topmost band (above normal windows). On by default: Nott has always
+pub struct OecaSettings {
+    /// Topmost band (above normal windows). On by default: Oeca has always
     /// been a topmost window.
     pub always_on_top: bool,
     /// Snap instead of animating (the same snap path as the system's
@@ -59,7 +59,7 @@ pub struct NottSettings {
     pub collapse_delay: crate::config::CollapseDelay,
 }
 
-impl Default for NottSettings {
+impl Default for OecaSettings {
     fn default() -> Self {
         Self {
             always_on_top: true,
@@ -78,7 +78,7 @@ impl Default for NottSettings {
 impl Scene {
     /// The space whose settled size this scene takes: its own, or the panel
     /// size for Settings and the drop page.
-    pub fn size_space(self) -> NottSpace {
+    pub fn size_space(self) -> OecaSpace {
         match self {
             Self::Space(space) => space,
             Self::Settings | Self::Drop => PANEL_SPACE,
@@ -87,7 +87,7 @@ impl Scene {
 
     /// What the expanded notch shows: an image drag's drop page first, then
     /// an open Settings page, otherwise the active space.
-    pub fn current(drop_page: bool, settings_open: bool, space: NottSpace) -> Self {
+    pub fn current(drop_page: bool, settings_open: bool, space: OecaSpace) -> Self {
         if drop_page {
             Self::Drop
         } else if settings_open {
@@ -98,7 +98,7 @@ impl Scene {
     }
 }
 
-impl NottSpace {
+impl OecaSpace {
     #[allow(dead_code)]
     pub const ALL: [Self; 3] = [Self::Home, Self::Music, Self::Clipboard];
 
@@ -135,23 +135,23 @@ mod tests {
 
     #[test]
     fn test_default_is_home_and_spaces_are_distinct() {
-        let s = NottSpace::default();
-        assert_eq!(s, NottSpace::Home);
+        let s = OecaSpace::default();
+        assert_eq!(s, OecaSpace::Home);
         assert!(s.is_home() && !s.is_music());
-        assert_ne!(NottSpace::Home, NottSpace::Music);
-        assert!(NottSpace::Music.is_music() && !NottSpace::Music.is_home());
+        assert_ne!(OecaSpace::Home, OecaSpace::Music);
+        assert!(OecaSpace::Music.is_music() && !OecaSpace::Music.is_home());
     }
 
     #[test]
     fn test_switching_home_music_and_back() {
-        let mut s = NottSpace::default();
-        assert!(s.switch_to(NottSpace::Music), "Home -> Music");
+        let mut s = OecaSpace::default();
+        assert!(s.switch_to(OecaSpace::Music), "Home -> Music");
         assert!(s.is_music());
-        assert!(!s.switch_to(NottSpace::Music), "same space is not a change");
-        assert!(s.switch_to(NottSpace::Home), "Music -> Home");
+        assert!(!s.switch_to(OecaSpace::Music), "same space is not a change");
+        assert!(s.switch_to(OecaSpace::Home), "Music -> Home");
         assert!(s.is_home());
         for i in 0..100 {
-            let target = NottSpace::ALL[i % 3];
+            let target = OecaSpace::ALL[i % 3];
             s.switch_to(target);
             assert_eq!(s, target, "repeated switching");
         }
@@ -159,25 +159,25 @@ mod tests {
 
     #[test]
     fn test_settings_and_drop_take_the_clipboard_size_from_any_space() {
-        for space in NottSpace::ALL {
+        for space in OecaSpace::ALL {
             assert_eq!(
                 Scene::current(false, true, space).size_space(),
-                NottSpace::Clipboard
+                OecaSpace::Clipboard
             );
             assert_eq!(
                 Scene::current(true, false, space).size_space(),
-                NottSpace::Clipboard
+                OecaSpace::Clipboard
             );
             assert_eq!(Scene::current(false, false, space).size_space(), space);
         }
-        let s = NottSettings::default();
+        let s = OecaSettings::default();
         assert!(s.always_on_top && !s.reduced_motion);
         assert!(s.close_settings_on_escape && s.confirm_clear_clipboard);
     }
 
     #[test]
     fn test_scene_priority_and_settings_keep_the_space() {
-        for space in NottSpace::ALL {
+        for space in OecaSpace::ALL {
             assert_eq!(Scene::current(false, false, space), Scene::Space(space));
             assert_eq!(Scene::current(false, true, space), Scene::Settings);
             assert_eq!(Scene::current(true, true, space), Scene::Drop, "drag wins");
@@ -189,7 +189,7 @@ mod tests {
     #[test]
     fn test_labels() {
         assert_eq!(
-            NottSpace::ALL.map(NottSpace::label),
+            OecaSpace::ALL.map(OecaSpace::label),
             ["Home", "Music", "Clipboard"]
         );
     }
@@ -197,22 +197,22 @@ mod tests {
     #[test]
     fn test_exactly_three_spaces() {
         // Exhaustive match (no wildcard): a fourth variant fails to compile here
-        let index = |s: NottSpace| match s {
-            NottSpace::Home => 0,
-            NottSpace::Music => 1,
-            NottSpace::Clipboard => 2,
+        let index = |s: OecaSpace| match s {
+            OecaSpace::Home => 0,
+            OecaSpace::Music => 1,
+            OecaSpace::Clipboard => 2,
         };
-        assert_eq!(NottSpace::ALL.len(), 3);
-        assert_eq!(NottSpace::ALL.map(index), [0, 1, 2]);
+        assert_eq!(OecaSpace::ALL.len(), 3);
+        assert_eq!(OecaSpace::ALL.map(index), [0, 1, 2]);
     }
 
     #[test]
     fn test_home_clipboard_music_round_trip() {
-        let mut s = NottSpace::default();
-        assert!(s.switch_to(NottSpace::Clipboard));
-        assert!(s.switch_to(NottSpace::Music));
-        assert!(s.switch_to(NottSpace::Clipboard));
-        assert!(s.switch_to(NottSpace::Home));
+        let mut s = OecaSpace::default();
+        assert!(s.switch_to(OecaSpace::Clipboard));
+        assert!(s.switch_to(OecaSpace::Music));
+        assert!(s.switch_to(OecaSpace::Clipboard));
+        assert!(s.switch_to(OecaSpace::Home));
         assert!(s.is_home());
     }
 
@@ -229,10 +229,10 @@ mod tests {
         viz.set_playing(true);
         viz.step(100.0);
         let (before_content, before_viz) = (content.clone(), viz);
-        let mut s = NottSpace::default();
-        s.switch_to(NottSpace::Music);
-        s.switch_to(NottSpace::Home);
-        s.switch_to(NottSpace::Music);
+        let mut s = OecaSpace::default();
+        s.switch_to(OecaSpace::Music);
+        s.switch_to(OecaSpace::Home);
+        s.switch_to(OecaSpace::Music);
         assert_eq!(content, before_content);
         assert_eq!(viz, before_viz);
         // ...and media updates don't touch the space
@@ -245,8 +245,8 @@ mod tests {
     #[test]
     fn test_no_persistence_each_start_is_home() {
         // A fresh state (as at every launch) is always Home, whatever was active
-        let mut previous = NottSpace::default();
-        previous.switch_to(NottSpace::Music);
-        assert_eq!(NottSpace::default(), NottSpace::Home);
+        let mut previous = OecaSpace::default();
+        previous.switch_to(OecaSpace::Music);
+        assert_eq!(OecaSpace::default(), OecaSpace::Home);
     }
 }

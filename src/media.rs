@@ -6,7 +6,7 @@
 //!   awaited on the UI thread. Their completion callbacks (`IAsyncOperation::when`,
 //!   provided by `windows-future`, already a dependency of `windows`) run on a WinRT
 //!   thread-pool thread, hand the result over through an mpsc channel and post a
-//!   private `WM_APP_MEDIA_*` message to the Nott window.
+//!   private `WM_APP_MEDIA_*` message to the Oeca window.
 //! - Event handlers (`CurrentSessionChanged`, `MediaPropertiesChanged`,
 //!   `PlaybackInfoChanged`) only post a message. They capture nothing but the HWND
 //!   value, so they can never touch `WindowState`.
@@ -72,7 +72,7 @@ pub fn is_media_message(msg: u32) -> bool {
 /// which bounds memory to 256 KiB per image.
 pub const ARTWORK_MAX_EDGE: u32 = 256;
 
-/// Decoded album artwork owned by Nott (no WinRT objects): BGRA8, premultiplied
+/// Decoded album artwork owned by Oeca (no WinRT objects): BGRA8, premultiplied
 /// alpha, tightly packed (stride = width * 4). Ready for a later
 /// `ID2D1RenderTarget::CreateBitmap`. Cloning shares the pixel buffer.
 #[derive(Clone)]
@@ -349,6 +349,215 @@ fn dominant_rgb(pixels: &[u8], w: usize, h: usize) -> Option<[f32; 3]> {
         }
     }
     Some(rgb.map(|v| v / score(best)))
+}
+
+// ---- Visualizer palette -------------------------------------------------------
+
+/// The visualizer's one gradient, taken from the artwork: the colour at the
+/// top end of every bar and the colour at its bottom end (sRGB bytes). Every
+/// bar shows this same gradient. Separate from `Accent` (the scrubber and the
+/// rest keep that one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VizGradient {
+    pub top: Accent,
+    pub bottom: Accent,
+}
+
+/// A second colour joins the gradient only with at least this share of the
+/// dominant one, and only this many hue bins (10 degrees each) apart: far
+/// enough to read as two colours, not so far (near-complementary) that the
+/// blend between them would pass through a muddy middle.
+const GRADIENT_SECOND_SHARE: f32 = 0.25;
+const GRADIENT_HUE_BINS: (usize, usize) = (3, 15);
+
+/// Samples darker than this (HSV value) are shadows, without usable colour.
+const PALETTE_MIN_VALUE: f32 = 0.2;
+/// Samples with less chroma than this are greys / whites / near-blacks.
+const PALETTE_MIN_CHROMA: f32 = 0.12;
+/// Colourful weight per sample below which the artwork counts as neutral.
+const PALETTE_MIN_COVERAGE: f32 = 0.03;
+/// Every bar colour is at least this bright on black (relative luminance,
+/// linear light): visible, yet the colour itself is kept.
+const PALETTE_MIN_LUMINANCE: f32 = 0.16;
+
+fn srgb_to_linear(v: f32) -> f32 {
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Relative luminance (WCAG) of sRGB 0..=1.
+fn relative_luminance(rgb: [f32; 3]) -> f32 {
+    let [r, g, b] = rgb.map(srgb_to_linear);
+    0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+
+/// HSV (hue 0..1) of sRGB 0..=1.
+fn to_hsv([r, g, b]: [f32; 3]) -> (f32, f32, f32) {
+    let max = r.max(g).max(b);
+    let c = max - r.min(g).min(b);
+    let h = if c <= f32::EPSILON {
+        0.0
+    } else if max == r {
+        ((g - b) / c).rem_euclid(6.0) / 6.0
+    } else if max == g {
+        ((b - r) / c + 2.0) / 6.0
+    } else {
+        ((r - g) / c + 4.0) / 6.0
+    };
+    (h, if max > 0.0 { c / max } else { 0.0 }, max)
+}
+
+fn from_hsv(h: f32, s: f32, v: f32) -> [f32; 3] {
+    let c = v * s;
+    let hp = h.rem_euclid(1.0) * 6.0;
+    let x = c * (1.0 - (hp.rem_euclid(2.0) - 1.0).abs());
+    let (r, g, b) = match hp as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = v - c;
+    [r + m, g + m, b + m]
+}
+
+/// A cluster's colour as shown on black: its own hue and saturation, at its
+/// vivid samples' brightness; only if that would be too dim to read on
+/// black is it lifted (brighter first, then a touch toward white), never
+/// greyed and never pushed past its own saturation.
+fn palette_colour(h: f32, s: f32, v: f32) -> Accent {
+    let (mut s, mut v) = (s.clamp(0.0, 1.0), v.clamp(0.0, 1.0));
+    while relative_luminance(from_hsv(h, s, v)) < PALETTE_MIN_LUMINANCE && v < 1.0 {
+        v = (v + 0.02).min(1.0);
+    }
+    while relative_luminance(from_hsv(h, s, v)) < PALETTE_MIN_LUMINANCE && s > 0.45 {
+        s -= 0.02;
+    }
+    from_hsv(h, s, v).map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+/// The colour `t` (0..=1) of the way from `a` to `b` (sRGB 0..=1): hue
+/// along the shorter arc, saturation and brightness straight across, so a
+/// blend of two vivid colours stays vivid (no grey or muddy middle). A
+/// colourless end takes the other end's hue.
+pub fn gradient_mix(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+    let ((ha, sa, va), (hb, sb, vb)) = (to_hsv(a), to_hsv(b));
+    let (ha, hb) = match (sa < 0.02, sb < 0.02) {
+        (true, false) => (hb, hb),
+        (false, true) => (ha, ha),
+        _ => (ha, hb),
+    };
+    let dh = (hb - ha + 0.5).rem_euclid(1.0) - 0.5;
+    from_hsv(ha + dh * t, sa + (sb - sa) * t, va + (vb - va) * t)
+}
+
+/// The visualizer gradient of already-decoded artwork (no decoding; runs
+/// once per artwork, on a ~48 x 48 sample grid). Each colourful sample (not
+/// a shadow, grey, white or transparent pixel) votes for its hue, weighted by
+/// how vivid and bright it is. The dominant hue cluster gives the main
+/// colour, rebuilt from its own hue (circular mean) and its samples'
+/// saturation and brightness, so tones are never averaged into grey.
+/// - A second prominent colour (a real share of the dominant one, a clearly
+///   different but not opposite hue) makes it a two-colour gradient: the
+///   dominant colour at the top, the second at the bottom.
+/// - Otherwise it is a quiet ramp of the dominant colour itself: a little
+///   lighter at the top, a little deeper at the bottom.
+///
+/// None for neutral artwork (grey, black and white, transparent): the
+/// caller then uses its usual accent. Deterministic.
+pub fn visualizer_gradient(art: &Artwork) -> Option<VizGradient> {
+    const BINS: usize = 36;
+    let (w, h) = (art.width as usize, art.height as usize);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let mut weight = [0f32; BINS];
+    let mut hue = [[0f32; 2]; BINS];
+    let mut sat = [0f32; BINS];
+    let mut val = [0f32; BINS];
+    let step = (w.max(h) / 48).max(1);
+    let mut samples = 0f32;
+    for y in (0..h).step_by(step) {
+        for x in (0..w).step_by(step) {
+            let i = (y * w + x) * 4;
+            let [b, g, r, a] = [0, 1, 2, 3].map(|k| f32::from(art.pixels[i + k]));
+            samples += 1.0;
+            if a < 128.0 {
+                continue;
+            }
+            // Premultiplied BGRA -> straight sRGB 0..=1
+            let rgb = [r / a, g / a, b / a].map(|v| v.min(1.0));
+            let (hh, ss, vv) = to_hsv(rgb);
+            let chroma = ss * vv;
+            if vv < PALETTE_MIN_VALUE || chroma < PALETTE_MIN_CHROMA {
+                continue;
+            }
+            let wt = chroma * vv;
+            let bin = ((hh * BINS as f32) as usize).min(BINS - 1);
+            let ang = hh * std::f32::consts::TAU;
+            weight[bin] += wt;
+            hue[bin][0] += ang.cos() * wt;
+            hue[bin][1] += ang.sin() * wt;
+            sat[bin] += ss * wt;
+            val[bin] += vv * wt;
+        }
+    }
+    let total: f32 = weight.iter().sum();
+    if samples == 0.0 || total / samples < PALETTE_MIN_COVERAGE {
+        return None;
+    }
+    let around = |i: usize| [(i + BINS - 1) % BINS, i, (i + 1) % BINS];
+    let score = |i: usize| around(i).iter().map(|&j| weight[j]).sum::<f32>();
+    let distance = |a: usize, b: usize| {
+        let d = a.abs_diff(b);
+        d.min(BINS - d)
+    };
+    // The dominant cluster (ties broken by bin: deterministic)
+    let first = (0..BINS).fold(0, |b, i| if score(i) > score(b) { i } else { b });
+    // A second colour: the strongest cluster at a pleasing distance
+    let second = (0..BINS)
+        .filter(|&i| {
+            let d = distance(first, i);
+            d >= GRADIENT_HUE_BINS.0 && d <= GRADIENT_HUE_BINS.1
+        })
+        .fold(None, |best: Option<usize>, i| match best {
+            Some(b) if score(b) >= score(i) => Some(b),
+            _ => Some(i),
+        })
+        .filter(|&i| score(i) >= GRADIENT_SECOND_SHARE * score(first));
+    let colour = |p: usize| {
+        let (mut c, mut s_, mut v_, mut wt) = ([0f32; 2], 0f32, 0f32, 0f32);
+        for j in around(p) {
+            c[0] += hue[j][0];
+            c[1] += hue[j][1];
+            s_ += sat[j];
+            v_ += val[j];
+            wt += weight[j];
+        }
+        let hh = c[1].atan2(c[0]).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU;
+        (hh, s_ / wt, v_ / wt)
+    };
+    let (h0, s0, v0) = colour(first);
+    Some(match second {
+        Some(p) => {
+            let (h1, s1, v1) = colour(p);
+            VizGradient {
+                top: palette_colour(h0, s0, v0),
+                bottom: palette_colour(h1, s1, v1),
+            }
+        }
+        // One colour: lighter (a little less saturated) at the top, a little
+        // deeper at the bottom: the same hue throughout
+        None => VizGradient {
+            top: palette_colour(h0, s0 * 0.85, (v0 + 0.1).min(1.0)),
+            bottom: palette_colour(h0, s0, v0 * 0.86),
+        },
+    })
 }
 
 // ---- Timeline ----------------------------------------------------------------
@@ -933,6 +1142,177 @@ impl ControlFeedback {
     pub fn reset(&mut self) {
         *self = Self::default();
     }
+
+    /// Reduced motion: hover levels (control brightening, a clipboard tile's
+    /// buttons) jump to their targets instead of fading. Presses still ease.
+    pub fn snap_hover(&mut self) {
+        for i in 0..3 {
+            self.hover[i] = self.targets(i).0;
+        }
+        let targeted = self.clip_targeted();
+        for b in targeted.into_iter().flatten() {
+            if !self.clip.iter().any(|e| e.0 == b) {
+                self.clip.push((b, 0.0, 0.0));
+            }
+        }
+        let targets: Vec<_> = self.clip.iter().map(|e| self.clip_targets(e.0)).collect();
+        for (e, (hover, _)) in self.clip.iter_mut().zip(targets) {
+            e.1 = hover;
+        }
+        self.clip
+            .retain(|e| e.1 > 0.0 || e.2 > 0.0 || targeted.contains(&Some(e.0)));
+    }
+}
+
+/// How long a play/pause click's expected icon waits for the session to
+/// confirm it before the glyph returns to the reported state (a command the
+/// app ignored never leaves a wrong glyph behind).
+pub const PLAY_PAUSE_CONFIRM_MS: u64 = 3000;
+
+/// Transport glyph motion, independent of the commands themselves:
+/// - Play/pause morphs continuously between the two glyphs (0 = play,
+///   1 = pause). A click heads for the other glyph at once (the command is
+///   sent at the same moment); the session's reported state then confirms
+///   it, or corrects it after `PLAY_PAUSE_CONFIRM_MS`. Every change retargets
+///   from where the glyph is, with its velocity.
+/// - Previous / Next slide their glyph one step per click in their direction
+///   (`skip` counts steps); repeated clicks extend the same motion.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IconMotion {
+    morph: crate::config::Glide,
+    /// What the session reports.
+    actual: PlayPauseIcon,
+    /// A click's expected glyph, until confirmed or the wait ends.
+    expected: Option<(PlayPauseIcon, std::time::Instant)>,
+    skip: [crate::config::Glide; 2],
+}
+
+impl Default for IconMotion {
+    fn default() -> Self {
+        Self {
+            morph: crate::config::Glide::at(0.0),
+            actual: PlayPauseIcon::Play,
+            expected: None,
+            skip: [crate::config::Glide::at(0.0); 2],
+        }
+    }
+}
+
+fn morph_of(icon: PlayPauseIcon) -> f32 {
+    match icon {
+        PlayPauseIcon::Play => 0.0,
+        PlayPauseIcon::Pause => 1.0,
+    }
+}
+
+impl IconMotion {
+    /// The session's reported glyph. A pending click that it confirms is
+    /// settled; one it does not yet confirm keeps its target until the wait
+    /// ends. `instant`: jump (Reduced motion, nothing on screen).
+    pub fn sync(&mut self, actual: PlayPauseIcon, now: std::time::Instant, instant: bool) {
+        self.actual = actual;
+        match self.expected {
+            Some((icon, _)) if icon == actual => self.expected = None,
+            Some((_, until)) if now < until => {}
+            _ => self.expected = None,
+        }
+        let target = morph_of(self.expected.map_or(actual, |(icon, _)| icon));
+        if instant {
+            self.morph.snap(target);
+        } else {
+            self.morph.target = target;
+        }
+    }
+
+    /// Play/pause clicked (its command already sent): head for the other
+    /// glyph from wherever the morph is.
+    pub fn clicked_play_pause(&mut self, now: std::time::Instant, instant: bool) {
+        let shown = self.expected.map_or(self.actual, |(icon, _)| icon);
+        let next = match shown {
+            PlayPauseIcon::Play => PlayPauseIcon::Pause,
+            PlayPauseIcon::Pause => PlayPauseIcon::Play,
+        };
+        self.expected = Some((
+            next,
+            now + std::time::Duration::from_millis(PLAY_PAUSE_CONFIRM_MS),
+        ));
+        if instant {
+            self.morph.snap(morph_of(next));
+        } else {
+            self.morph.target = morph_of(next);
+        }
+    }
+
+    /// Previous / Next clicked (command sent): one more step of slide. At
+    /// most a few steps queue up, so a burst never spins on.
+    pub fn clicked_skip(&mut self, control: MediaControl, instant: bool) {
+        let Some(g) = self.skip_mut(control) else {
+            return;
+        };
+        if instant {
+            g.snap(0.0);
+            return;
+        }
+        g.target = (g.target + 1.0).min(g.value.floor() + 3.0);
+    }
+
+    fn skip_mut(&mut self, control: MediaControl) -> Option<&mut crate::config::Glide> {
+        match control {
+            MediaControl::Previous => Some(&mut self.skip[0]),
+            MediaControl::Next => Some(&mut self.skip[1]),
+            MediaControl::PlayPause => None,
+        }
+    }
+
+    /// 0 = play glyph, 1 = pause glyph.
+    pub fn morph(&self) -> f32 {
+        self.morph.value
+    }
+
+    /// Where a skip glyph is in its current step, 0..1 (0 at rest).
+    pub fn skip_phase(&self, control: MediaControl) -> f32 {
+        let g = match control {
+            MediaControl::Previous => self.skip[0],
+            MediaControl::Next => self.skip[1],
+            MediaControl::PlayPause => return 0.0,
+        };
+        g.value - g.value.floor()
+    }
+
+    /// Needs frames: a glyph moving, or a click awaiting confirmation.
+    pub fn is_animating(&self) -> bool {
+        self.morph.is_animating()
+            || self.expected.is_some()
+            || self.skip.iter().any(|g| g.is_animating())
+    }
+
+    /// Advances by `dt_ms`; an unconfirmed click's wait ends here. True
+    /// while anything still needs frames.
+    pub fn step(&mut self, dt_ms: f32, now: std::time::Instant) -> bool {
+        if self.expected.is_some_and(|(_, until)| now >= until) {
+            self.expected = None;
+            self.morph.target = morph_of(self.actual);
+        }
+        self.morph.step(crate::config::ICON_SPRING, dt_ms);
+        // Skips roll on the calmer space spring (smoother than the
+        // play/pause snap)
+        for g in &mut self.skip {
+            if g.step(crate::config::SPACE_SPRING, dt_ms) {
+                continue;
+            }
+            // Settled on a whole step: back to 0 (same picture)
+            g.snap(0.0);
+        }
+        self.is_animating()
+    }
+
+    /// Everything at rest on the reported glyph (nothing on screen).
+    pub fn settle(&mut self) {
+        let actual = self.actual;
+        *self = Self::default();
+        self.actual = actual;
+        self.morph.snap(morph_of(actual));
+    }
 }
 
 /// Icon on the central control: the action a click performs.
@@ -1402,7 +1782,7 @@ impl MediaEngine {
         let hwnd_raw = hwnd.0 as usize;
         let started = SessionManager::RequestAsync().and_then(|op| {
             op.when(move |result| {
-                // Receiver gone means Nott is shutting down; nothing to do.
+                // Receiver gone means Oeca is shutting down; nothing to do.
                 if tx.send(result).is_ok() {
                     post(hwnd_raw, WM_APP_MEDIA_MANAGER_READY);
                 }
@@ -1722,6 +2102,41 @@ impl MediaEngine {
                 false
             }
         }
+    }
+
+    /// Whether the session shown lets its position be changed (the app
+    /// says so through its transport controls).
+    pub fn can_seek(&self) -> bool {
+        self.session.as_ref().is_some_and(|s| {
+            s.GetPlaybackInfo()
+                .and_then(|i| i.Controls())
+                .and_then(|c| c.IsPlaybackPositionEnabled())
+                .unwrap_or(false)
+        })
+    }
+
+    /// UI thread: asks the session shown to play from `position_ms` into its
+    /// timeline. Fire-and-forget like `send_command` (the new position
+    /// arrives as a timeline event). Nothing is sent if the current session
+    /// is no longer the one shown or it does not allow seeking. Returns
+    /// whether it was sent.
+    pub fn send_seek(&self, position_ms: i64) -> bool {
+        let Some(session) = self
+            .manager
+            .as_ref()
+            .and_then(|m| m.GetCurrentSession().ok())
+        else {
+            return false;
+        };
+        if Some(&session) != self.session.as_ref() || !self.can_seek() {
+            return false;
+        }
+        let start = session
+            .GetTimelineProperties()
+            .and_then(|t| t.StartTime())
+            .map_or(0, |d| d.Duration);
+        let ticks = start.saturating_add(position_ms.max(0).saturating_mul(10_000));
+        session.TryChangePlaybackPositionAsync(ticks).is_ok()
     }
 
     /// Re-reads playback info of the current session (synchronous WinRT call).
@@ -2291,14 +2706,14 @@ mod tests {
     }
 
     /// Machine-dependent: prints what Windows resolves for real AUMIDs.
-    /// Run with `NOTT_AUMIDS="A;B" cargo test resolve_real -- --ignored --nocapture`.
+    /// Run with `OECA_AUMIDS="A;B" cargo test resolve_real -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn resolve_real_aumids() {
         use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
         // Same apartment as the Windows thread pool work item in production
         let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        for id in std::env::var("NOTT_AUMIDS").unwrap_or_default().split(';') {
+        for id in std::env::var("OECA_AUMIDS").unwrap_or_default().split(';') {
             let t = std::time::Instant::now();
             println!("{id:?} -> {:?} ({:?})", resolve_app_name(id), t.elapsed());
         }
@@ -2314,7 +2729,7 @@ mod tests {
             "MSEdge",
             "Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic",
             "Spotify.exe",
-            "Nott.Missing!App",
+            "Oeca.Missing!App",
         ];
         let handles: Vec<_> = (0..8)
             .map(|t| {
@@ -2336,7 +2751,7 @@ mod tests {
     fn test_resolve_empty_or_unknown_app_is_unavailable() {
         assert_eq!(resolve_app_name(""), AppName::Unavailable);
         assert_eq!(
-            resolve_app_name("Nott.Test.Definitely.Not.Installed!App"),
+            resolve_app_name("Oeca.Test.Definitely.Not.Installed!App"),
             AppName::Unavailable
         );
     }
@@ -2803,6 +3218,194 @@ mod tests {
         assert!(luma(rgb) >= 0.15, "too dark: {a:?}");
     }
 
+    /// Premultiplied BGRA artwork from a function of (x, y) -> (rgb, alpha).
+    fn cover_of(w: u32, h: u32, f: impl Fn(u32, u32) -> ([u8; 3], u8)) -> Artwork {
+        let mut px = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let ([r, g, b], a) = f(x, y);
+                let pm = |c: u8| (u32::from(c) * u32::from(a) / 255) as u8;
+                px.extend([pm(b), pm(g), pm(r), a]);
+            }
+        }
+        Artwork::new(w, h, px).unwrap()
+    }
+
+    fn hsv_of(c: Accent) -> (f32, f32, f32) {
+        to_hsv(c.map(|v| f32::from(v) / 255.0))
+    }
+
+    fn hue_near(a: f32, b: f32, tol: f32) -> bool {
+        let d = (a - b).abs();
+        d.min(1.0 - d) <= tol
+    }
+
+    fn visible(c: Accent) -> bool {
+        relative_luminance(c.map(|v| f32::from(v) / 255.0)) >= PALETTE_MIN_LUMINANCE - 0.005
+    }
+
+    #[test]
+    fn test_gradient_of_vivid_single_colour_artwork_is_one_hue() {
+        // A vivid red-orange cover with deep shadows and a white title: one
+        // rich red-orange, lighter at the top, deeper at the bottom
+        let art = cover_of(96, 96, |x, y| {
+            if y < 12 {
+                ([250, 250, 250], 255)
+            } else if x < 20 {
+                ([20, 6, 4], 255)
+            } else {
+                ([235, 60, 30], 255)
+            }
+        });
+        let g = visualizer_gradient(&art).unwrap();
+        let (top, bottom) = (hsv_of(g.top), hsv_of(g.bottom));
+        assert!(hue_near(top.0, 0.025, 0.03) && hue_near(bottom.0, 0.025, 0.03));
+        assert!(
+            bottom.1 > 0.75 && bottom.2 > 0.7,
+            "rich, not muted: {bottom:?}"
+        );
+        assert!(top.2 >= bottom.2, "lighter at the top");
+        assert_ne!(g.top, g.bottom, "a gentle ramp, not flat");
+        // The old accent of the same cover is the duller one
+        assert!(hsv_of(artwork_accent(&art).unwrap()).1 < bottom.1);
+        assert!(visible(g.top) && visible(g.bottom));
+    }
+
+    #[test]
+    fn test_gradient_of_two_colour_artwork_blends_them() {
+        // Mostly blue with a strong purple area and a small orange detail:
+        // blue to purple; the small (and opposite) orange is left out
+        let art = cover_of(120, 120, |x, y| {
+            if x < 70 {
+                ([30, 80, 230], 255)
+            } else if y < 90 {
+                ([140, 50, 220], 255)
+            } else {
+                ([245, 140, 30], 255)
+            }
+        });
+        let g = visualizer_gradient(&art).unwrap();
+        assert!(
+            hue_near(hsv_of(g.top).0, 0.62, 0.04),
+            "dominant blue on top: {g:?}"
+        );
+        assert!(
+            hue_near(hsv_of(g.bottom).0, 0.75, 0.04),
+            "purple below: {g:?}"
+        );
+        assert!(visible(g.top) && visible(g.bottom));
+        // Red and yellow make a warm two-colour gradient too
+        let warm = cover_of(64, 64, |x, _| {
+            if x < 36 {
+                ([225, 40, 50], 255)
+            } else {
+                ([245, 200, 40], 255)
+            }
+        });
+        let g = visualizer_gradient(&warm).unwrap();
+        assert!(
+            hue_near(hsv_of(g.top).0, 0.99, 0.04) && hue_near(hsv_of(g.bottom).0, 0.13, 0.04),
+            "{g:?}"
+        );
+        // Near-opposite colours (blue / orange) would blend through mud: the
+        // dominant one alone
+        let opposite = cover_of(64, 64, |x, _| {
+            if x < 36 {
+                ([30, 80, 230], 255)
+            } else {
+                ([245, 140, 30], 255)
+            }
+        });
+        let g = visualizer_gradient(&opposite).unwrap();
+        assert!(
+            hue_near(hsv_of(g.top).0, hsv_of(g.bottom).0, 0.03),
+            "one hue: {g:?}"
+        );
+        // A minor second colour (under a quarter of the main one): one hue
+        let minor = cover_of(64, 64, |x, _| {
+            if x < 58 {
+                ([30, 80, 230], 255)
+            } else {
+                ([140, 50, 220], 255)
+            }
+        });
+        let g = visualizer_gradient(&minor).unwrap();
+        assert!(hue_near(hsv_of(g.top).0, hsv_of(g.bottom).0, 0.03), "{g:?}");
+    }
+
+    #[test]
+    fn test_gradient_lifts_dark_hues_to_visible_without_greying() {
+        let art = cover_of(64, 64, |_, _| ([12, 24, 110], 255));
+        let g = visualizer_gradient(&art).unwrap();
+        for c in [g.top, g.bottom] {
+            assert!(visible(c), "visible on black: {c:?}");
+            let (h, s, _) = hsv_of(c);
+            assert!(hue_near(h, 0.64, 0.05) && s >= 0.45, "still blue: {c:?}");
+        }
+    }
+
+    #[test]
+    fn test_gradient_neutral_dark_and_transparent_artwork_fall_back() {
+        let grey = cover_of(64, 64, |x, _| ([(x * 4) as u8; 3], 255));
+        let mono = cover_of(64, 64, |x, y| {
+            (
+                if (x / 8 + y / 8) % 2 == 0 {
+                    [0; 3]
+                } else {
+                    [255; 3]
+                },
+                255,
+            )
+        });
+        let black = cover_of(64, 64, |_, _| ([8, 4, 10], 255));
+        let clear = cover_of(64, 64, |_, _| ([255, 0, 0], 0));
+        let washed = cover_of(64, 64, |_, _| ([235, 228, 230], 255));
+        for (name, art) in [
+            ("grey", grey),
+            ("mono", mono),
+            ("black", black),
+            ("clear", clear),
+            ("washed", washed),
+        ] {
+            assert_eq!(
+                visualizer_gradient(&art),
+                None,
+                "{name}: the usual accent instead"
+            );
+        }
+        // A coloured core in transparent artwork counts
+        let core = cover_of(64, 64, |x, y| {
+            if (20..44).contains(&x) && (20..44).contains(&y) {
+                ([40, 200, 120], 255)
+            } else {
+                ([0, 0, 0], 0)
+            }
+        });
+        assert!(hue_near(
+            hsv_of(visualizer_gradient(&core).unwrap().bottom).0,
+            0.42,
+            0.04
+        ));
+        // Low saturation that is still coloured: kept subtle, not boosted
+        let dusty = cover_of(64, 64, |_, _| ([150, 110, 170], 255));
+        let g = visualizer_gradient(&dusty).unwrap();
+        assert!(hsv_of(g.bottom).1 < 0.5, "dusty stays dusty");
+        assert!(visible(g.bottom) && visible(g.top));
+    }
+
+    #[test]
+    fn test_gradient_is_stable_for_the_same_artwork() {
+        let art = cover_of(200, 200, |x, y| {
+            ([(x % 256) as u8, (y % 256) as u8, 160], 255)
+        });
+        let g = visualizer_gradient(&art);
+        for _ in 0..5 {
+            assert_eq!(visualizer_gradient(&art), g, "deterministic");
+        }
+        let copy = Artwork::new(200, 200, art.pixels.to_vec()).unwrap();
+        assert_eq!(visualizer_gradient(&copy), g, "same pixels, same gradient");
+    }
+
     #[test]
     fn test_accent_dark_artwork_is_lifted() {
         // Near-black cover with a dim red motif
@@ -3059,5 +3662,153 @@ mod tests {
             "paused while off screen: no stale fade later"
         );
         assert!(!v.is_active());
+    }
+
+    // ---- Transport glyph motion ----------------------------------------------
+
+    fn run(m: &mut IconMotion, now: std::time::Instant, ms: u32) -> Vec<f32> {
+        (0..ms / 16)
+            .map(|_| {
+                m.step(16.0, now);
+                m.morph()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_play_pause_answers_a_click_at_once_in_both_directions() {
+        let now = std::time::Instant::now();
+        let mut deltas = Vec::new();
+        for (actual, toward) in [(PlayPauseIcon::Play, 1.0f32), (PlayPauseIcon::Pause, 0.0)] {
+            let mut m = IconMotion::default();
+            m.sync(actual, now, true);
+            let start = m.morph();
+            m.clicked_play_pause(now, false);
+            assert!(m.is_animating(), "frames start with the click");
+            m.step(16.0, now);
+            let moved = m.morph() - start;
+            assert!(moved.abs() > 0.02, "the first frame already moves: {moved}");
+            assert_eq!(moved.signum(), (toward - start).signum());
+            deltas.push(moved.abs());
+            // ...and it gets there without waiting for the session
+            run(&mut m, now, 600);
+            assert_eq!(m.morph(), toward);
+        }
+        assert!(
+            (deltas[0] - deltas[1]).abs() < 1e-4,
+            "same response both ways: {deltas:?}"
+        );
+    }
+
+    #[test]
+    fn test_play_pause_reverses_mid_way_without_a_jump() {
+        let now = std::time::Instant::now();
+        let mut m = IconMotion::default();
+        m.sync(PlayPauseIcon::Play, now, true);
+        m.clicked_play_pause(now, false);
+        let path = run(&mut m, now, 80);
+        let mid = *path.last().unwrap();
+        assert!(mid > 0.1 && mid < 0.9, "mid-way: {mid}");
+        m.clicked_play_pause(now, false); // back to play
+        m.step(1.0, now);
+        assert!((m.morph() - mid).abs() < 0.03, "continues from where it is");
+        let back = run(&mut m, now, 600);
+        assert_eq!(*back.last().unwrap(), 0.0);
+        // Never outside the two glyphs (critically damped: no overshoot)
+        assert!(path.iter().chain(&back).all(|v| (0.0..=1.0).contains(v)));
+        // Smooth: no frame jumps more than a modest step
+        let all: Vec<f32> = path.iter().chain(&back).copied().collect();
+        assert!(all.windows(2).all(|w| (w[1] - w[0]).abs() < 0.2));
+    }
+
+    #[test]
+    fn test_play_pause_confirmed_or_corrected_by_the_session() {
+        let t0 = std::time::Instant::now();
+        let ms = std::time::Duration::from_millis;
+        // Confirmed: the session reports the new state
+        let mut m = IconMotion::default();
+        m.sync(PlayPauseIcon::Play, t0, true);
+        m.clicked_play_pause(t0, false);
+        // A stale report of the old state (e.g. a timeline event) changes nothing
+        m.sync(PlayPauseIcon::Play, t0 + ms(100), false);
+        run(&mut m, t0 + ms(100), 400);
+        assert_eq!(m.morph(), 1.0, "still heading for pause");
+        m.sync(PlayPauseIcon::Pause, t0 + ms(400), false);
+        run(&mut m, t0 + ms(400), 200);
+        assert!(!m.is_animating(), "confirmed: settles, no frames");
+        // Ignored by the app: back to the reported glyph once the wait ends
+        let mut m = IconMotion::default();
+        m.sync(PlayPauseIcon::Play, t0, true);
+        m.clicked_play_pause(t0, false);
+        run(&mut m, t0, 300);
+        assert!(m.is_animating(), "waits for the session");
+        let late = t0 + ms(PLAY_PAUSE_CONFIRM_MS);
+        run(&mut m, late, 600);
+        assert_eq!(m.morph(), 0.0, "never left showing a wrong glyph");
+        assert!(!m.is_animating());
+    }
+
+    #[test]
+    fn test_skip_glyphs_slide_their_own_way_and_settle_after_rapid_clicks() {
+        let now = std::time::Instant::now();
+        let mut m = IconMotion::default();
+        assert_eq!(m.skip_phase(MediaControl::Next), 0.0);
+        m.clicked_skip(MediaControl::Next, false);
+        m.step(16.0, now);
+        let p = m.skip_phase(MediaControl::Next);
+        assert!(p > 0.0 && p < 1.0, "moves at once: {p}");
+        assert_eq!(
+            m.skip_phase(MediaControl::Previous),
+            0.0,
+            "Previous untouched"
+        );
+        assert_eq!(m.skip_phase(MediaControl::PlayPause), 0.0);
+        // Rapid clicks extend the same motion (bounded), never jumping
+        let mut total = vec![m.skip[1].value];
+        for _ in 0..5 {
+            m.clicked_skip(MediaControl::Next, false);
+            m.step(16.0, now);
+            total.push(m.skip[1].value);
+        }
+        assert!(
+            m.skip[1].target <= m.skip[1].value.floor() + 3.0,
+            "a burst never spins on"
+        );
+        while m.step(16.0, now) {
+            total.push(m.skip[1].value);
+            assert!(total.len() < 400, "settles");
+        }
+        assert!(
+            total.windows(2).all(|w| w[1] >= w[0] - 1e-4 || w[1] == 0.0),
+            "one way"
+        );
+        assert!(
+            total
+                .windows(2)
+                .all(|w| w[1] == 0.0 || (w[1] - w[0]).abs() < 0.5),
+            "continuous"
+        );
+        assert_eq!(m.skip_phase(MediaControl::Next), 0.0, "at rest again");
+        assert!(!m.is_animating(), "no frames once settled");
+    }
+
+    #[test]
+    fn test_reduced_motion_glyphs_change_at_once() {
+        let now = std::time::Instant::now();
+        let mut m = IconMotion::default();
+        m.sync(PlayPauseIcon::Play, now, true);
+        m.clicked_play_pause(now, true);
+        assert_eq!(m.morph(), 1.0);
+        m.clicked_skip(MediaControl::Previous, true);
+        assert_eq!(m.skip_phase(MediaControl::Previous), 0.0);
+        m.sync(PlayPauseIcon::Pause, now, true);
+        assert!(!m.is_animating());
+        // Settling (nothing on screen) lands on the reported glyph
+        let mut m = IconMotion::default();
+        m.sync(PlayPauseIcon::Pause, now, false);
+        m.clicked_skip(MediaControl::Next, false);
+        m.settle();
+        assert_eq!(m.morph(), 1.0);
+        assert!(!m.is_animating());
     }
 }

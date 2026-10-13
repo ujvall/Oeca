@@ -4,7 +4,7 @@ use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 
 use crate::config::{
     BASE_CLIPBOARD_BOTTOM_PAD, BASE_CLIPBOARD_ROW_GAP, BASE_CLIPBOARD_ROW_HEIGHT,
-    BASE_CLIPBOARD_SIDE_INSET, BASE_CLIPBOARD_WIDTH, CLIPBOARD_VISIBLE_ROWS,
+    BASE_CLIPBOARD_SIDE_INSET, BASE_CLIPBOARD_WIDTH, CLIPBOARD_TILES, CLIPBOARD_VISIBLE_ROWS,
 };
 use crate::config::{
     BASE_EXPANDED_HEIGHT, BASE_EXPANDED_PADDING_V, BASE_EXPANDED_SHADOW_MARGIN_BOTTOM,
@@ -32,7 +32,7 @@ use crate::config::{
 };
 use crate::media::MediaControl;
 use crate::media::VISUALIZER_BARS;
-use crate::space::{NottSpace, Scene};
+use crate::space::{OecaSpace, Scene};
 
 /// Floating-point axis-aligned rectangle for layout computation
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -104,6 +104,8 @@ pub struct CollapsedLayout {
     pub clock_bounds: RectF,
     /// Playback visualizer, right end of the content area (inside the notch body)
     pub visualizer_bounds: RectF,
+    /// Album art, left end of the content area (whole pixels, square)
+    pub artwork_bounds: RectF,
 }
 
 /// Space selector capsules (Home, Music, Clipboard) in the expanded notch's
@@ -118,11 +120,11 @@ pub struct SpaceSelectorLayout {
 }
 
 impl SpaceSelectorLayout {
-    pub fn bounds(&self, space: NottSpace) -> RectF {
+    pub fn bounds(&self, space: OecaSpace) -> RectF {
         match space {
-            NottSpace::Home => self.home,
-            NottSpace::Music => self.music,
-            NottSpace::Clipboard => self.clipboard,
+            OecaSpace::Home => self.home,
+            OecaSpace::Music => self.music,
+            OecaSpace::Clipboard => self.clipboard,
         }
     }
 
@@ -137,8 +139,8 @@ impl SpaceSelectorLayout {
 
     /// The space whose capsule contains the client point (only the capsules
     /// themselves are interactive).
-    pub fn space_at(&self, px: f32, py: f32) -> Option<NottSpace> {
-        NottSpace::ALL
+    pub fn space_at(&self, px: f32, py: f32) -> Option<OecaSpace> {
+        OecaSpace::ALL
             .into_iter()
             .find(|s| self.bounds(*s).contains(px, py))
     }
@@ -148,14 +150,14 @@ impl SpaceSelectorLayout {
 /// It sits above the content area, starting at the cover's left edge (notch
 /// wall + cover inset), so it never touches the media composition.
 pub fn resolve_space_selector(dimensions: &NotchDimensions) -> Option<SpaceSelectorLayout> {
-    resolve_space_selector_in(dimensions, NottSpace::Home)
+    resolve_space_selector_in(dimensions, OecaSpace::Home)
 }
 
 /// The selector for the active space: its left edge follows that space's
 /// content edge (Home: the cover inset; Music: the player column inset).
 pub fn resolve_space_selector_in(
     dimensions: &NotchDimensions,
-    space: NottSpace,
+    space: OecaSpace,
 ) -> Option<SpaceSelectorLayout> {
     if dimensions.state != NotchState::Expanded {
         return None;
@@ -163,9 +165,9 @@ pub fn resolve_space_selector_in(
     let px = |v: f32| (v * dimensions.scale).round();
     let wall = dimensions.shadow_margin_x + dimensions.curvature.top_transition_radius;
     let inset = match space {
-        NottSpace::Home => BASE_MEDIA_ARTWORK_INSET,
-        NottSpace::Music => BASE_MUSIC_SIDE_INSET,
-        NottSpace::Clipboard => BASE_CLIPBOARD_SIDE_INSET,
+        OecaSpace::Home => BASE_MEDIA_ARTWORK_INSET,
+        OecaSpace::Music => BASE_MUSIC_SIDE_INSET,
+        OecaSpace::Clipboard => BASE_CLIPBOARD_SIDE_INSET,
     };
     let left = (wall + px(inset)).round();
     let top = px(BASE_SPACE_SELECTOR_TOP);
@@ -193,7 +195,7 @@ pub fn blended_selector(
     dimensions: &NotchDimensions,
     from: Scene,
     to: Scene,
-    space: NottSpace,
+    space: OecaSpace,
     mix: f32,
 ) -> Option<(SpaceSelectorLayout, RectF)> {
     if dimensions.state != NotchState::Expanded {
@@ -317,68 +319,358 @@ pub enum PanelHit {
     CancelClear,
     /// The clear confirmation's Clear: forgets the history.
     ConfirmClear,
+    /// Home's timer: the round primary button (Start / Pause / Resume /
+    /// Restart), the round Cancel button, and the duration scale.
+    TimerPrimary,
+    TimerCancel,
+    TimerScale,
 }
 
 impl PanelHit {
-    /// Icon buttons (they grow on hover/press); a row box is not one.
+    /// Icon buttons (they grow on hover/press); a row box or the timer's
+    /// scale is not one.
     pub fn is_button(self) -> bool {
-        !matches!(self, Self::Row(_))
+        !matches!(self, Self::Row(_) | Self::TimerScale)
+    }
+}
+
+/// Home's countdown timer: the numerals with their round buttons at the
+/// row's right end (Cancel, then the primary button), and under them the
+/// duration scale (setup) or a status line.
+///
+/// ```text
+/// 4:59                 (x) (||)
+/// 5 min timer
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TimerLayout {
+    pub panel: RectF,
+    /// Numerals row (the text itself stops before the buttons: `display`).
+    pub numerals: RectF,
+    pub primary: RectF,
+    pub cancel: RectF,
+    /// Second row: the scale (setup) or the status line.
+    pub row: RectF,
+    /// Half the indicator's width: the scale's first and last stops sit this
+    /// far inside the row so the indicator never leaves it.
+    pub inset: f32,
+}
+
+impl TimerLayout {
+    pub fn offset_x(self, dx: f32) -> Self {
+        Self {
+            panel: self.panel.offset_x(dx),
+            numerals: self.numerals.offset_x(dx),
+            primary: self.primary.offset_x(dx),
+            cancel: self.cancel.offset_x(dx),
+            row: self.row.offset_x(dx),
+            inset: self.inset,
+        }
+    }
+
+    /// Where the numerals may draw: up to the first button shown (Cancel
+    /// only outside setup).
+    pub fn display(&self, idle: bool) -> RectF {
+        let first = if idle { self.primary } else { self.cancel };
+        let gap = (self.primary.left - self.cancel.right).max(0.0);
+        RectF::new(
+            self.numerals.left,
+            self.numerals.top,
+            (first.left - gap).max(self.numerals.left),
+            self.numerals.bottom,
+        )
+    }
+
+    /// Whole-pixel x of the scale's stop `i` (of `n`).
+    pub fn stop_x(&self, i: usize, n: usize) -> f32 {
+        let (left, right) = (self.row.left + self.inset, self.row.right - self.inset);
+        let step = (right - left) / (n.max(2) - 1) as f32;
+        (left + i.min(n - 1) as f32 * step).round()
+    }
+
+    /// The stop nearest `x` (clamped to the scale).
+    pub fn stop_at(&self, x: f32, n: usize) -> usize {
+        let (left, right) = (self.row.left + self.inset, self.row.right - self.inset);
+        let step = (right - left) / (n.max(2) - 1) as f32;
+        (((x - left) / step).round().max(0.0) as usize).min(n - 1)
+    }
+
+    /// What a point hits: the buttons shown, and the scale during setup.
+    pub fn hit(&self, px: f32, py: f32, idle: bool) -> Option<PanelHit> {
+        if self.primary.contains(px, py) {
+            Some(PanelHit::TimerPrimary)
+        } else if !idle && self.cancel.contains(px, py) {
+            Some(PanelHit::TimerCancel)
+        } else if idle && self.row.contains(px, py) {
+            Some(PanelHit::TimerScale)
+        } else {
+            None
+        }
+    }
+}
+
+/// Home with its timer. With media the timer takes the empty band between
+/// the divider and the clock column (the media composition is untouched).
+/// Without media the content area becomes two columns around a centre
+/// divider: the clock (unchanged type, centred in the left column) and the
+/// timer (centred in the right one).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HomeTimerLayout {
+    pub timer: TimerLayout,
+    /// Without media: the clock's time and date bounds (the left column).
+    pub clock: Option<(RectF, RectF)>,
+    /// Without media: the centre divider.
+    pub divider: Option<RectF>,
+}
+
+/// Resolves Home's timer panel for settled Home dimensions (None when
+/// collapsed). `media`: the shape of the media composition shown, if any.
+pub fn resolve_home_timer_layout(
+    dimensions: &NotchDimensions,
+    media: Option<MediaShape>,
+) -> Option<HomeTimerLayout> {
+    use crate::config::{
+        BASE_TIMER_BUTTON_GAP, BASE_TIMER_BUTTON_SIZE, BASE_TIMER_COLUMN_GAP,
+        BASE_TIMER_DISPLAY_HEIGHT, BASE_TIMER_INDICATOR_WIDTH, BASE_TIMER_PANEL_WIDTH,
+        BASE_TIMER_ROW_GAP, BASE_TIMER_SCALE_HEIGHT,
+    };
+    let ResolvedLayout::Expanded { components, .. } = resolve_layout(dimensions) else {
+        return None;
+    };
+    let px = |v: f32| (v * dimensions.scale).round();
+    let c = components.content_bounds;
+    // Centred on the settled Home body, like the clock and media block
+    let bottom = (home_settled_notch_h(dimensions.scale) - dimensions.padding_v).max(c.top);
+    let (region, clock, divider) = match media {
+        Some(shape) => {
+            let m = resolve_media_layout_in(dimensions, shape, OecaSpace::Home)?;
+            let left = m.divider_bounds.right + px(BASE_MEDIA_DIVIDER_TEXT_GAP);
+            (
+                RectF::new(left, c.top, m.time_bounds.left.max(left), bottom),
+                None,
+                None,
+            )
+        }
+        None => {
+            let mid = ((c.left + c.right) / 2.0).round();
+            let gap = px(BASE_TIMER_COLUMN_GAP);
+            let inset = px(BASE_MEDIA_DIVIDER_INSET);
+            let clock_col = (c.left, mid - gap);
+            let time = RectF::new(
+                clock_col.0,
+                components.time_bounds.top,
+                clock_col.1,
+                components.time_bounds.bottom,
+            );
+            let date = RectF::new(
+                clock_col.0,
+                components.date_bounds.top,
+                clock_col.1,
+                components.date_bounds.bottom,
+            );
+            let line = px(BASE_MEDIA_DIVIDER_WIDTH).max(1.0);
+            (
+                RectF::new(mid + gap, c.top, c.right, bottom),
+                Some((time, date)),
+                Some(RectF::new(mid, c.top + inset, mid + line, bottom - inset)),
+            )
+        }
+    };
+    let w = px(BASE_TIMER_PANEL_WIDTH).min(region.width());
+    let (display_h, row_gap, row_h) = (
+        px(BASE_TIMER_DISPLAY_HEIGHT),
+        px(BASE_TIMER_ROW_GAP),
+        px(BASE_TIMER_SCALE_HEIGHT),
+    );
+    let h = display_h + row_gap + row_h;
+    let left = (region.left + (region.width() - w) / 2.0).round();
+    let top = (region.top + (region.height() - h) / 2.0)
+        .round()
+        .max(c.top);
+    let panel = RectF::new(left, top, left + w, top + h);
+    let numerals = RectF::new(left, top, panel.right, top + display_h);
+    let (b, gap) = (px(BASE_TIMER_BUTTON_SIZE), px(BASE_TIMER_BUTTON_GAP));
+    let b_top = (top + (display_h - b) / 2.0).round();
+    let primary = RectF::new(panel.right - b, b_top, panel.right, b_top + b);
+    let cancel = RectF::new(primary.left - gap - b, b_top, primary.left - gap, b_top + b);
+    let row_top = numerals.bottom + row_gap;
+    Some(HomeTimerLayout {
+        timer: TimerLayout {
+            panel,
+            numerals,
+            primary,
+            cancel,
+            row: RectF::new(left, row_top, panel.right, row_top + row_h),
+            inset: (px(BASE_TIMER_INDICATOR_WIDTH) / 2.0).ceil(),
+        },
+        clock,
+        divider,
+    })
+}
+
+/// The collapsed notch's countdown slot: the visualizer's place, grown left
+/// (toward the centred clock) just enough for the remaining time.
+pub fn timer_slot_rect(layout: &CollapsedLayout, scale: f32) -> RectF {
+    let right = layout.visualizer_bounds.right;
+    let w = (crate::config::BASE_TIMER_SLOT_WIDTH * scale).round();
+    RectF::new(
+        (right - w).max(layout.content_bounds.left),
+        layout.clock_bounds.top,
+        right,
+        layout.clock_bounds.bottom,
+    )
+}
+
+/// The countdown bubble beside the collapsed notch: a floating circle of
+/// its own, centred on the notch's height (clear of the screen edge), that
+/// behaves like a drop of the notch's own liquid. It buds out of the
+/// notch's wall and is absorbed back into it: while it is close a neck joins
+/// it to the wall, which thins and pinches off as it moves away. Window
+/// coordinates: the window starts `overlap` px back over the notch's body,
+/// so the wall is at x = `wall`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BubbleGeometry {
+    /// Window size (px).
+    pub window: (i32, i32),
+    /// The notch body's right wall (x).
+    pub wall: f32,
+    /// The circle.
+    pub center: (f32, f32),
+    pub radius: f32,
+    /// The ring (centre line radius, stroke width).
+    pub ring: (f32, f32),
+    /// The neck's half-height where it meets the wall (0: detached).
+    pub neck: f32,
+}
+
+/// The bubble at `presence` (0: inside the notch .. 1: floating a gap
+/// away; slightly above while the spring settles). On the way in it moves
+/// into the wall while shrinking a little, so at 0 it is entirely behind
+/// the notch's black body.
+pub fn timer_bubble_geometry(dpi: u32, presence: f32) -> BubbleGeometry {
+    use crate::config::{
+        BASE_TIMER_BUBBLE_GAP, BASE_TIMER_BUBBLE_HEIGHT, BASE_TIMER_BUBBLE_OVERLAP,
+        BASE_TIMER_NECK_REACH, BASE_TIMER_RING_INSET, BASE_TIMER_RING_WIDTH,
+    };
+    let d = NotchDimensions::from_state_and_dpi(NotchState::Collapsed, dpi);
+    let px = |v: f32| (v * d.scale).round();
+    let big_r = px(BASE_TIMER_BUBBLE_HEIGHT).min(d.height as f32 - 2.0) / 2.0;
+    let gap = px(BASE_TIMER_BUBBLE_GAP);
+    let wall = px(BASE_TIMER_BUBBLE_OVERLAP);
+    // 0 = floating, 1 = absorbed (below 0 while the spring overshoots out)
+    let t = 1.0 - presence.clamp(0.0, 1.05);
+    let home = gap + big_r;
+    let cx = home - (home + 0.6 * big_r) * t;
+    let r = big_r * (1.0 - 0.5 * t.max(0.0));
+    // The neck: from nothing at its reach to most of the circle's height
+    let clear = cx - r;
+    let near = (1.0 - clear / px(BASE_TIMER_NECK_REACH)).clamp(0.0, 1.0);
+    let neck = r * 0.85 * near.powf(1.5);
+    let ring_w = px(BASE_TIMER_RING_WIDTH).max(1.0);
+    BubbleGeometry {
+        window: (
+            (wall + gap + 2.0 * big_r * 1.05).ceil() as i32 + 2,
+            d.height,
+        ),
+        wall,
+        center: (wall + cx, d.height as f32 / 2.0),
+        radius: r,
+        ring: (
+            (r - px(BASE_TIMER_RING_INSET) + ring_w / 2.0).max(0.0),
+            ring_w,
+        ),
+        neck,
     }
 }
 
 /// Clipboard space: the clear X sits at the right end of the selector band;
-/// the newest entries fill the content area as rows.
+/// the newest entries fill the content area as six squircle tiles, three
+/// columns by two rows, newest first (left to right, then down).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClipboardLayout {
     /// The header's X (a band-height square).
     pub clear: RectF,
-    pub rows: [RectF; CLIPBOARD_VISIBLE_ROWS],
-    /// The whole row area (the empty state centres in it).
+    pub tiles: [RectF; CLIPBOARD_TILES],
+    /// The whole tile area (the empty state centres in it).
     pub list: RectF,
-    /// The clear confirmation, centred in the row area in place of the rows:
-    /// its question, the note under it, then Cancel and Clear side by side.
+    /// The clear confirmation, centred in the tile area in place of the
+    /// tiles: its question, the note under it, then Cancel and Clear.
     pub confirm_message: RectF,
     pub confirm_note: RectF,
     pub cancel: RectF,
     pub confirm_clear: RectF,
+    /// DIP to px of the dimensions (the tiles' parts scale with it).
+    pub scale: f32,
+}
+
+/// A tile's parts: its preview (text, or the image's own area), the image
+/// caption line, and its round copy and trash buttons along its bottom edge
+/// (copy in the corner). The buttons fade in only while the tile is
+/// hovered, over space reserved for them, so nothing moves.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TileParts {
+    pub tile: RectF,
+    pub text: RectF,
+    pub image: RectF,
+    pub caption: RectF,
+    pub copy: RectF,
+    pub trash: RectF,
 }
 
 impl ClipboardLayout {
-    /// A row's (outlined box, copy button, trash button): the box is the
-    /// whole row; the buttons are row-height squares inside its right end
-    /// (shown only while the row is hovered).
-    pub fn row_parts(row: RectF) -> (RectF, RectF, RectF) {
-        let h = row.height();
-        let inset = (h / 6.0).round();
-        let trash = RectF::new(
-            row.right - inset - h,
-            row.top,
-            row.right - inset,
-            row.bottom,
+    pub fn tile_parts(&self, i: usize) -> TileParts {
+        use crate::config::{
+            BASE_CLIPBOARD_TILE_BUTTON, BASE_CLIPBOARD_TILE_INSET, BASE_CLIPBOARD_TILE_PAD,
+        };
+        let px = |v: f32| (v * self.scale).round();
+        let t = self.tiles[i.min(CLIPBOARD_TILES - 1)];
+        let (b, inset, pad) = (
+            px(BASE_CLIPBOARD_TILE_BUTTON),
+            px(BASE_CLIPBOARD_TILE_INSET),
+            px(BASE_CLIPBOARD_TILE_PAD),
         );
-        let copy = RectF::new(trash.left - h, row.top, trash.left, row.bottom);
-        (row, copy, trash)
+        let copy = RectF::new(
+            t.right - inset - b,
+            t.bottom - inset - b,
+            t.right - inset,
+            t.bottom - inset,
+        );
+        let trash = RectF::new(copy.left - b, copy.top, copy.left, copy.bottom);
+        TileParts {
+            tile: t,
+            text: RectF::new(t.left + pad, t.top + pad, t.right - pad, copy.top),
+            image: RectF::new(
+                t.left + inset,
+                t.top + inset,
+                t.right - inset,
+                copy.top - inset / 2.0,
+            ),
+            caption: RectF::new(t.left + pad, copy.top, trash.left, copy.bottom),
+            copy,
+            trash,
+        }
     }
 
-    /// Only what is drawn is interactive: the boxes and buttons of rows holding
-    /// an entry (of `len`), and the X while there is history. Everything else
-    /// is notch background.
+    /// Only what is drawn is interactive: the tiles holding an entry (of
+    /// `len`) and their buttons, and the X while there is history.
+    /// Everything else is notch background. The buttons stay hit-testable
+    /// while faded, so a click (or a tap without hover) still works.
     pub fn hit(&self, px: f32, py: f32, len: usize) -> Option<PanelHit> {
         if len > 0 && self.clear.contains(px, py) {
             return Some(PanelHit::Clear);
         }
         let i = self
-            .rows
+            .tiles
             .iter()
             .take(len)
             .position(|r| r.contains(px, py))?;
-        let (entry, copy, trash) = Self::row_parts(self.rows[i]);
-        if trash.contains(px, py) {
+        let parts = self.tile_parts(i);
+        if parts.trash.contains(px, py) {
             Some(PanelHit::Remove(i))
-        } else if copy.contains(px, py) {
+        } else if parts.copy.contains(px, py) {
             Some(PanelHit::Copy(i))
         } else {
-            entry.contains(px, py).then_some(PanelHit::Row(i))
+            Some(PanelHit::Row(i))
         }
     }
 
@@ -399,7 +691,7 @@ pub fn resolve_clipboard_layout(dimensions: &NotchDimensions) -> Option<Clipboar
     let ResolvedLayout::Expanded { components, .. } = resolve_layout(dimensions) else {
         return None;
     };
-    let band = resolve_space_selector_in(dimensions, NottSpace::Clipboard)?.clipboard;
+    let band = resolve_space_selector_in(dimensions, OecaSpace::Clipboard)?.clipboard;
     let px = |v: f32| (v * dimensions.scale).round();
     let wall = dimensions.shadow_margin_x + dimensions.curvature.top_transition_radius;
     let inset = px(BASE_CLIPBOARD_SIDE_INSET);
@@ -408,7 +700,7 @@ pub fn resolve_clipboard_layout(dimensions: &NotchDimensions) -> Option<Clipboar
         (dimensions.width as f32 - wall - inset).round(),
     );
     // The X sits just left of the header's Settings icon
-    let gear = resolve_space_selector_in(dimensions, NottSpace::Clipboard)?.settings;
+    let gear = resolve_space_selector_in(dimensions, OecaSpace::Clipboard)?.settings;
     let clear_right = gear.left - px(BASE_SPACE_PILL_GAP);
     let clear = RectF::new(
         clear_right - band.height(),
@@ -416,15 +708,30 @@ pub fn resolve_clipboard_layout(dimensions: &NotchDimensions) -> Option<Clipboar
         clear_right,
         band.bottom,
     );
+    // The content area: as tall as the former five rows at this DPI (the
+    // space's height is unchanged)
     let top = components.content_bounds.top.round();
-    let (h, gap) = (px(BASE_CLIPBOARD_ROW_HEIGHT), px(BASE_CLIPBOARD_ROW_GAP));
-    let rows = std::array::from_fn(|i| {
-        let t = top + i as f32 * (h + gap);
-        RectF::new(left, t, right, t + h)
+    let n = CLIPBOARD_VISIBLE_ROWS as f32;
+    let area_h = n * px(BASE_CLIPBOARD_ROW_HEIGHT) + (n - 1.0) * px(BASE_CLIPBOARD_ROW_GAP);
+    let list = RectF::new(left, top, right, top + area_h);
+    // 3 x 2 whole-pixel tiles, centred in it
+    let gap = px(crate::config::BASE_CLIPBOARD_TILE_GAP);
+    let cols = crate::config::CLIPBOARD_TILE_COLUMNS as f32;
+    let rows = (CLIPBOARD_TILES / crate::config::CLIPBOARD_TILE_COLUMNS) as f32;
+    let tw = ((list.width() - (cols - 1.0) * gap) / cols).floor();
+    let th = ((list.height() - (rows - 1.0) * gap) / rows).floor();
+    let x0 = (list.left + (list.width() - (cols * tw + (cols - 1.0) * gap)) / 2.0).round();
+    let y0 = (list.top + (list.height() - (rows * th + (rows - 1.0) * gap)) / 2.0).round();
+    let tiles = std::array::from_fn(|i| {
+        let (c, r) = (
+            (i % crate::config::CLIPBOARD_TILE_COLUMNS) as f32,
+            (i / crate::config::CLIPBOARD_TILE_COLUMNS) as f32,
+        );
+        let (l, t) = (x0 + c * (tw + gap), y0 + r * (th + gap));
+        RectF::new(l, t, l + tw, t + th)
     });
-    let list = RectF::new(left, top, right, rows[CLIPBOARD_VISIBLE_ROWS - 1].bottom);
     // Confirmation block (question 20, note 18, gap 12, buttons 28 DIP),
-    // vertically centred in the row area
+    // vertically centred in the tile area
     let (line, note, gap, button) = (px(20.0), px(18.0), px(12.0), px(28.0));
     let block_top = (list.top + (list.height() - (line + note + gap + button)) / 2.0).round();
     let confirm_message = RectF::new(left, block_top, right, block_top + line);
@@ -441,12 +748,13 @@ pub fn resolve_clipboard_layout(dimensions: &NotchDimensions) -> Option<Clipboar
     let confirm_clear = RectF::new(cx + bgap / 2.0, btop, cx + bgap / 2.0 + bw, btop + button);
     Some(ClipboardLayout {
         clear,
-        rows,
+        tiles,
         list,
         confirm_message,
         confirm_note,
         cancel,
         confirm_clear,
+        scale: dimensions.scale,
     })
 }
 
@@ -630,6 +938,31 @@ impl MediaLayout {
         RectF::new(cx - d / 2.0, hit.top, cx + d / 2.0, hit.top + d)
     }
 
+    /// The scrubber's track (Music): between its two time labels, exactly
+    /// where `draw_timeline` draws it, with a hit area a little taller than
+    /// the strip (never reaching the controls). None without a scrubber
+    /// (Home) or when it is too narrow to draw.
+    pub fn scrub_track(&self, scale: f32) -> Option<RectF> {
+        use crate::config::{BASE_MEDIA_TIMELINE_MIN_TRACK, BASE_MUSIC_CONTROLS_GAP};
+        let s = self.timeline_bounds;
+        if s.width() <= 0.0 || s.height() <= 0.0 {
+            return None;
+        }
+        let px = |v: f32| (v * scale).round();
+        let edge = px(BASE_MEDIA_TIMELINE_LABEL_WIDTH) + px(BASE_MEDIA_TIMELINE_LABEL_GAP);
+        let (left, right) = (s.left + edge, s.right - edge);
+        if right - left < px(BASE_MEDIA_TIMELINE_MIN_TRACK) {
+            return None;
+        }
+        let reach = px(BASE_MUSIC_CONTROLS_GAP) / 2.0;
+        Some(RectF::new(left, s.top - px(4.0), right, s.bottom + reach))
+    }
+
+    /// Where on the track `x` is, 0..=1 (clamped: a drag may leave it).
+    pub fn scrub_fraction(track: RectF, x: f32) -> f32 {
+        ((x - track.left) / track.width().max(1.0)).clamp(0.0, 1.0)
+    }
+
     /// Returns the transport control under the client point, if any.
     pub fn control_at(&self, px: f32, py: f32) -> Option<MediaControl> {
         MediaControl::ALL
@@ -662,11 +995,11 @@ impl MediaShape {
 /// shoulder on both sides, the column inset on both sides, and its widest row,
 /// the full-width scrubber (two edge labels with their gaps around
 /// `BASE_MUSIC_TIMELINE_TRACK`).
-pub fn expanded_width(space: NottSpace) -> f32 {
+pub fn expanded_width(space: OecaSpace) -> f32 {
     match space {
-        NottSpace::Home => BASE_EXPANDED_WIDTH,
-        NottSpace::Clipboard => BASE_CLIPBOARD_WIDTH,
-        NottSpace::Music => {
+        OecaSpace::Home => BASE_EXPANDED_WIDTH,
+        OecaSpace::Clipboard => BASE_CLIPBOARD_WIDTH,
+        OecaSpace::Music => {
             // Side walls, the player column's inset on both sides, and the
             // widest row: the full-width scrubber (labels + track)
             let edges = 2.0 * (BASE_EXPANDED_SHADOW_MARGIN_X + BASE_EXPANDED_TOP_TRANSITION_RADIUS);
@@ -680,17 +1013,17 @@ pub fn expanded_width(space: NottSpace) -> f32 {
 
 /// Settled notch dimensions for a state in a space: the collapsed notch is the
 /// same for every space; the expanded notch takes the space's width and height.
-pub fn space_dimensions(state: NotchState, dpi: u32, space: NottSpace) -> NotchDimensions {
+pub fn space_dimensions(state: NotchState, dpi: u32, space: OecaSpace) -> NotchDimensions {
     let dims = NotchDimensions::from_state_and_dpi(state, dpi);
     match (state, space) {
-        (NotchState::Expanded, NottSpace::Music) => {
+        (NotchState::Expanded, OecaSpace::Music) => {
             let dims = dims.with_width_dip(expanded_width(space));
             NotchDimensions {
                 height: music_height_px(&dims),
                 ..dims
             }
         }
-        (NotchState::Expanded, NottSpace::Clipboard) => {
+        (NotchState::Expanded, OecaSpace::Clipboard) => {
             let dims = dims.with_width_dip(expanded_width(space));
             NotchDimensions {
                 height: clipboard_height_px(&dims),
@@ -703,7 +1036,7 @@ pub fn space_dimensions(state: NotchState, dpi: u32, space: NottSpace) -> NotchD
 
 /// Settled expanded window size of a space at a DPI, in DIP (what transitions
 /// target, so they end exactly on the settled pixel size).
-pub fn expanded_size_dip(space: NottSpace, dpi: u32) -> (f32, f32) {
+pub fn expanded_size_dip(space: OecaSpace, dpi: u32) -> (f32, f32) {
     let d = space_dimensions(NotchState::Expanded, dpi, space);
     (d.width as f32 / d.scale, d.height as f32 / d.scale)
 }
@@ -742,7 +1075,7 @@ pub fn resolve_media_layout(
     dimensions: &NotchDimensions,
     shape: MediaShape,
 ) -> Option<MediaLayout> {
-    resolve_media_layout_in(dimensions, shape, NottSpace::Home)
+    resolve_media_layout_in(dimensions, shape, OecaSpace::Home)
 }
 
 /// Media composition for a space. Home keeps the right time/date column; Music
@@ -752,7 +1085,7 @@ pub fn resolve_media_layout(
 pub fn resolve_media_layout_in(
     dimensions: &NotchDimensions,
     shape: MediaShape,
-    space: NottSpace,
+    space: OecaSpace,
 ) -> Option<MediaLayout> {
     let ResolvedLayout::Expanded { components, .. } = resolve_layout(dimensions) else {
         return None;
@@ -1007,10 +1340,10 @@ fn resolve_music_layout(dimensions: &NotchDimensions, shape: MediaShape, c: Rect
 /// Expanded window height (DIP) of a space. Home is the existing expanded notch.
 /// Music is derived from its player rows: shoulder band + top padding, cover
 /// row, gap, scrubber, gap, controls, bottom padding, shadow margin.
-pub fn expanded_height(space: NottSpace) -> f32 {
+pub fn expanded_height(space: OecaSpace) -> f32 {
     match space {
-        NottSpace::Home => BASE_EXPANDED_HEIGHT,
-        NottSpace::Clipboard => {
+        OecaSpace::Home => BASE_EXPANDED_HEIGHT,
+        OecaSpace::Clipboard => {
             let n = CLIPBOARD_VISIBLE_ROWS as f32;
             BASE_EXPANDED_TOP_TRANSITION_HEIGHT
                 + crate::config::BASE_EXPANDED_HEADER_EXTRA
@@ -1020,7 +1353,7 @@ pub fn expanded_height(space: NottSpace) -> f32 {
                 + BASE_CLIPBOARD_BOTTOM_PAD
                 + BASE_EXPANDED_SHADOW_MARGIN_BOTTOM
         }
-        NottSpace::Music => {
+        OecaSpace::Music => {
             BASE_EXPANDED_TOP_TRANSITION_HEIGHT
                 + crate::config::BASE_EXPANDED_HEADER_EXTRA
                 + BASE_EXPANDED_PADDING_V
@@ -1059,14 +1392,16 @@ pub fn resolve_collapsed_layout(dimensions: &NotchDimensions) -> CollapsedLayout
         content_bottom + optical_y,
     );
 
+    let cy = (content_top + content_bottom) / 2.0;
+    let art = (crate::config::BASE_COLLAPSED_ARTWORK_SIZE * scale)
+        .round()
+        .min(content_bottom - content_top);
+    let (art_left, art_top) = (content_left.round(), (cy - art / 2.0).round());
     CollapsedLayout {
         content_bounds,
         clock_bounds,
-        visualizer_bounds: visualizer_rect(
-            content_right,
-            (content_top + content_bottom) / 2.0,
-            scale,
-        ),
+        visualizer_bounds: visualizer_rect(content_right, cy, scale),
+        artwork_bounds: RectF::new(art_left, art_top, art_left + art, art_top + art),
     }
 }
 
@@ -1806,11 +2141,11 @@ mod tests {
     fn test_opening_reveals_content_in_place_every_space() {
         use crate::config::AnimationState;
         // Vertical positions of each space's content on a frame
-        let tops = |d: &NotchDimensions, space: NottSpace| -> Vec<f32> {
+        let tops = |d: &NotchDimensions, space: OecaSpace| -> Vec<f32> {
             match space {
-                NottSpace::Clipboard => resolve_clipboard_layout(d)
+                OecaSpace::Clipboard => resolve_clipboard_layout(d)
                     .unwrap()
-                    .rows
+                    .tiles
                     .iter()
                     .map(|r| r.top)
                     .collect(),
@@ -1823,7 +2158,7 @@ mod tests {
             }
         };
         for dpi in ALL_DPIS {
-            for space in NottSpace::ALL {
+            for space in OecaSpace::ALL {
                 let settled = tops(&space_dimensions(NotchState::Expanded, dpi, space), space);
                 let mut anim = AnimationState::start(
                     NotchState::Collapsed,
@@ -1977,7 +2312,7 @@ mod tests {
     #[test]
     fn test_settings_icon_at_the_right_end_of_every_header() {
         for dpi in ALL_DPIS {
-            for space in NottSpace::ALL {
+            for space in OecaSpace::ALL {
                 let dims = space_dimensions(NotchState::Expanded, dpi, space);
                 let sel = resolve_space_selector_in(&dims, space).unwrap();
                 let gear = sel.settings;
@@ -2003,8 +2338,8 @@ mod tests {
                 assert_eq!(hi, panel_gear);
             }
             // Clipboard's clear X moves just left of the icon
-            let dims = space_dimensions(NotchState::Expanded, dpi, NottSpace::Clipboard);
-            let gear = resolve_space_selector_in(&dims, NottSpace::Clipboard)
+            let dims = space_dimensions(NotchState::Expanded, dpi, OecaSpace::Clipboard);
+            let gear = resolve_space_selector_in(&dims, OecaSpace::Clipboard)
                 .unwrap()
                 .settings;
             let clear = resolve_clipboard_layout(&dims).unwrap().clear;
@@ -2065,7 +2400,7 @@ mod tests {
     #[test]
     fn test_blended_selector_glides_between_spaces() {
         for dpi in ALL_DPIS {
-            for space in NottSpace::ALL {
+            for space in OecaSpace::ALL {
                 let dims = space_dimensions(NotchState::Expanded, dpi, space);
                 let plain = resolve_space_selector_in(&dims, space).unwrap();
                 // Settled: exactly the plain selector, highlight on the space
@@ -2075,14 +2410,14 @@ mod tests {
             }
             // Mid Home -> Music: the highlight is between the two pills
             let dims =
-                space_dimensions(NotchState::Expanded, dpi, NottSpace::Home).with_width_dip(490.0);
+                space_dimensions(NotchState::Expanded, dpi, OecaSpace::Home).with_width_dip(490.0);
             let (h, m) = (
-                Scene::Space(NottSpace::Home),
-                Scene::Space(NottSpace::Music),
+                Scene::Space(OecaSpace::Home),
+                Scene::Space(OecaSpace::Music),
             );
-            let (a, _) = blended_selector(&dims, h, h, NottSpace::Home, 1.0).unwrap();
-            let (b, _) = blended_selector(&dims, m, m, NottSpace::Music, 1.0).unwrap();
-            let (_, hi) = blended_selector(&dims, h, m, NottSpace::Music, 0.5).unwrap();
+            let (a, _) = blended_selector(&dims, h, h, OecaSpace::Home, 1.0).unwrap();
+            let (b, _) = blended_selector(&dims, m, m, OecaSpace::Music, 1.0).unwrap();
+            let (_, hi) = blended_selector(&dims, h, m, OecaSpace::Music, 0.5).unwrap();
             assert!(
                 hi.left > a.home.left.min(b.music.left) && hi.left < a.home.left.max(b.music.left)
             );
@@ -2091,7 +2426,7 @@ mod tests {
                     &NotchDimensions::from_state_and_dpi(NotchState::Collapsed, dpi),
                     h,
                     m,
-                    NottSpace::Music,
+                    OecaSpace::Music,
                     0.5
                 )
                 .is_none()
@@ -2103,10 +2438,10 @@ mod tests {
     fn test_media_morph_moves_shared_parts_and_keeps_one_sided_slots() {
         let dims = |s| space_dimensions(NotchState::Expanded, 120, s);
         let home =
-            resolve_media_layout_in(&dims(NottSpace::Home), MediaShape::FULL, NottSpace::Home)
+            resolve_media_layout_in(&dims(OecaSpace::Home), MediaShape::FULL, OecaSpace::Home)
                 .unwrap();
         let music =
-            resolve_media_layout_in(&dims(NottSpace::Music), MediaShape::FULL, NottSpace::Music)
+            resolve_media_layout_in(&dims(OecaSpace::Music), MediaShape::FULL, OecaSpace::Music)
                 .unwrap();
         assert_eq!(
             MediaLayout::morph(&home, &music, 0.0).title_bounds,
@@ -2144,12 +2479,12 @@ mod tests {
     #[test]
     fn test_selector_shows_three_spaces_in_every_space() {
         for dpi in ALL_DPIS {
-            for active in NottSpace::ALL {
+            for active in OecaSpace::ALL {
                 let dims = space_dimensions(NotchState::Expanded, dpi, active);
                 let sel = resolve_space_selector_in(&dims, active).unwrap();
-                let pills = NottSpace::ALL.map(|s| sel.bounds(s));
+                let pills = OecaSpace::ALL.map(|s| sel.bounds(s));
                 assert_eq!(pills.len(), 3);
-                for (i, s) in NottSpace::ALL.into_iter().enumerate() {
+                for (i, s) in OecaSpace::ALL.into_iter().enumerate() {
                     let r = pills[i];
                     for (x, y) in corners(&r) {
                         assert!(
@@ -2168,11 +2503,11 @@ mod tests {
     }
 
     #[test]
-    fn test_clipboard_space_size_and_rows_fit_all_dpis() {
-        assert_eq!(expanded_width(NottSpace::Home), 600.0, "Home unchanged");
-        assert_eq!(expanded_height(NottSpace::Home), BASE_EXPANDED_HEIGHT);
+    fn test_clipboard_space_size_and_tiles_fit_all_dpis() {
+        assert_eq!(expanded_width(OecaSpace::Home), 600.0, "Home unchanged");
+        assert_eq!(expanded_height(OecaSpace::Home), BASE_EXPANDED_HEIGHT);
         for dpi in ALL_DPIS {
-            let dims = space_dimensions(NotchState::Expanded, dpi, NottSpace::Clipboard);
+            let dims = space_dimensions(NotchState::Expanded, dpi, OecaSpace::Clipboard);
             assert_eq!(
                 dims.width,
                 NotchDimensions::from_state_and_dpi(NotchState::Expanded, dpi)
@@ -2180,21 +2515,51 @@ mod tests {
                     .width
             );
             let l = resolve_clipboard_layout(&dims).unwrap();
-            let sel = resolve_space_selector_in(&dims, NottSpace::Clipboard).unwrap();
+            let sel = resolve_space_selector_in(&dims, OecaSpace::Clipboard).unwrap();
             let body_bottom = dims.height as f32 - dims.shadow_margin_bottom;
-            for (i, r) in l.rows.iter().enumerate() {
+            assert_eq!(l.tiles.len(), 6, "six tiles");
+            for (i, r) in l.tiles.iter().enumerate() {
                 assert!(r.height() > 0.0 && r.width() > 0.0);
+                assert!(r.top >= sel.clipboard.bottom, "below the selector at {dpi}");
                 assert!(
-                    r.top >= sel.clipboard.bottom,
-                    "rows below the selector at {dpi}"
+                    r.bottom <= body_bottom,
+                    "tile {i} inside the notch at {dpi}"
                 );
-                assert!(r.bottom <= body_bottom, "row {i} inside the notch at {dpi}");
+                assert!(inside(r, &l.list), "tile {i} in the area at {dpi}");
                 for (x, y) in corners(r) {
-                    assert!(dims.contains_point(x, y), "row {i} corner at {dpi}");
+                    assert!(dims.contains_point(x, y), "tile {i} corner at {dpi}");
                 }
-                if i > 0 {
-                    assert!(l.rows[i - 1].bottom <= r.top, "rows don't overlap at {dpi}");
+                // Whole pixels, all the same size
+                assert_eq!(r.left, r.left.round());
+                assert_eq!(
+                    (r.width(), r.height()),
+                    (l.tiles[0].width(), l.tiles[0].height())
+                );
+                for (j, o) in l.tiles.iter().enumerate() {
+                    assert!(i == j || !overlaps(r, o), "tiles {i}/{j} overlap at {dpi}");
                 }
+            }
+            // Three columns, two rows, newest first left to right
+            assert_eq!(l.tiles[0].top, l.tiles[2].top);
+            assert!(l.tiles[0].right < l.tiles[1].left && l.tiles[1].right < l.tiles[2].left);
+            assert!(l.tiles[0].bottom < l.tiles[3].top);
+            assert_eq!(l.tiles[3].left, l.tiles[0].left);
+            // Tiles are wider than tall, but no pills
+            assert!(l.tiles[0].width() > l.tiles[0].height());
+            // Each tile's parts fit it without overlapping
+            for i in 0..6 {
+                let p = l.tile_parts(i);
+                for r in [p.text, p.image, p.caption, p.copy, p.trash] {
+                    assert!(inside(&r, &p.tile), "part {r:?} of tile {i} at {dpi}");
+                }
+                assert!(p.trash.right <= p.copy.left, "{dpi}");
+                assert!(p.caption.right <= p.trash.left, "{dpi}");
+                assert!(p.image.bottom <= p.copy.top && p.text.bottom <= p.copy.top);
+                assert!(
+                    (p.tile.bottom - p.copy.bottom) < p.tile.height() / 4.0,
+                    "copy near the bottom edge at {dpi}"
+                );
+                assert!(p.image.width() > 0.0 && p.image.height() > 0.0, "{dpi}");
             }
             // Header: the X shares the selector band, at its right end
             assert!(l.clear.left > sel.clipboard.right);
@@ -2205,42 +2570,39 @@ mod tests {
             for (x, y) in corners(&l.clear) {
                 assert!(dims.contains_point(x, y), "Clear inside at {dpi}");
             }
-            let at96 = space_dimensions(NotchState::Expanded, 96, NottSpace::Clipboard);
-            assert_eq!(at96.height as f32, expanded_height(NottSpace::Clipboard));
+            let at96 = space_dimensions(NotchState::Expanded, 96, OecaSpace::Clipboard);
+            assert_eq!(at96.height as f32, expanded_height(OecaSpace::Clipboard));
         }
     }
 
     #[test]
-    fn test_clipboard_hit_testing() {
-        let dims = space_dimensions(NotchState::Expanded, 144, NottSpace::Clipboard);
-        let l = resolve_clipboard_layout(&dims).unwrap();
+    fn test_clipboard_tile_hit_testing_with_zero_to_six_entries() {
         let mid = |r: RectF| ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
-        // Each row hits its own index while it holds an entry
-        for (i, r) in l.rows.iter().enumerate() {
-            let (x, y) = mid(*r);
-            assert_eq!(l.hit(x, y, CLIPBOARD_VISIBLE_ROWS), Some(PanelHit::Row(i)));
-            assert_eq!(l.hit(x, y, i), None, "empty row slot is background");
+        for dpi in ALL_DPIS {
+            let dims = space_dimensions(NotchState::Expanded, dpi, OecaSpace::Clipboard);
+            let l = resolve_clipboard_layout(&dims).unwrap();
+            for len in 0..=6 {
+                for i in 0..6 {
+                    let p = l.tile_parts(i);
+                    let has = i < len;
+                    let (x, y) = mid(p.text);
+                    assert_eq!(l.hit(x, y, len), has.then_some(PanelHit::Row(i)), "{dpi}");
+                    let (x, y) = mid(p.copy);
+                    assert_eq!(l.hit(x, y, len), has.then_some(PanelHit::Copy(i)));
+                    let (x, y) = mid(p.trash);
+                    assert_eq!(l.hit(x, y, len), has.then_some(PanelHit::Remove(i)));
+                }
+                let (x, y) = mid(l.clear);
+                assert_eq!(l.hit(x, y, len), (len > 0).then_some(PanelHit::Clear));
+            }
+            // Gaps between tiles and the margins are background
+            let t = l.tiles;
+            let gap_x = (t[0].right + t[1].left) / 2.0;
+            assert_eq!(l.hit(gap_x, mid(t[0]).1, 6), None, "{dpi}");
+            let gap_y = (t[0].bottom + t[3].top) / 2.0;
+            assert_eq!(l.hit(mid(t[0]).0, gap_y, 6), None, "{dpi}");
+            assert_eq!(l.hit(t[0].left - 2.0, mid(t[0]).1, 6), None, "{dpi}");
         }
-        // Row buttons sit inside the full-width box: copy restores, trash removes
-        let (entry, copy, trash) = ClipboardLayout::row_parts(l.rows[2]);
-        assert_eq!(entry, l.rows[2]);
-        assert!(entry.left < copy.left && copy.right <= trash.left && trash.right < entry.right);
-        let (x, y) = mid(copy);
-        assert_eq!(l.hit(x, y, 5), Some(PanelHit::Copy(2)));
-        let (x, y) = mid(trash);
-        assert_eq!(l.hit(x, y, 5), Some(PanelHit::Remove(2)));
-        assert_eq!(l.hit(x, y, 2), None, "no buttons on empty slots");
-        let (x, y) = mid(l.clear);
-        assert_eq!(l.hit(x, y, 3), Some(PanelHit::Clear));
-        assert_eq!(l.hit(x, y, 0), None, "no Clear without history");
-        // Gaps, the label and the margins are background
-        let gap_y = (l.rows[0].bottom + l.rows[1].top) / 2.0;
-        if l.rows[0].bottom < l.rows[1].top {
-            assert_eq!(l.hit(mid(l.rows[0]).0, gap_y, 5), None);
-        }
-        let between = (l.clear.left - 6.0, mid(l.clear).1);
-        assert_eq!(l.hit(between.0, between.1, 5), None);
-        assert_eq!(l.hit(l.rows[0].left - 3.0, mid(l.rows[0]).1, 5), None);
         assert_eq!(
             resolve_clipboard_layout(&NotchDimensions::from_state_and_dpi(
                 NotchState::Collapsed,
@@ -2266,7 +2628,7 @@ mod tests {
                 unreachable!()
             };
             let c = components.content_bounds;
-            for space in NottSpace::ALL {
+            for space in OecaSpace::ALL {
                 let r = sel.bounds(space);
                 assert!(r.width() > 0.0 && r.height() > 0.0);
                 for (x, y) in corners(&r) {
@@ -2309,7 +2671,7 @@ mod tests {
                 ];
                 others.extend(m.artwork_bounds);
                 others.extend(MediaControl::ALL.map(|k| m.control_bounds(k)));
-                for space in NottSpace::ALL {
+                for space in OecaSpace::ALL {
                     for o in &others {
                         assert!(
                             !overlaps(&sel.bounds(space), o),
@@ -2322,8 +2684,8 @@ mod tests {
     }
 
     fn music(dpi: u32, shape: MediaShape) -> (NotchDimensions, MediaLayout, RectF) {
-        let dims = space_dimensions(NotchState::Expanded, dpi, NottSpace::Music);
-        let m = resolve_media_layout_in(&dims, shape, NottSpace::Music).unwrap();
+        let dims = space_dimensions(NotchState::Expanded, dpi, OecaSpace::Music);
+        let m = resolve_media_layout_in(&dims, shape, OecaSpace::Music).unwrap();
         let ResolvedLayout::Expanded { components, .. } = resolve_layout(&dims) else {
             unreachable!()
         };
@@ -2333,7 +2695,7 @@ mod tests {
     #[test]
     fn test_music_hit_testing_follows_the_narrow_width() {
         for dpi in ALL_DPIS {
-            let home = space_dimensions(NotchState::Expanded, dpi, NottSpace::Home);
+            let home = space_dimensions(NotchState::Expanded, dpi, OecaSpace::Home);
             let (dims, m, _) = music(dpi, MediaShape::FULL);
             let mid_y = dims.notch_height() / 2.0;
             assert!(dims.contains_point(dims.width as f32 / 2.0, mid_y));
@@ -2359,7 +2721,7 @@ mod tests {
             }
             // Selector stays inside the Music notch and clear of its layout
             let sel = resolve_space_selector(&dims).unwrap();
-            for s in NottSpace::ALL {
+            for s in OecaSpace::ALL {
                 let r = sel.bounds(s);
                 for (x, y) in corners(&r) {
                     assert!(dims.contains_point(x, y), "{s:?} selector inside at {dpi}");
@@ -2376,23 +2738,23 @@ mod tests {
 
     #[test]
     fn test_space_sizes_home_unchanged_music_taller() {
-        assert_eq!(expanded_width(NottSpace::Home), BASE_EXPANDED_WIDTH);
-        assert_eq!(expanded_height(NottSpace::Home), BASE_EXPANDED_HEIGHT);
+        assert_eq!(expanded_width(OecaSpace::Home), BASE_EXPANDED_WIDTH);
+        assert_eq!(expanded_height(OecaSpace::Home), BASE_EXPANDED_HEIGHT);
         assert_eq!(
-            expanded_width(NottSpace::Music),
+            expanded_width(OecaSpace::Music),
             384.0,
             "derived Music width: 48 walls + 32 insets + 64 labels + 240 track"
         );
         // 14 shoulder + 12 pad + 40 cover row + 6 + 14 scrubber + 4 + 34 controls
         // + 6 pad + 18 shadow margin + 10 header band
         assert_eq!(
-            expanded_height(NottSpace::Music),
+            expanded_height(OecaSpace::Music),
             158.0,
             "derived Music height"
         );
         for dpi in ALL_DPIS {
-            let home = space_dimensions(NotchState::Expanded, dpi, NottSpace::Home);
-            let music = space_dimensions(NotchState::Expanded, dpi, NottSpace::Music);
+            let home = space_dimensions(NotchState::Expanded, dpi, OecaSpace::Home);
+            let music = space_dimensions(NotchState::Expanded, dpi, OecaSpace::Music);
             assert_eq!(
                 home,
                 NotchDimensions::from_state_and_dpi(NotchState::Expanded, dpi)
@@ -2417,7 +2779,7 @@ mod tests {
                 home,
                 "only width/height differ at {dpi}"
             );
-            for space in NottSpace::ALL {
+            for space in OecaSpace::ALL {
                 assert_eq!(
                     space_dimensions(NotchState::Collapsed, dpi, space),
                     NotchDimensions::from_state_and_dpi(NotchState::Collapsed, dpi),
@@ -2431,7 +2793,7 @@ mod tests {
     fn test_music_hit_testing_and_selector_on_taller_notch() {
         for dpi in ALL_DPIS {
             let (dims, m, _) = music(dpi, MediaShape::FULL);
-            let home = space_dimensions(NotchState::Expanded, dpi, NottSpace::Home);
+            let home = space_dimensions(NotchState::Expanded, dpi, OecaSpace::Home);
             // The extra Music height is part of the notch (scrubber row)...
             let y = home.notch_height() + 2.0;
             assert!(
@@ -2461,7 +2823,7 @@ mod tests {
                 sel.home.top, home_sel.home.top,
                 "selector keeps its band at {dpi}"
             );
-            for s in NottSpace::ALL {
+            for s in OecaSpace::ALL {
                 let r = sel.bounds(s);
                 assert!(
                     r.bottom <= m.title_bounds.top,
@@ -2497,7 +2859,7 @@ mod tests {
                         (dims.width as f32 - wall - inset).round(),
                         c.bottom,
                     );
-                    let sel = resolve_space_selector_in(&dims, NottSpace::Music).unwrap();
+                    let sel = resolve_space_selector_in(&dims, OecaSpace::Music).unwrap();
                     let at = format!("{dpi} DPI art={artwork} lines={secondary_lines}");
                     assert_eq!(col.left, sel.home.left, "aligned with the pills {at}");
                     let px = |v: f32| (v * dims.scale).round();
@@ -2619,7 +2981,7 @@ mod tests {
     #[test]
     fn test_clear_confirmation_fits_and_hits_at_all_dpis() {
         for dpi in ALL_DPIS {
-            let dims = space_dimensions(NotchState::Expanded, dpi, NottSpace::Clipboard);
+            let dims = space_dimensions(NotchState::Expanded, dpi, OecaSpace::Clipboard);
             let l = resolve_clipboard_layout(&dims).unwrap();
             // Inside the row area, stacked, and the buttons side by side
             // (Cancel first) without overlapping
@@ -2652,6 +3014,189 @@ mod tests {
                     "{dpi}: only the buttons are live"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_home_timer_fits_the_empty_band_beside_media_at_all_dpis() {
+        for dpi in ALL_DPIS {
+            for artwork in [true, false] {
+                for lines in [0, 1, 2] {
+                    let shape = MediaShape {
+                        artwork,
+                        secondary_lines: lines,
+                    };
+                    let dims = NotchDimensions::from_state_and_dpi(NotchState::Expanded, dpi);
+                    let m = resolve_media_layout(&dims, shape).unwrap();
+                    let h = resolve_home_timer_layout(&dims, Some(shape)).unwrap();
+                    let ResolvedLayout::Expanded { components, .. } = resolve_layout(&dims) else {
+                        unreachable!()
+                    };
+                    let t = h.timer;
+                    assert!(
+                        h.clock.is_none() && h.divider.is_none(),
+                        "media keeps its clock"
+                    );
+                    // Between the divider and the clock column, inside the content
+                    assert!(t.panel.left > m.divider_bounds.right, "{dpi}");
+                    assert!(t.panel.right <= m.time_bounds.left + 0.001, "{dpi}");
+                    assert!(inside(&t.panel, &components.content_bounds), "{dpi}");
+                    // Touches none of the media composition
+                    let mut parts = vec![
+                        m.title_bounds,
+                        m.artist_bounds,
+                        m.source_bounds,
+                        m.time_bounds,
+                        m.date_bounds,
+                        m.divider_bounds,
+                    ];
+                    parts.extend(MediaControl::ALL.map(|c| m.control_bounds(c)));
+                    parts.extend(m.artwork_bounds);
+                    for r in parts {
+                        assert!(!overlaps(&t.panel, &r), "{dpi} {artwork} {lines}: {r:?}");
+                    }
+                    timer_panel_is_well_formed(&t, dpi);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_home_without_media_is_clock_and_timer_columns_at_all_dpis() {
+        for dpi in ALL_DPIS {
+            let dims = NotchDimensions::from_state_and_dpi(NotchState::Expanded, dpi);
+            let ResolvedLayout::Expanded { components, .. } = resolve_layout(&dims) else {
+                unreachable!()
+            };
+            let h = resolve_home_timer_layout(&dims, None).unwrap();
+            let (time, date) = h.clock.unwrap();
+            let d = h.divider.unwrap();
+            let c = components.content_bounds;
+            // The clock keeps its rows (same heights), moved to the left
+            // column; the timer takes the right one; the divider between
+            let rows = |r: RectF| (r.top, r.bottom);
+            assert_eq!(rows(time), rows(components.time_bounds));
+            assert_eq!(rows(date), rows(components.date_bounds));
+            assert_eq!(time.left, c.left);
+            assert!(time.right < d.left && date.right < d.left, "{dpi}");
+            assert!(d.right < h.timer.panel.left, "{dpi}");
+            assert!(inside(&h.timer.panel, &c), "{dpi}");
+            // Balanced: the divider is the content's centre
+            let mid = (c.left + c.right) / 2.0;
+            assert!((d.left - mid).abs() <= 1.0, "{dpi}");
+            assert!(d.top > c.top && d.width() >= 1.0, "{dpi}");
+            // Never the collapsed notch
+            let collapsed = NotchDimensions::from_state_and_dpi(NotchState::Collapsed, dpi);
+            assert!(resolve_home_timer_layout(&collapsed, None).is_none());
+            timer_panel_is_well_formed(&h.timer, dpi);
+        }
+    }
+
+    /// Buttons inside the panel, side by side; the numerals row and the
+    /// scale row stacked; the scale's stops in order and hit-testable.
+    fn timer_panel_is_well_formed(t: &TimerLayout, dpi: u32) {
+        for r in [t.numerals, t.primary, t.cancel, t.row] {
+            assert!(inside(&r, &t.panel), "{dpi}: {r:?} in {:?}", t.panel);
+        }
+        assert!(t.cancel.right < t.primary.left, "{dpi}");
+        assert_eq!(t.primary.width(), t.primary.height(), "round buttons");
+        assert!(t.numerals.bottom <= t.row.top, "{dpi}");
+        assert!(t.display(true).right < t.primary.left, "{dpi}");
+        assert!(t.display(false).right < t.cancel.left, "{dpi}");
+        assert!(
+            t.display(false).width() > t.panel.width() * 0.4,
+            "room for numerals at {dpi}"
+        );
+        let n = crate::timer::STOPS.len();
+        let xs: Vec<f32> = (0..n).map(|i| t.stop_x(i, n)).collect();
+        assert!(
+            xs.windows(2).all(|w| w[0] < w[1]),
+            "stops in order at {dpi}"
+        );
+        assert!(xs[0] >= t.row.left && xs[n - 1] <= t.row.right, "{dpi}");
+        for (i, x) in xs.iter().enumerate() {
+            assert_eq!(t.stop_at(*x, n), i, "round trip at {dpi}");
+        }
+        assert_eq!(t.stop_at(t.row.left - 100.0, n), 0, "clamped");
+        assert_eq!(t.stop_at(t.row.right + 100.0, n), n - 1, "clamped");
+        let centre = |r: RectF| ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
+        let (px, py) = centre(t.primary);
+        assert_eq!(t.hit(px, py, true), Some(PanelHit::TimerPrimary));
+        let (cx, cy) = centre(t.cancel);
+        assert_eq!(t.hit(cx, cy, false), Some(PanelHit::TimerCancel));
+        assert_eq!(t.hit(cx, cy, true), None, "no Cancel during setup");
+        let (rx, ry) = centre(t.row);
+        assert_eq!(t.hit(rx, ry, true), Some(PanelHit::TimerScale));
+        assert_eq!(t.hit(rx, ry, false), None, "the scale is setup-only");
+        let (nx, ny) = (t.numerals.left + 2.0, centre(t.numerals).1);
+        assert_eq!(t.hit(nx, ny, true), None, "numerals are not a control");
+        assert!(PanelHit::TimerPrimary.is_button() && PanelHit::TimerCancel.is_button());
+        assert!(!PanelHit::TimerScale.is_button());
+    }
+
+    #[test]
+    fn test_timer_slot_and_bubble_geometry_at_all_dpis() {
+        for dpi in ALL_DPIS {
+            let dims = NotchDimensions::from_state_and_dpi(NotchState::Collapsed, dpi);
+            let l = resolve_collapsed_layout(&dims);
+            let slot = timer_slot_rect(&l, dims.scale);
+            // The visualizer's place (same right edge), inside the content,
+            // right of the centre (the clock)
+            assert_eq!(slot.right, l.visualizer_bounds.right);
+            assert!(slot.left <= l.visualizer_bounds.left);
+            assert!(inside(&slot, &l.content_bounds), "{dpi}");
+            assert!(slot.left > dims.width as f32 / 2.0, "{dpi}");
+            // Bubble: a floating circle, centred on the notch's height and
+            // clear of the screen edge once out; budding from / absorbed into
+            // the notch's wall through a liquid neck
+            let px = |v: f32| (v * dims.scale).round();
+            let full = timer_bubble_geometry(dpi, 1.0);
+            let (w, h) = full.window;
+            assert_eq!(h, dims.height, "{dpi}");
+            let (cx, cy) = full.center;
+            let r = full.radius;
+            assert_eq!(
+                r * 2.0,
+                px(crate::config::BASE_TIMER_BUBBLE_HEIGHT),
+                "a circle at {dpi}"
+            );
+            assert!((cy - h as f32 / 2.0).abs() < 0.01, "centred at {dpi}");
+            assert!(cy - r >= 1.0, "clear of the screen edge at {dpi}");
+            assert_eq!(
+                cx - r - full.wall,
+                px(crate::config::BASE_TIMER_BUBBLE_GAP),
+                "{dpi}"
+            );
+            assert!(cx + r <= w as f32, "inside its window at {dpi}");
+            assert_eq!(full.neck, 0.0, "detached when out at {dpi}");
+            assert!(
+                full.ring.0 > 0.0 && full.ring.0 + full.ring.1 / 2.0 < r,
+                "ring inside at {dpi}"
+            );
+            // In between: moving into the wall, shrinking a little; the neck
+            // forms as it nears and stays inside the circle's height
+            let mut last_x = cx;
+            let mut neck_seen = false;
+            for k in (0..=40).rev() {
+                let g = timer_bubble_geometry(dpi, k as f32 / 40.0);
+                assert!(g.center.0 <= last_x + 1e-3, "moves one way at {dpi}");
+                assert!((g.center.0 - last_x).abs() < r * 0.2, "no jump at {dpi}");
+                last_x = g.center.0;
+                assert!(g.radius <= r && g.radius >= r * 0.5 - 1e-3);
+                assert!(g.neck <= g.radius, "{dpi}");
+                neck_seen |= g.neck > 0.0;
+                assert!(g.center.0 + g.radius <= g.window.0 as f32);
+            }
+            assert!(neck_seen, "a liquid neck while close at {dpi}");
+            // Absorbed: entirely behind the wall
+            let gone = timer_bubble_geometry(dpi, 0.0);
+            assert!(
+                gone.center.0 + gone.radius <= gone.wall,
+                "inside the notch at {dpi}"
+            );
+            // The overshoot past fully out still fits its window
+            let over = timer_bubble_geometry(dpi, 1.05);
+            assert!(over.center.0 + over.radius <= over.window.0 as f32, "{dpi}");
         }
     }
 }

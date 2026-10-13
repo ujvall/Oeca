@@ -1,7 +1,8 @@
 [package]
-name = "Nott"
+name = "Oeca"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 # Already a dependency of `windows` (same version); named directly because the

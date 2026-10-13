@@ -1,6 +1,6 @@
-# Nott
+# Oeca
 
-Nott is a lightweight, ultra-efficient native Windows notch application built in Rust with native Win32 and Direct2D.
+Oeca is a lightweight, ultra-efficient native Windows notch application built in Rust with native Win32 and Direct2D.
 
 ## Status
 
@@ -60,7 +60,19 @@ cargo build --release
 
 ## Branding & Packaging Assets
 
+- `Oeca.png` (repository root): the official Oeca icon, featuring the minimalist hardware-notch cutout. Designed by the author.
+
 Located under `assets/branding/`:
-- `nott.ico`: Multi-resolution Windows icon (16x16, 32x32, 48x48, 64x64, 128x128, 256x256) ready for release packaging and executable embedding.
-- `nott_icon_minimal.png` (from `nott.png`): Primary official icon featuring the minimalist hardware-notch cutout.
-- `nott_icon_wordmark.png` (from `nott2.png`): Alternative brand variation featuring the embossed "Nott" wordmark inside the notch cutout.
+- `Oeca.ico`: Multi-resolution Windows icon (16x16, 32x32, 48x48, 64x64, 128x128, 256x256) ready for release packaging and executable embedding.
+- `Oeca.png`: copy of the root `Oeca.png`.
+
+---
+
+## Credits
+
+- Clipboard, House blank, Music-alt, Palette, Info, Settings and Trash icons: [Uicons by Flaticon](https://www.flaticon.com/uicons), used under the Flaticon free licence (with attribution).
+- Drop page icon: "Inbox" by Jivan from [Noun Project](https://thenounproject.com/icon/1052548/), used under the Noun Project free licence (with attribution).
+
+## Licence scope
+
+Oeca's source code is released under the [MIT License](LICENSE). It does not cover the third-party icons credited above, which remain under their own licences, or the Oeca icon and branding assets (`Oeca.png`, `assets/branding/`), which remain the property of the author.

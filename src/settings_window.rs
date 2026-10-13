@@ -1,4 +1,4 @@
-//! Nott Settings (Phases 6.4-6.6): a normal native window, separate from the
+//! Oeca Settings (Phases 6.4-6.6): a normal native window, separate from the
 //! notch, opened from the notch Settings page's "Open Full Settings". A
 //! persistent sidebar selects a category page; General holds the quick
 //! Settings page's switches plus the window-behavior ones (Escape closes this
@@ -12,7 +12,7 @@
 //!
 //! Lifecycle: at most one window, created on demand (`open` focuses an existing
 //! one), unowned (so it is never pulled into the notch's topmost band) and
-//! never topmost. Closing it leaves Nott running; the notch destroys it on
+//! never topmost. Closing it leaves Oeca running; the notch destroys it on
 //! shutdown (`close`). A new window always starts on General. All on the UI
 //! thread, drawn with Direct2D in DIPs at the window's own DPI.
 
@@ -62,11 +62,11 @@ use crate::config::{
 };
 use crate::layout::RectF;
 use crate::renderer::{CLIPBOARD, GEAR, INFO, IconSeg, MUSIC_ALT, PALETTE, fill_glyph};
-use crate::space::NottSettings;
+use crate::space::OecaSettings;
 use crate::window::WM_MOUSELEAVE;
 
-const CLASS_NAME: PCWSTR = w!("NottSettingsWindowClass");
-const TITLE: PCWSTR = w!("Nott Settings");
+const CLASS_NAME: PCWSTR = w!("OecaSettingsWindowClass");
+const TITLE: PCWSTR = w!("Oeca Settings");
 
 /// Posted to the notch window when a switch here is used (wParam: the
 /// `Control` index). The notch applies it and calls `sync`.
@@ -172,11 +172,11 @@ impl Category {
     /// yet only say what they are for; nothing claims unbuilt features.
     pub fn description(self) -> &'static str {
         match self {
-            Self::General => "How Nott behaves on your desktop.",
-            Self::Appearance => "How Nott looks on your desktop.",
-            Self::Clipboard => "How much copied history Nott keeps.",
+            Self::General => "How Oeca behaves on your desktop.",
+            Self::Appearance => "How Oeca looks on your desktop.",
+            Self::Clipboard => "How much copied history Oeca keeps.",
             Self::Media => "How detected Windows media sessions are shown.",
-            Self::About => concat!("Nott, version ", env!("CARGO_PKG_VERSION"), "."),
+            Self::About => concat!("Oeca, version ", env!("CARGO_PKG_VERSION"), "."),
         }
     }
 
@@ -282,10 +282,10 @@ impl Control {
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::AlwaysOnTop => "Keep Nott above other windows",
-            Self::ReducedMotion => "Minimize Nott's interface transitions",
+            Self::AlwaysOnTop => "Keep Oeca above other windows",
+            Self::ReducedMotion => "Minimize Oeca's interface transitions",
             Self::CloseOnEscape => "Press Esc to close this window",
-            Self::ConfirmClearClipboard => "Ask before Clear forgets Nott's copied items",
+            Self::ConfirmClearClipboard => "Ask before Clear forgets Oeca's copied items",
             Self::ShowSourceApp => "App icon on the Home artwork",
             Self::ShowVisualizer => "Animated bars in the Music space",
         }
@@ -303,7 +303,7 @@ impl Control {
     }
 
     /// Flips this control's value (the notch applies it to its settings).
-    pub fn toggle(self, settings: &mut NottSettings) {
+    pub fn toggle(self, settings: &mut OecaSettings) {
         let value = match self {
             Self::AlwaysOnTop => &mut settings.always_on_top,
             Self::ReducedMotion => &mut settings.reduced_motion,
@@ -316,7 +316,7 @@ impl Control {
     }
 
     /// This control's value in the (notch-owned) settings.
-    pub fn is_on(self, settings: NottSettings) -> bool {
+    pub fn is_on(self, settings: OecaSettings) -> bool {
         match self {
             Self::AlwaysOnTop => settings.always_on_top,
             Self::ReducedMotion => settings.reduced_motion,
@@ -671,14 +671,14 @@ struct View {
     hwnd: HWND,
     notch: HWND,
     /// Display copy of the notch's settings, replaced by `sync`.
-    settings: NottSettings,
+    settings: OecaSettings,
     nav: Nav,
     hover: Option<Target>,
     pressed: Option<Target>,
     d2d: ID2D1Factory,
     formats: Formats,
     target: Option<ID2D1HwndRenderTarget>,
-    /// Where Nott placed the new window (outer top-left, px), until the user
+    /// Where Oeca placed the new window (outer top-left, px), until the user
     /// takes over (a click, key, move/size or DPI change). While set, a move
     /// made by another process is undone (`placement_correction`).
     placement: Option<(i32, i32)>,
@@ -703,7 +703,7 @@ pub fn is_open() -> bool {
     with_view(|_| ()).is_some()
 }
 
-/// The open Settings window, if any (the notch treats clicks on it as Nott
+/// The open Settings window, if any (the notch treats clicks on it as Oeca
 /// being used).
 pub fn handle() -> Option<HWND> {
     window_handle()
@@ -715,7 +715,7 @@ fn window_handle() -> Option<HWND> {
 
 /// Opens the Settings window (creating it once) and brings it to the front.
 /// `notch` receives the switch changes; `settings` is the current state.
-pub fn open(notch: HWND, settings: NottSettings) -> Result<()> {
+pub fn open(notch: HWND, settings: OecaSettings) -> Result<()> {
     let hwnd = match window_handle() {
         Some(hwnd) => hwnd,
         None => create(notch, settings)?,
@@ -736,7 +736,7 @@ pub fn open(notch: HWND, settings: NottSettings) -> Result<()> {
 }
 
 /// Shows new settings values (after a change from either surface).
-pub fn sync(settings: NottSettings) {
+pub fn sync(settings: OecaSettings) {
     // Flipped switches slide (at once under Reduced motion), on a frame timer
     // that stops when they settle
     let instant = !crate::window::motion_allowed(
@@ -769,7 +769,7 @@ pub fn sync(settings: NottSettings) {
     }
 }
 
-/// Destroys the Settings window if it is open (Nott shutting down).
+/// Destroys the Settings window if it is open (Oeca shutting down).
 pub fn close() {
     if let Some(hwnd) = window_handle() {
         unsafe {
@@ -786,7 +786,7 @@ fn navigate(hwnd: HWND, category: Category) {
     }
 }
 
-fn create(notch: HWND, settings: NottSettings) -> Result<HWND> {
+fn create(notch: HWND, settings: OecaSettings) -> Result<HWND> {
     let instance = unsafe { GetModuleHandleW(None)? };
     if !REGISTERED.get() {
         let class = WNDCLASSEXW {
@@ -922,7 +922,7 @@ fn notch_monitor(notch: HWND) -> (u32, RECT, i32) {
 /// monitor when expanded (its tallest space, shadow included), plus a gap.
 pub fn notch_clear_top(monitor_top: i32, dpi: u32) -> i32 {
     const GAP: f32 = 16.0;
-    let tallest = crate::space::NottSpace::ALL
+    let tallest = crate::space::OecaSpace::ALL
         .into_iter()
         .map(|s| {
             crate::layout::space_dimensions(crate::config::NotchState::Expanded, dpi, s).height
@@ -950,11 +950,11 @@ pub fn initial_position(work: RECT, size: (i32, i32), clear_top: i32) -> (i32, i
 const MAX_PLACEMENT_CORRECTIONS: u8 = 3;
 
 /// Where to put the window back after it moved to `moved_to`, if anywhere:
-/// only while Nott's placement still stands (`placement`, cleared once the
+/// only while Oeca's placement still stands (`placement`, cleared once the
 /// user interacts), only for a move made by another process or thread
-/// (`external`; Nott's own moves and the user's are never undone), and at
+/// (`external`; Oeca's own moves and the user's are never undone), and at
 /// most `MAX_PLACEMENT_CORRECTIONS` times. Some shells re-centre a new window
-/// that opens without the foreground (as Nott's does: the notch never
+/// that opens without the foreground (as Oeca's does: the notch never
 /// activates), which would put its title bar under the expanded notch.
 pub fn placement_correction(
     placement: Option<(i32, i32)>,
@@ -1005,7 +1005,7 @@ fn text_format(
     Ok(format)
 }
 
-/// A role's format in Nott's typeface (sizes are DIP: the window draws at
+/// A role's format in Oeca's typeface (sizes are DIP: the window draws at
 /// its own DPI).
 fn role_format(dwrite: &IDWriteFactory, role: TextRole) -> Result<IDWriteTextFormat> {
     let style = role.style();
@@ -1122,7 +1122,7 @@ fn invalidate(hwnd: HWND) {
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    // The user (or a DPI change) takes over the position: Nott's initial
+    // The user (or a DPI change) takes over the position: Oeca's initial
     // placement is no longer defended
     if matches!(
         msg,
@@ -1135,7 +1135,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     ) {
         with_view(|v| v.placement = None);
     }
-    // Nott is in use: the notch's pending auto-collapse (if any) is cancelled
+    // Oeca is in use: the notch's pending auto-collapse (if any) is cancelled
     let activated =
         msg == windows::Win32::UI::WindowsAndMessaging::WM_ACTIVATE && (wparam.0 & 0xFFFF) != 0;
     if (activated || matches!(msg, WM_LBUTTONDOWN | WM_KEYDOWN | WM_SYSKEYDOWN))
@@ -1146,7 +1146,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = PostMessageW(
                     Some(notch),
                     crate::window::WM_APP_GRACE,
-                    WPARAM(crate::window::GraceEvent::NottInteraction as usize),
+                    WPARAM(crate::window::GraceEvent::OecaInteraction as usize),
                     LPARAM(0),
                 );
             }
@@ -1197,7 +1197,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_WINDOWPOSCHANGED => {
             let wp = unsafe { &*(lparam.0 as *const WINDOWPOS) };
-            // Sent from another thread / process (Nott moves its own window
+            // Sent from another thread / process (Oeca moves its own window
             // on this thread only)
             let external = unsafe { InSendMessageEx(None) } & (ISMEX_SEND | ISMEX_NOTIFY) != 0;
             if wp.flags & SWP_NOMOVE == SET_WINDOW_POS_FLAGS(0) {
@@ -1374,7 +1374,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_GETOBJECT => access::answer(hwnd, wparam, lparam)
             .unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }),
         WM_DESTROY => {
-            // Only this window goes: Nott (and its message loop) keeps running
+            // Only this window goes: Oeca (and its message loop) keeps running
             access::disconnect(hwnd);
             VIEW.with(|v| v.borrow_mut().take());
             LRESULT(0)
@@ -1604,7 +1604,7 @@ fn paint(v: &mut View) -> Result<()> {
                 }
             }
             text(chosen.name(), &v.formats.caption, l.accent_name, &secondary);
-            // Preview: Nott's black surface with an "on" switch and a
+            // Preview: Oeca's black surface with an "on" switch and a
             // progress track in the accent (the real switch drawing)
             let p = l.preview;
             rt.FillRoundedRectangle(&rounded(p, 14.0), &brush(&NOTCH_BG_COLOR)?);
@@ -1788,7 +1788,7 @@ impl Element {
 
     /// Selected state (SelectionItem): the showing page's sidebar entry, and
     /// the swatch of the current accent.
-    pub fn is_selected(self, showing: Category, settings: NottSettings) -> bool {
+    pub fn is_selected(self, showing: Category, settings: OecaSettings) -> bool {
         match self {
             Self::Category(c) => c == showing,
             Self::Accent(a) => a == settings.accent,
@@ -1953,7 +1953,7 @@ mod access {
 
     /// Settings changed: announce the switches whose state flipped, and a
     /// newly chosen accent.
-    pub(super) fn toggled(hwnd: HWND, old: NottSettings, new: NottSettings) {
+    pub(super) fn toggled(hwnd: HWND, old: OecaSettings, new: OecaSettings) {
         if !listening() {
             return;
         }
@@ -2028,9 +2028,9 @@ mod access {
             empty()
         }
         fn GetPropertyValue(&self, id: UIA_PROPERTY_ID) -> Result<VARIANT> {
-            // The host window supplies name ("Nott Settings") and type
+            // The host window supplies name ("Oeca Settings") and type
             Ok(if id == UIA_AutomationIdPropertyId {
-                var_str("NottSettings")
+                var_str("OecaSettings")
             } else {
                 VARIANT::default()
             })
@@ -2640,9 +2640,9 @@ mod tests {
                     ]
                 );
                 // Only the current accent reads as selected; page entries too
-                let s = NottSettings {
+                let s = OecaSettings {
                     accent: AccentChoice::Rose,
-                    ..NottSettings::default()
+                    ..OecaSettings::default()
                 };
                 let selected: Vec<_> = children
                     .iter()
@@ -2670,9 +2670,9 @@ mod tests {
                         CLIPBOARD_NOTES[1]
                     ]
                 );
-                let s = NottSettings {
+                let s = OecaSettings {
                     clipboard_capacity: ClipboardCapacity::Ten,
-                    ..NottSettings::default()
+                    ..OecaSettings::default()
                 };
                 let selected: Vec<_> = switches
                     .iter()
@@ -2703,7 +2703,7 @@ mod tests {
     #[test]
     fn test_controls_map_to_the_shared_settings() {
         // Defaults of every General setting
-        let d = NottSettings::default();
+        let d = OecaSettings::default();
         assert_eq!(
             Control::ALL.map(|c| c.is_on(d)),
             [true, false, true, true, true, true],
@@ -2728,12 +2728,12 @@ mod tests {
     fn test_window_lifecycle_navigation_and_sync() {
         // Hidden creation: lifecycle only (open() would also show it)
         assert!(!is_open());
-        let hwnd = create(HWND::default(), NottSettings::default()).unwrap();
+        let hwnd = create(HWND::default(), OecaSettings::default()).unwrap();
         assert!(is_open() && window_handle() == Some(hwnd));
         assert_eq!(with_view(|v| v.nav.category), Some(Category::General));
         // A second request reuses the same window (no duplicate)
         let again = window_handle()
-            .unwrap_or_else(|| create(HWND::default(), NottSettings::default()).unwrap());
+            .unwrap_or_else(|| create(HWND::default(), OecaSettings::default()).unwrap());
         assert_eq!(again, hwnd);
         // Navigating changes only the page, never the (notch-owned) settings
         let before = with_view(|v| v.settings);
@@ -2744,7 +2744,7 @@ mod tests {
         assert_eq!(with_view(|v| v.settings), before);
         // Changes from the notch show up here on any page; back on General the
         // switches read them
-        let changed = NottSettings {
+        let changed = OecaSettings {
             always_on_top: false,
             reduced_motion: true,
             close_settings_on_escape: false,
@@ -2763,7 +2763,7 @@ mod tests {
         assert!(!is_open());
         let mut msg = MSG::default();
         let quit = unsafe { PeekMessageW(&mut msg, None, WM_QUIT, WM_QUIT, PM_REMOVE) };
-        assert!(!quit.as_bool(), "closing Settings never quits Nott");
+        assert!(!quit.as_bool(), "closing Settings never quits Oeca");
         // Reopening: a fresh window, back on General
         let reopened = create(HWND::default(), changed).unwrap();
         assert_eq!(with_view(|v| v.nav.category), Some(Category::General));
@@ -2848,13 +2848,13 @@ mod tests {
     #[test]
     fn test_escape_follows_the_setting_and_keyboard_still_works() {
         // On (default): Escape closes the window
-        let _ = create(HWND::default(), NottSettings::default()).unwrap();
+        let _ = create(HWND::default(), OecaSettings::default()).unwrap();
         key(window_handle().unwrap(), VK_ESCAPE.0);
         assert!(!is_open(), "Escape closes Settings");
         // Off: Escape is ignored
-        let off = NottSettings {
+        let off = OecaSettings {
             close_settings_on_escape: false,
-            ..NottSettings::default()
+            ..OecaSettings::default()
         };
         let hwnd = create(HWND::default(), off).unwrap();
         toggle_requests();
@@ -2891,7 +2891,7 @@ mod tests {
         assert!(is_open());
         // The notch flips the value and syncs back: Escape now closes, the
         // switch reads On, on any page
-        sync(NottSettings::default());
+        sync(OecaSettings::default());
         assert_eq!(
             with_view(|v| Control::CloseOnEscape.is_on(v.settings)),
             Some(true)
@@ -2988,7 +2988,7 @@ mod tests {
 
     #[test]
     fn test_accent_keyboard_selection_sync_and_retention() {
-        let hwnd = create(HWND::default(), NottSettings::default()).unwrap();
+        let hwnd = create(HWND::default(), OecaSettings::default()).unwrap();
         accent_requests();
         navigate(hwnd, Category::Appearance);
         // Tab from the last sidebar entry reaches the swatches, in order
@@ -3016,9 +3016,9 @@ mod tests {
         key(hwnd, VK_SPACE.0);
         assert_eq!(accent_requests(), [AccentChoice::Blue.index()]);
         // The notch applies it and syncs back: selected here at once
-        let owned = NottSettings {
+        let owned = OecaSettings {
             accent: AccentChoice::Blue,
-            ..NottSettings::default()
+            ..OecaSettings::default()
         };
         sync(owned);
         assert_eq!(with_view(|v| v.settings.accent), Some(AccentChoice::Blue));
@@ -3127,14 +3127,14 @@ mod tests {
 
     #[test]
     fn test_capacity_and_media_keyboard_sync_and_retention() {
-        let hwnd = create(HWND::default(), NottSettings::default()).unwrap();
+        let hwnd = create(HWND::default(), OecaSettings::default()).unwrap();
         capacity_requests();
         toggle_requests();
         // Clipboard: Tab reaches the segments (20 selected by default)
         navigate(hwnd, Category::Clipboard);
         assert!(
             Element::Capacity(ClipboardCapacity::Twenty)
-                .is_selected(Category::Clipboard, NottSettings::default())
+                .is_selected(Category::Clipboard, OecaSettings::default())
         );
         with_view(|v| v.nav.focus = Target::Category(Category::About));
         key(hwnd, VK_TAB.0);
@@ -3158,9 +3158,9 @@ mod tests {
         key(hwnd, VK_RETURN.0);
         assert_eq!(capacity_requests(), [ClipboardCapacity::Ten.index()]);
         // The notch applies it and syncs back
-        let owned = NottSettings {
+        let owned = OecaSettings {
             clipboard_capacity: ClipboardCapacity::Ten,
-            ..NottSettings::default()
+            ..OecaSettings::default()
         };
         sync(owned);
         assert_eq!(
@@ -3182,7 +3182,7 @@ mod tests {
         );
         key(hwnd, VK_SPACE.0);
         assert_eq!(toggle_requests(), [Control::ShowVisualizer.index()]);
-        let owned = NottSettings {
+        let owned = OecaSettings {
             show_visualizer: false,
             ..owned
         };
@@ -3218,7 +3218,7 @@ mod tests {
         assert_eq!(y, clear, "below the expanded notch");
         assert!(y + size.1 <= work.bottom);
         // The band covers the tallest expanded notch at that DPI
-        for space in crate::space::NottSpace::ALL {
+        for space in crate::space::OecaSpace::ALL {
             let d =
                 crate::layout::space_dimensions(crate::config::NotchState::Expanded, 120, space);
             assert!(clear > d.height, "{space:?}");
@@ -3239,7 +3239,7 @@ mod tests {
         assert!(y >= 40 && y == clear.max(40));
         // Exactly the 16 DIP gap below the tallest expanded notch, at each DPI
         for dpi in [96u32, 120, 144, 192] {
-            let tallest = crate::space::NottSpace::ALL
+            let tallest = crate::space::OecaSpace::ALL
                 .into_iter()
                 .map(|s| {
                     crate::layout::space_dimensions(crate::config::NotchState::Expanded, dpi, s)
@@ -3267,7 +3267,7 @@ mod tests {
             IRawElementProviderFragment, ISelectionItemProvider, IToggleProvider,
         };
         use windows::core::Interface;
-        let hwnd = create(HWND::default(), NottSettings::default()).unwrap();
+        let hwnd = create(HWND::default(), OecaSettings::default()).unwrap();
         toggle_requests();
         let switch = access::provider(hwnd, Element::Control(Control::AlwaysOnTop));
         let toggle: IToggleProvider = switch.cast().unwrap();
@@ -3307,7 +3307,7 @@ mod tests {
         assert_eq!(toggle_requests(), [Control::AlwaysOnTop.index()]);
         // After the window closes (and a new one opens) the old element is dead
         close();
-        let reopened = create(HWND::default(), NottSettings::default()).unwrap();
+        let reopened = create(HWND::default(), OecaSettings::default()).unwrap();
         assert!(!access::is_live(
             hwnd,
             Element::Control(Control::AlwaysOnTop)
@@ -3327,7 +3327,7 @@ mod tests {
             placement_correction(placed, 0, (438, 191), true),
             Some((438, 281))
         );
-        // ...but never Nott's own moves, a move to the same spot, or once the
+        // ...but never Oeca's own moves, a move to the same spot, or once the
         // user has taken over (placement cleared), or past the cap
         assert_eq!(placement_correction(placed, 0, (438, 191), false), None);
         assert_eq!(placement_correction(placed, 0, (438, 281), true), None);
@@ -3394,13 +3394,13 @@ mod tests {
     #[test]
     fn test_external_recentre_is_undone_until_the_user_moves_it() {
         use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
-        let hwnd = create(HWND::default(), NottSettings::default()).unwrap();
+        let hwnd = create(HWND::default(), OecaSettings::default()).unwrap();
         let placed = top_left(hwnd);
         assert_eq!(with_view(|v| v.placement), Some(Some(placed)));
-        // Another thread re-centres it: Nott puts it back
+        // Another thread re-centres it: Oeca puts it back
         external_move(hwnd, placed.0, placed.1 - 90);
         assert_eq!(top_left(hwnd), placed, "title bar stays clear of the notch");
-        // Nott's own moves are never fought
+        // Oeca's own moves are never fought
         unsafe {
             let _ = SetWindowPos(
                 hwnd,
@@ -3425,14 +3425,14 @@ mod tests {
             "a user-placed window is left alone"
         );
         // Reopening an open window does not move it either
-        open(HWND::default(), NottSettings::default()).unwrap();
+        open(HWND::default(), OecaSettings::default()).unwrap();
         assert_eq!(top_left(hwnd), (100, 120));
         close();
     }
 
     #[test]
     fn test_closing_delay_row_layout_hits_and_selection() {
-        assert_eq!(NottSettings::default().collapse_delay, CollapseDelay::Five);
+        assert_eq!(OecaSettings::default().collapse_delay, CollapseDelay::Five);
         for (w, h) in [MIN_CLIENT_SIZE, CLIENT_SIZE] {
             let l = layout(w, h);
             // Third row of "Notch", between the switches and "Window behavior"
@@ -3478,9 +3478,9 @@ mod tests {
             }
         }
         // UIA: radio buttons named by duration; only the current one selected
-        let s = NottSettings {
+        let s = OecaSettings {
             collapse_delay: CollapseDelay::Ten,
-            ..NottSettings::default()
+            ..OecaSettings::default()
         };
         let selected: Vec<_> = Element::children(Category::General)
             .into_iter()
@@ -3516,7 +3516,7 @@ mod tests {
 
     #[test]
     fn test_closing_delay_keyboard_request_and_sync() {
-        let hwnd = create(HWND::default(), NottSettings::default()).unwrap();
+        let hwnd = create(HWND::default(), OecaSettings::default()).unwrap();
         delay_requests();
         with_view(|v| v.nav.focus = Target::Control(Control::ReducedMotion));
         key(hwnd, VK_TAB.0);
@@ -3536,9 +3536,9 @@ mod tests {
         key(hwnd, VK_SPACE.0);
         assert_eq!(delay_requests(), [CollapseDelay::Fifteen.index()]);
         // The notch applies it and syncs back; it survives page changes
-        let owned = NottSettings {
+        let owned = OecaSettings {
             collapse_delay: CollapseDelay::Fifteen,
-            ..NottSettings::default()
+            ..OecaSettings::default()
         };
         sync(owned);
         for c in Category::ALL {
@@ -3553,15 +3553,15 @@ mod tests {
 
     #[test]
     fn test_window_switches_slide_and_stop_and_respect_reduced_motion() {
-        let hwnd = create(HWND::default(), NottSettings::default()).unwrap();
+        let hwnd = create(HWND::default(), OecaSettings::default()).unwrap();
         let level = |c: Control| with_view(|v| v.switches[c.index()].level()).unwrap();
         let ticking = || with_view(|v| v.switch_tick.is_some()).unwrap();
         assert_eq!(level(Control::AlwaysOnTop), 1.0, "starts settled on");
         assert!(!ticking(), "no timer while settled");
         // Turned off (motion allowed): it slides on a frame timer
-        let mut s = NottSettings {
+        let mut s = OecaSettings {
             always_on_top: false,
-            ..NottSettings::default()
+            ..OecaSettings::default()
         };
         sync(s);
         let motion = crate::window::is_client_animation_enabled();

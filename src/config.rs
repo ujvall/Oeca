@@ -4,8 +4,8 @@ use crate::space::Scene;
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::core::{PCWSTR, w};
 
-pub const WINDOW_CLASS_NAME: PCWSTR = w!("NottWindowClass");
-pub const WINDOW_TITLE: PCWSTR = w!("Nott");
+pub const WINDOW_CLASS_NAME: PCWSTR = w!("OecaWindowClass");
+pub const WINDOW_TITLE: PCWSTR = w!("Oeca");
 
 // ============================================================================
 // 1. BASELINE DESIGN SYSTEM TOKENS (Logical Pixels @ 96 DPI / 100% scale)
@@ -129,7 +129,7 @@ pub const UI_FONT_CANDIDATES: [(&str, PCWSTR); 3] = [
 pub const FONT_FAMILY_FALLBACK_NAME: &str = "Segoe UI Variable Text";
 pub const FONT_FAMILY_FALLBACK: PCWSTR = w!("Segoe UI Variable Text");
 
-/// A typographic role: every piece of text in Nott is drawn in one of these,
+/// A typographic role: every piece of text in Oeca is drawn in one of these,
 /// so size and weight live here, not at the call sites. Sizes are DIP (the
 /// notch scales them by its DPI; the Settings window draws in DIP).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,7 +339,7 @@ pub const CLIPBOARD_MAX_TEXT_UNITS: usize = 256 * 1024;
 /// read. The timer exists only between an update and its read.
 pub const CLIPBOARD_TIMER_ID: usize = 1005;
 /// One-shot: the expanded notch collapses `CollapseDelay` after a click
-/// outside Nott, unless Nott is used again first (restarted by each outside
+/// outside Oeca, unless Oeca is used again first (restarted by each outside
 /// click).
 pub const AUTO_COLLAPSE_TIMER_ID: usize = 1006;
 
@@ -400,6 +400,67 @@ pub const SWITCH_TRAVEL_MS: f32 = 170.0;
 pub const SWITCH_FRAME_MS: u32 = 16;
 pub const CLIPBOARD_SETTLE_MS: u32 = 150;
 
+/// Countdown timer (Home): wakes only while a countdown runs (when its
+/// displayed second changes) or a finished one is on show (when that ends).
+pub const TIMER_TICK_TIMER_ID: usize = 1007;
+/// A finished countdown stays on show (collapsed bubble / slot, Home's
+/// "done" state) this long, then returns to the idle setup by itself.
+pub const TIMER_DONE_HOLD_MS: u64 = 6_000;
+/// The finished countdown's numerals pulse gently: this many cycles of this
+/// length, then hold steady (none under Reduced motion).
+pub const TIMER_PULSE_MS: f32 = 700.0;
+pub const TIMER_PULSES: f32 = 3.0;
+/// The timer's warm accent (numerals, indicator, primary button), and its
+/// button wash. Independent of the user accent, like Apple's timer orange.
+pub const COLOR_TIMER: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 1.0,
+    g: 159.0 / 255.0,
+    b: 10.0 / 255.0,
+    a: 1.0,
+};
+pub const TIMER_BUTTON_WASH: f32 = 0.22;
+/// Home timer panel (DIP at 96 DPI): numerals row, then the duration scale
+/// (setup) or a status line; round buttons at the row's right end.
+pub const BASE_TIMER_PANEL_WIDTH: f32 = 178.0;
+pub const BASE_TIMER_DISPLAY_HEIGHT: f32 = 32.0;
+pub const BASE_TIMER_ROW_GAP: f32 = 6.0;
+pub const BASE_TIMER_SCALE_HEIGHT: f32 = 20.0;
+pub const BASE_TIMER_BUTTON_SIZE: f32 = 30.0;
+pub const BASE_TIMER_BUTTON_GAP: f32 = 8.0;
+pub const BASE_TIMER_GLYPH_SIZE: f32 = 11.0;
+/// Scale: tick (minor / unit-start) heights and width, indicator size.
+pub const BASE_TIMER_TICK_HEIGHT: f32 = 6.0;
+pub const BASE_TIMER_MAJOR_TICK_HEIGHT: f32 = 10.0;
+pub const BASE_TIMER_TICK_WIDTH: f32 = 1.0;
+pub const BASE_TIMER_INDICATOR_WIDTH: f32 = 3.0;
+pub const BASE_TIMER_INDICATOR_HEIGHT: f32 = 16.0;
+pub const COLOR_TIMER_TICK: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 1.0,
+    g: 1.0,
+    b: 1.0,
+    a: 0.28,
+};
+/// Home without media: the clock and the timer share the content area as two
+/// columns this far either side of the centre divider.
+pub const BASE_TIMER_COLUMN_GAP: f32 = 16.0;
+/// Collapsed notch without playback: the remaining time in the visualizer's
+/// place, right-aligned to its edge, at most this wide.
+pub const BASE_TIMER_SLOT_WIDTH: f32 = 54.0;
+/// Collapsed notch during playback: a floating circle beside the notch (not
+/// attached to the screen edge): this wide, centred on the notch's height,
+/// this far from the notch's body. Inside it, the timer's ring (this far in
+/// from its edge, this thick) depletes as the countdown runs.
+pub const BASE_TIMER_BUBBLE_HEIGHT: f32 = 24.0;
+pub const BASE_TIMER_BUBBLE_GAP: f32 = 8.0;
+pub const BASE_TIMER_RING_INSET: f32 = 4.5;
+pub const BASE_TIMER_RING_WIDTH: f32 = 2.5;
+/// The liquid neck between the circle and the notch's wall forms once the
+/// circle comes this close (and pinches off as it leaves).
+pub const BASE_TIMER_NECK_REACH: f32 = 7.0;
+/// How far the bubble's window reaches back over the notch's body, so the
+/// neck joins the wall even where the notch's bottom corner curves away.
+pub const BASE_TIMER_BUBBLE_OVERLAP: f32 = 4.0;
+
 pub const MEDIA_FEEDBACK_TIMER_ID: usize = 1003;
 pub const MEDIA_FEEDBACK_FRAME_MS: u32 = 16;
 /// Playback "live" timer (visualizer + scrubber): runs only while playing or
@@ -419,6 +480,12 @@ pub const BASE_VISUALIZER_HEIGHT: f32 = 12.0;
 pub const VISUALIZER_MIN_HEIGHT: f32 = 0.25;
 /// Fade in on play / out on pause.
 pub const VISUALIZER_FADE_MS: f32 = 220.0;
+
+/// Collapsed notch album art (DIP at 96 DPI): a small rounded square at the
+/// left end of the content area, mirroring the visualizer at the right end,
+/// vertically centred in the 32 px notch (7 px above and below).
+pub const BASE_COLLAPSED_ARTWORK_SIZE: f32 = 18.0;
+pub const BASE_COLLAPSED_ARTWORK_RADIUS: f32 = 4.5;
 /// Space between the title and the expanded visualizer.
 pub const BASE_MEDIA_VISUALIZER_GAP: f32 = 8.0;
 
@@ -460,26 +527,32 @@ pub const BASE_MUSIC_BOTTOM_PAD: f32 = 6.0;
 /// (the only Music-specific width input; everything else is existing layout).
 pub const BASE_MUSIC_TIMELINE_TRACK: f32 = 240.0;
 
-/// Clipboard space (DIP): its own window width and list rows. The count label
-/// and the Clear capsule share the selector band; the newest rows fill the
-/// content area (older entries stay in the history, reachable once newer ones
-/// are cleared or restored past them).
+/// Clipboard space (DIP): its own window width, and its content area's
+/// height, still measured in the former list's five rows (so the space keeps
+/// its exact size at every DPI). The Clear X shares the selector band; the
+/// newest entries fill the area as a 3 x 2 grid of tiles (older entries stay
+/// in the history, reachable once newer ones are cleared or restored past
+/// them).
 pub const BASE_CLIPBOARD_WIDTH: f32 = 440.0;
 pub const BASE_CLIPBOARD_SIDE_INSET: f32 = 16.0;
 pub const CLIPBOARD_VISIBLE_ROWS: usize = 5;
+/// The tile grid: columns, rows, the gap between tiles, their squircle
+/// corner, the padding of their text, and their round copy / trash buttons
+/// (inset from the tile's bottom corner).
+pub const CLIPBOARD_TILE_COLUMNS: usize = 3;
+pub const CLIPBOARD_TILES: usize = 6;
+pub const BASE_CLIPBOARD_TILE_GAP: f32 = 8.0;
+pub const BASE_CLIPBOARD_TILE_RADIUS: f32 = 12.0;
+pub const BASE_CLIPBOARD_TILE_PAD: f32 = 8.0;
+pub const BASE_CLIPBOARD_TILE_BUTTON: f32 = 20.0;
+pub const BASE_CLIPBOARD_TILE_INSET: f32 = 3.0;
 pub const BASE_CLIPBOARD_ROW_HEIGHT: f32 = 26.0;
 pub const BASE_CLIPBOARD_ROW_GAP: f32 = 2.0;
-pub const BASE_CLIPBOARD_ROW_RADIUS: f32 = 8.0;
-/// Text inset inside a row, and the thumbnail's inset from the row edges.
-pub const BASE_CLIPBOARD_ROW_PAD: f32 = 10.0;
-pub const BASE_CLIPBOARD_THUMB_INSET: f32 = 3.0;
-pub const BASE_CLIPBOARD_THUMB_RADIUS: f32 = 5.0;
 pub const BASE_CLIPBOARD_BOTTOM_PAD: f32 = 12.0;
-/// Copy / trash glyphs after each row's outline, and the header's clear X
-/// (each in a row- or band-height square).
+/// Copy / trash glyphs on each tile, and the header's clear X.
 pub const BASE_CLIPBOARD_ACTION_ICON_SIZE: f32 = 13.0;
 pub const BASE_CLIPBOARD_CLEAR_ICON_SIZE: f32 = 9.0;
-/// Row outline stroke (DIP).
+/// Tile outline stroke (DIP).
 pub const BASE_CLIPBOARD_ROW_OUTLINE: f32 = 1.0;
 /// Icon button growth at full hover / full press (fractions, additive).
 pub const CLIPBOARD_BUTTON_HOVER_GROW: f32 = 0.16;
@@ -614,7 +687,7 @@ pub fn rgb_color([r, g, b]: [u8; 3]) -> D2D1_COLOR_F {
 }
 
 /// The user's accent (Settings > Appearance): a few named colors that read
-/// on the black notch. Used only where Nott already shows an accent: an "on"
+/// on the black notch. Used only where Oeca already shows an accent: an "on"
 /// switch, the Settings window's selected-page bar, and the playback
 /// visualizer / scrubber when the artwork gives no accent of its own.
 /// `White` (the default) is the original neutral accent.
@@ -1271,6 +1344,56 @@ impl Spring {
     }
 }
 
+/// Transport glyph motion (play/pause morph, skip slide): critically damped
+/// and quicker than the shell, so a glyph answers a click at once and never
+/// overshoots.
+pub const ICON_SPRING: Spring = Spring {
+    zeta: 1.0,
+    response: 0.24,
+};
+
+/// A value following a target on a spring (position + velocity): a new
+/// target mid-way continues from where it is, at the speed it has, so
+/// reversals and repeated retargets never jump. Settles exactly on the
+/// target; needs frames only while `is_animating`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Glide {
+    pub value: f32,
+    vel: f32,
+    pub target: f32,
+}
+
+impl Glide {
+    pub fn at(value: f32) -> Self {
+        Self {
+            value,
+            vel: 0.0,
+            target: value,
+        }
+    }
+
+    /// Jumps to `value` and stays (Reduced motion, content not on screen).
+    pub fn snap(&mut self, value: f32) {
+        *self = Self::at(value);
+    }
+
+    pub fn is_animating(&self) -> bool {
+        self.value != self.target || self.vel != 0.0
+    }
+
+    /// Advances by `dt_ms` on `spring`; true while still moving.
+    pub fn step(&mut self, spring: Spring, dt_ms: f32) -> bool {
+        if !self.is_animating() {
+            return false;
+        }
+        (self.value, self.vel) = spring.advance(self.value, self.vel, self.target, dt_ms);
+        if (self.value - self.target).abs() < 1e-3 && self.vel.abs() < 0.05 {
+            self.snap(self.target);
+        }
+        self.is_animating()
+    }
+}
+
 /// Cubic ease-out curve: f(t) = 1 - (1 - t)^3
 /// Provides responsive initial velocity smoothly decelerating to rest.
 pub fn cubic_ease_out(t: f32) -> f32 {
@@ -1418,7 +1541,7 @@ impl AnimationState {
             home,
             target_state,
             home,
-            Scene::Space(crate::space::NottSpace::Home),
+            Scene::Space(crate::space::OecaSpace::Home),
         )
     }
 
@@ -1657,8 +1780,8 @@ impl AnimationState {
 // ============================================================================
 
 /// Accessible name for the top-level application / overlay
-pub const ACCESSIBLE_NAME: PCWSTR = w!("Nott");
-pub const ACCESSIBLE_NAME_STR: &str = "Nott";
+pub const ACCESSIBLE_NAME: PCWSTR = w!("Oeca");
+pub const ACCESSIBLE_NAME_STR: &str = "Oeca";
 
 /// Concise accessible description explaining the overlay's purpose
 pub const ACCESSIBLE_DESCRIPTION: &str = "Interactive desktop notch overlay";
@@ -1667,8 +1790,8 @@ pub const ACCESSIBLE_DESCRIPTION: &str = "Interactive desktop notch overlay";
 pub const ACCESSIBLE_ROLE_NAME: &str = "Desktop Overlay";
 
 /// Full accessible title when the notch is in its expanded state
-pub const ACCESSIBLE_EXPANDED_TITLE: PCWSTR = w!("Nott");
-pub const ACCESSIBLE_EXPANDED_TITLE_STR: &str = "Nott";
+pub const ACCESSIBLE_EXPANDED_TITLE: PCWSTR = w!("Oeca");
+pub const ACCESSIBLE_EXPANDED_TITLE_STR: &str = "Oeca";
 
 /// Returns the user-facing accessible window title for a given notch state
 pub fn accessible_title_for_state(state: NotchState) -> PCWSTR {
@@ -1694,7 +1817,7 @@ pub fn accessible_state_description(state: NotchState) -> &'static str {
     }
 }
 
-/// Explicit semantic accessibility snapshot for Nott representing what
+/// Explicit semantic accessibility snapshot for Oeca representing what
 /// screen readers and accessibility clients observe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccessibilitySnapshot {
@@ -2589,7 +2712,7 @@ mod tests {
 
     #[test]
     fn test_accessible_name_and_metadata() {
-        assert_eq!(ACCESSIBLE_NAME_STR, "Nott");
+        assert_eq!(ACCESSIBLE_NAME_STR, "Oeca");
         assert_eq!(ACCESSIBLE_DESCRIPTION, "Interactive desktop notch overlay");
         assert_eq!(ACCESSIBLE_ROLE_NAME, "Desktop Overlay");
 
@@ -2999,7 +3122,7 @@ mod tests {
                 (0.0, 0.0),
                 NotchState::Expanded,
                 size,
-                Scene::Space(crate::space::NottSpace::Home),
+                Scene::Space(crate::space::OecaSpace::Home),
             );
             let f = frames(&mut anim);
             for (i, target) in [(0, size.0), (1, size.1)] {
@@ -3031,7 +3154,7 @@ mod tests {
     }
 
     fn scene() -> Scene {
-        Scene::Space(crate::space::NottSpace::Home)
+        Scene::Space(crate::space::OecaSpace::Home)
     }
 
     #[test]
@@ -3112,8 +3235,8 @@ mod tests {
     fn test_reversal_keeps_velocity_no_stall() {
         for (a, b) in [(HOME, MUSIC), (MUSIC, CLIPBOARD)] {
             let (sa, sb) = (
-                Scene::Space(crate::space::NottSpace::Home),
-                Scene::Space(crate::space::NottSpace::Music),
+                Scene::Space(crate::space::OecaSpace::Home),
+                Scene::Space(crate::space::OecaSpace::Music),
             );
             let mut anim = AnimationState::space(a, b, sa, sb);
             anim.run_for(110.0);
@@ -3205,7 +3328,7 @@ mod tests {
         let mut anim = AnimationState::space(
             CLIPBOARD,
             CLIPBOARD,
-            Scene::Space(crate::space::NottSpace::Clipboard),
+            Scene::Space(crate::space::OecaSpace::Clipboard),
             Scene::Drop,
         );
         assert_eq!(anim.mix, 0.0);
@@ -3399,7 +3522,7 @@ mod tests {
                     size,
                     to,
                     size,
-                    Scene::Space(crate::space::NottSpace::Home),
+                    Scene::Space(crate::space::OecaSpace::Home),
                 );
                 let f = frames(&mut anim);
                 assert!(f.len() > 10, "normal motion still animates");

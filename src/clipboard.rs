@@ -1,4 +1,4 @@
-//! Clipboard history foundation (Phase 5.0): Nott listens for system clipboard
+//! Clipboard history foundation (Phase 5.0): Oeca listens for system clipboard
 //! changes (`AddClipboardFormatListener` / `WM_CLIPBOARDUPDATE`, no polling) and
 //! keeps a small in-memory history of Unicode text and images that later phases
 //! can display and restore.
@@ -6,7 +6,7 @@
 //! Privacy: history lives in memory only. Nothing is written to disk, logs,
 //! the network or debug output; clipboard contents are never printed.
 //!
-//! Ownership: every item is copied into Nott-owned memory while the clipboard is
+//! Ownership: every item is copied into Oeca-owned memory while the clipboard is
 //! open; no clipboard handle or pointer outlives `CloseClipboard`. Images reuse
 //! the media artwork representation (owned BGRA8 premultiplied + fingerprint),
 //! but each item owns its own pixels, independent of the media session.
@@ -30,7 +30,7 @@ use crate::media::Artwork;
 const CF_UNICODETEXT: u32 = 13;
 const CF_DIB: u32 = 8;
 
-/// One clipboard history entry, fully owned by Nott.
+/// One clipboard history entry, fully owned by Oeca.
 #[derive(Clone, PartialEq, Eq)]
 pub enum ClipboardItem {
     Text(String),
@@ -207,7 +207,7 @@ fn check_limits(item: &ClipboardItem) -> Result<(), Rejected> {
 pub enum ClipboardError {
     /// Another application has the clipboard open (no retry, no spinning).
     Unavailable,
-    /// Nothing Nott stores (no text or bitmap).
+    /// Nothing Oeca stores (no text or bitmap).
     Unsupported,
     /// Content over the configured limits (rejected before copying).
     TooLarge,
@@ -228,7 +228,7 @@ pub fn stop_listening(hwnd: HWND) {
     }
 }
 
-/// True when the clipboard's current content was put there by `hwnd` (Nott
+/// True when the clipboard's current content was put there by `hwnd` (Oeca
 /// restoring a history item), so the resulting update is not a new copy.
 pub fn owned_by(hwnd: HWND) -> bool {
     unsafe { GetClipboardOwner() }.is_ok_and(|owner| owner == hwnd)
@@ -270,13 +270,15 @@ fn with_locked<R>(handle: HANDLE, f: impl FnOnce(&[u8]) -> R) -> Result<R, Clipb
 
 /// Reads the current clipboard into an owned item: Unicode text if present,
 /// otherwise a bitmap (CF_DIB, which Windows synthesizes from the other bitmap
-/// formats). The clipboard is closed before this returns.
+/// formats). Text that is blank or unreadable never hides an image offered
+/// alongside it (`text_wins`). The clipboard is closed before this returns.
 pub fn read(owner: HWND) -> Result<ClipboardItem, ClipboardError> {
     let _open = OpenGuard::open(Some(owner))?;
     unsafe {
+        let has_image = IsClipboardFormatAvailable(CF_DIB).is_ok();
         if IsClipboardFormatAvailable(CF_UNICODETEXT).is_ok() {
             let handle = GetClipboardData(CF_UNICODETEXT).map_err(|_| ClipboardError::Invalid)?;
-            return with_locked(handle, |bytes| {
+            let text = with_locked(handle, |bytes| {
                 let units: Vec<u16> = bytes
                     .as_chunks::<2>()
                     .0
@@ -286,10 +288,12 @@ pub fn read(owner: HWND) -> Result<ClipboardItem, ClipboardError> {
                     .take(CLIPBOARD_MAX_TEXT_UNITS + 1)
                     .collect();
                 text_from_utf16(&units)
-            })?
-            .map(ClipboardItem::Text);
+            })?;
+            if text_wins(&text, has_image) {
+                return text.map(ClipboardItem::Text);
+            }
         }
-        if IsClipboardFormatAvailable(CF_DIB).is_ok() {
+        if has_image {
             let handle = GetClipboardData(CF_DIB).map_err(|_| ClipboardError::Invalid)?;
             return with_locked(handle, dib_to_artwork)?.map(ClipboardItem::Image);
         }
@@ -297,7 +301,7 @@ pub fn read(owner: HWND) -> Result<ClipboardItem, ClipboardError> {
     Err(ClipboardError::Unsupported)
 }
 
-/// Places an item on the system clipboard (Nott becomes the owner). On success
+/// Places an item on the system clipboard (Oeca becomes the owner). On success
 /// the memory handle belongs to the system and is not freed here; on failure
 /// it is freed. The clipboard is closed before this returns.
 #[allow(dead_code)]
@@ -345,14 +349,52 @@ fn text_from_utf16(units: &[u16]) -> Result<String, ClipboardError> {
     Ok(String::from_utf16_lossy(units))
 }
 
+/// Whether the clipboard's text (decoded, or why not) is the entry rather than
+/// its bitmap: always without a bitmap; with one, only readable, non-blank
+/// text. Apps that copy a picture often add blank or placeholder text (a
+/// space, U+FFFC), which must not replace the image with an empty tile.
+fn text_wins(text: &Result<String, ClipboardError>, has_image: bool) -> bool {
+    !has_image || text.as_deref().is_ok_and(|t| !is_blank(t))
+}
+
+/// True if `text` would preview as nothing: only whitespace, control
+/// characters or object replacement placeholders (U+FFFC).
+fn is_blank(text: &str) -> bool {
+    text.chars()
+        .all(|c| c.is_whitespace() || c.is_control() || c == '\u{FFFC}')
+}
+
+/// Whether a 32 bpp DIB's fourth byte is real alpha. In plain BI_RGB DIBs that
+/// byte is formally reserved, and screen captures (Print Screen, the CF_DIB
+/// synthesized from a screen bitmap) fill it with whatever the desktop surface
+/// held: 255 under some windows, 0 under others. Honouring that made most of a
+/// screenshot transparent (a partly black tile). Real alpha never keeps colour
+/// under a fully transparent pixel (premultiplied sources cannot; Oeca's own
+/// DIB writes 0 there), so any `a == 0` pixel with colour, or no alpha at all,
+/// means opaque.
+fn alpha_is_meaningful(pixels: impl Iterator<Item = [u8; 4]>) -> bool {
+    let mut any_alpha = false;
+    for [b, g, r, a] in pixels {
+        if a == 0 && (b | g | r) != 0 {
+            return false;
+        }
+        any_alpha |= a != 0;
+    }
+    any_alpha
+}
+
 const BI_RGB: u32 = 0;
 const BI_BITFIELDS: u32 = 3;
 
 /// Packed DIB (BITMAPINFOHEADER or later + optional masks/palette + pixels) to
 /// owned premultiplied BGRA. Supports 24 and 32 bpp, bottom-up and top-down;
-/// 32 bpp with no alpha at all is treated as opaque. The size limit is checked
-/// before any pixel is copied.
+/// 32 bpp is opaque unless its alpha is meaningful (`alpha_is_meaningful`).
+/// The size limit is checked before any pixel is copied.
 fn dib_to_artwork(dib: &[u8]) -> Result<Artwork, ClipboardError> {
+    // The whole fixed header must be present before any field is read
+    if dib.len() < 40 {
+        return Err(ClipboardError::Invalid);
+    }
     let u32_at = |o: usize| {
         dib.get(o..o + 4)
             .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -407,8 +449,14 @@ fn dib_to_artwork(dib: &[u8]) -> Result<Artwork, ClipboardError> {
         return Err(ClipboardError::Invalid);
     }
     let rows = &dib[offset..];
-    let has_alpha =
-        bit_count == 32 && (0..h).any(|y| (0..w).any(|x| rows[y * stride + x * 4 + 3] != 0));
+    let has_alpha = bit_count == 32
+        && alpha_is_meaningful((0..h).flat_map(|y| {
+            rows[y * stride..][..w * 4]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+        }));
     let mut out = vec![0u8; out_bytes];
     for y in 0..h {
         // Bottom-up DIBs store the last row first
@@ -650,7 +698,7 @@ mod tests {
         assert_eq!(h.promote(2), Some(&text("a")));
         assert_eq!(h.len(), 3);
         assert_eq!(h.get(0), Some(&text("a")));
-        // The clipboard update Nott's own restore triggers is a no-op
+        // The clipboard update Oeca's own restore triggers is a no-op
         assert_eq!(h.add(text("a")), AddOutcome::Duplicate);
         assert_eq!(h.len(), 3);
         assert!(h.promote(9).is_none());
@@ -697,7 +745,7 @@ mod tests {
         // Top-left is the red pixel (bottom-up flipped), opaque
         assert_eq!(&a.pixels[0..4], &[0, 0, 255, 255]);
         assert_eq!(&a.pixels[12..16], &[0, 255, 0, 255], "bottom-right green");
-        // Round trip through Nott's own CF_DIB keeps the pixels
+        // Round trip through Oeca's own CF_DIB keeps the pixels
         let back = dib_to_artwork(&artwork_to_dib(&a)).unwrap();
         assert_eq!(back, a);
     }
@@ -726,6 +774,127 @@ mod tests {
         assert_eq!(dib_to_artwork(&huge), Err(ClipboardError::TooLarge));
     }
 
+    /// Packed 32 bpp BI_RGB top-down DIB (40-byte header) from BGRA rows.
+    fn dib32(w: u32, h: u32, px: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> {
+        let mut d = Vec::new();
+        for v in [40u32, w, (-(h as i32)) as u32] {
+            d.extend(v.to_le_bytes());
+        }
+        d.extend(1u16.to_le_bytes());
+        d.extend(32u16.to_le_bytes());
+        d.extend([0u8; 24]);
+        for y in 0..h {
+            for x in 0..w {
+                d.extend(px(x, y));
+            }
+        }
+        d
+    }
+
+    /// A screen capture's CF_DIB: the reserved byte is 255 under one "window"
+    /// (left half) and 0 over the rest of the desktop, colour everywhere.
+    fn screenshot_dib(w: u32, h: u32, bgr: [u8; 3]) -> Vec<u8> {
+        dib32(w, h, |x, _| {
+            [bgr[0], bgr[1], bgr[2], if x < w / 2 { 255 } else { 0 }]
+        })
+    }
+
+    #[test]
+    fn test_screen_capture_reserved_byte_decodes_opaque() {
+        let a = dib_to_artwork(&screenshot_dib(8, 4, [10, 120, 230])).unwrap();
+        assert_eq!((a.width, a.height), (8, 4));
+        for p in a.pixels.as_chunks::<4>().0 {
+            assert_eq!(p, &[10, 120, 230, 255], "every pixel kept, fully opaque");
+        }
+        // All-zero reserved bytes (the usual BI_RGB case) are opaque too
+        let a = dib_to_artwork(&dib32(2, 2, |_, _| [1, 2, 3, 0])).unwrap();
+        assert!(
+            a.pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| p == &[1, 2, 3, 255])
+        );
+        // Real alpha (nothing hidden under a == 0) is still honoured, premultiplied
+        let a = dib_to_artwork(&dib32(2, 1, |x, _| {
+            if x == 0 {
+                [0, 0, 0, 0]
+            } else {
+                [200, 100, 50, 128]
+            }
+        }))
+        .unwrap();
+        assert_eq!(&a.pixels[0..4], &[0, 0, 0, 0]);
+        assert_eq!(&a.pixels[4..8], &[100, 50, 25, 128]);
+    }
+
+    #[test]
+    fn test_truncated_header_is_rejected_without_panicking() {
+        let full = dib24();
+        for len in 0..40 {
+            assert_eq!(
+                dib_to_artwork(&full[..len]),
+                Err(ClipboardError::Invalid),
+                "{len}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_selection_keeps_images_next_to_blank_text() {
+        let ok = |t: &str| Ok(t.to_string());
+        // No bitmap: text is the entry, even blank (unchanged behaviour)
+        assert!(text_wins(&ok("hello"), false));
+        assert!(text_wins(&ok(" \r\n"), false));
+        assert!(text_wins(&Err(ClipboardError::TooLarge), false));
+        // Bitmap + real text: text wins (e.g. spreadsheet cells)
+        assert!(text_wins(&ok("A1\tB1"), true));
+        assert!(text_wins(&ok("  x  "), true));
+        // Bitmap + blank, placeholder or unreadable text: the image is kept
+        for blank in [" ", "\r\n", "\t", "\u{FFFC}", " \u{FFFC}\r\n", "\u{0}"] {
+            assert!(!text_wins(&ok(blank), true), "{blank:?}");
+        }
+        assert!(!text_wins(&Err(ClipboardError::Unsupported), true));
+        assert!(!text_wins(&Err(ClipboardError::TooLarge), true));
+    }
+
+    #[test]
+    fn test_mixed_screenshot_and_text_history_keeps_each_image() {
+        // Screenshots decoded as they arrive, interleaved with text and a
+        // repeated text; each image entry keeps its own full, opaque pixels
+        let mut h = ClipboardHistory::default();
+        let shades: [[u8; 3]; 4] = [[200, 0, 0], [0, 200, 0], [0, 0, 200], [90, 90, 90]];
+        for (i, bgr) in shades.iter().enumerate() {
+            let shot = dib_to_artwork(&screenshot_dib(40 + i as u32, 30, *bgr)).unwrap();
+            assert_eq!(h.add(ClipboardItem::Image(shot)), AddOutcome::Added);
+            assert_eq!(h.add(text(&format!("note {i}"))), AddOutcome::Added);
+        }
+        assert_eq!(h.len(), 8);
+        // Newest first: note 3, shot 3, note 2, shot 2, ...
+        for (i, item) in h.items().enumerate() {
+            let k = 3 - i / 2;
+            match (i % 2, item) {
+                (0, ClipboardItem::Text(t)) => assert_eq!(t, &format!("note {k}")),
+                (1, ClipboardItem::Image(a)) => {
+                    assert_eq!((a.width, a.height), (40 + k as u32, 30));
+                    let [b, g, r] = shades[k];
+                    assert!(
+                        a.pixels
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .all(|p| p == &[b, g, r, 255])
+                    );
+                }
+                other => panic!("entry {i} out of order: {other:?}"),
+            }
+        }
+        // Removing one image shifts nothing else
+        assert!(matches!(h.remove(1), Some(ClipboardItem::Image(_))));
+        assert_eq!(h.get(1), Some(&text("note 2")));
+        assert!(matches!(h.get(2), Some(ClipboardItem::Image(a)) if a.width == 42));
+    }
+
     /// Real clipboard (run explicitly: `cargo test clipboard_live -- --ignored`).
     /// Overwrites the user's clipboard.
     #[test]
@@ -752,9 +921,9 @@ mod tests {
             )
         }
         .expect("owner window");
-        let item = text("nott clipboard test");
+        let item = text("oeca clipboard test");
         write(owner, &item).expect("write");
-        assert!(owned_by(owner), "Nott's own write is recognisable");
+        assert!(owned_by(owner), "Oeca's own write is recognisable");
         assert_eq!(read(owner), Ok(item));
         let img = image(3, 2, 77);
         write(owner, &img).expect("write image");

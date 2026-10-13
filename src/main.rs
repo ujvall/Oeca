@@ -9,6 +9,7 @@ mod media;
 mod renderer;
 mod settings_window;
 mod space;
+mod timer;
 mod window;
 
 fn main() {
@@ -16,7 +17,7 @@ fn main() {
         // Only fatal initialization failures (window/renderer) reach here; media
         // and other recoverable failures never surface. There is no console in
         // the windows subsystem, so show the reason instead of exiting silently.
-        let text: Vec<u16> = format!("Nott could not start.\n\n{e}")
+        let text: Vec<u16> = format!("Oeca could not start.\n\n{e}")
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
@@ -25,7 +26,7 @@ fn main() {
             MessageBoxW(
                 None,
                 windows::core::PCWSTR(text.as_ptr()),
-                windows::core::w!("Nott"),
+                windows::core::w!("Oeca"),
                 MB_OK | MB_ICONERROR,
             );
         }

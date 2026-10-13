@@ -1,10 +1,10 @@
 //! Drag-and-drop ingestion (Phase 5.1): image files dragged from Explorer onto
 //! the notch go into the existing clipboard history (and onto the system
-//! clipboard). Native OLE: the Nott window is registered as an `IDropTarget` on
+//! clipboard). Native OLE: the Oeca window is registered as an `IDropTarget` on
 //! the UI thread (an STA, see `window::run`); OLE calls these methods there,
 //! from the message loop.
 //!
-//! Nothing is read while a drag passes over Nott: during the drag only the file
+//! Nothing is read while a drag passes over Oeca: during the drag only the file
 //! *names* are inspected (extension check). Files are opened and decoded only on
 //! Drop, through WIC, into the same owned `Artwork` the clipboard history uses.
 //! Dropped files are never modified, moved or deleted.
@@ -32,7 +32,7 @@ use crate::clipboard::{AddOutcome, ClipboardHistory, ClipboardItem};
 use crate::config::CLIPBOARD_MAX_IMAGE_BYTES;
 use crate::media::Artwork;
 
-/// Image file types Nott accepts (decoded by the built-in WIC codecs).
+/// Image file types Oeca accepts (decoded by the built-in WIC codecs).
 const SUPPORTED_EXTENSIONS: [&str; 9] = [
     "png", "jpg", "jpeg", "jfif", "bmp", "gif", "tif", "tiff", "webp",
 ];
@@ -202,7 +202,7 @@ pub enum DragEvent {
 /// The window's handler: returns true to accept (copy effect).
 pub type DragHandler = fn(HWND, DragEvent) -> bool;
 
-/// `IDropTarget` for the Nott window. Holds no COM references between calls;
+/// `IDropTarget` for the Oeca window. Holds no COM references between calls;
 /// OLE owns it after `RegisterDragDrop` until `RevokeDragDrop`.
 #[implement(IDropTarget)]
 pub struct DropTarget {
@@ -386,7 +386,7 @@ mod tests {
     impl TempFile {
         fn new(name: &str, bytes: &[u8]) -> Self {
             let path =
-                std::env::temp_dir().join(format!("nott-test-{}-{name}", std::process::id()));
+                std::env::temp_dir().join(format!("oeca-test-{}-{name}", std::process::id()));
             std::fs::write(&path, bytes).unwrap();
             Self(path)
         }
@@ -401,7 +401,7 @@ mod tests {
         let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     }
 
-    /// A .bmp file (file header + Nott's own 32 bpp DIB) of `w` x `h`.
+    /// A .bmp file (file header + Oeca's own 32 bpp DIB) of `w` x `h`.
     fn bmp(w: u32, h: u32, bgra: [u8; 4]) -> Vec<u8> {
         let px: Vec<u8> = (0..w * h).flat_map(|_| bgra).collect();
         let dib = crate::clipboard::artwork_to_dib(&Artwork::new(w, h, px).unwrap());
@@ -433,9 +433,9 @@ mod tests {
         com();
         let renamed = TempFile::new("fake.png", b"this is a text file, not a PNG");
         assert_eq!(decode_image_file(&renamed.0), Err(DropError::Malformed));
-        let missing = std::env::temp_dir().join("nott-test-does-not-exist.png");
+        let missing = std::env::temp_dir().join("oeca-test-does-not-exist.png");
         assert_eq!(decode_image_file(&missing), Err(DropError::Unreadable));
-        let dir = std::env::temp_dir().join(format!("nott-test-{}-folder.png", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("oeca-test-{}-folder.png", std::process::id()));
         let _ = std::fs::create_dir(&dir);
         assert_eq!(
             decode_image_file(&dir),
@@ -482,7 +482,7 @@ mod tests {
 
     #[test]
     fn test_own_clipboard_write_after_drop_adds_nothing() {
-        // After a drop, Nott writes the front image to the clipboard; the update
+        // After a drop, Oeca writes the front image to the clipboard; the update
         // that write triggers is skipped by the owner check, and even if it were
         // read it would be a consecutive duplicate.
         let mut h = ClipboardHistory::default();

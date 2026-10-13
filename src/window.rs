@@ -7,7 +7,7 @@ use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    GetCapture, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
@@ -36,6 +36,7 @@ unsafe extern "system" {
 use crate::clipboard::{self, ClipboardHistory, ClipboardItem};
 use crate::clock::ClockEngine;
 use crate::config::AUTO_COLLAPSE_TIMER_ID;
+use crate::config::TIMER_TICK_TIMER_ID;
 use crate::config::{
     ANIMATION_FRAME_INTERVAL_MS, ANIMATION_TIMER_ID, AnimationState, CLIPBOARD_SETTLE_MS,
     CLIPBOARD_TIMER_ID, CLOCK_TIMER_ID, MEDIA_FEEDBACK_FRAME_MS, MEDIA_FEEDBACK_TIMER_ID,
@@ -54,7 +55,8 @@ use crate::media::{
 };
 use crate::renderer::Renderer;
 use crate::settings_window;
-use crate::space::{NottSettings, NottSpace, PANEL_SPACE, Scene};
+use crate::space::{OecaSettings, OecaSpace, PANEL_SPACE, Scene};
+use crate::timer::{Countdown, Phase, Presence};
 use windows::Win32::System::Ole::{
     OleInitialize, OleUninitialize, RegisterDragDrop, RevokeDragDrop,
 };
@@ -64,6 +66,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::Win32::UI::WindowsAndMessaging::{
     HWND_NOTOPMOST, SET_WINDOW_POS_FLAGS, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
 };
+use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, WM_MOUSEWHEEL, WS_EX_TRANSPARENT};
 
 /// Owns the process's 1 ms timer-resolution request (`timeBeginPeriod`), held
 /// only while the notch animation runs. Requests never stack (reversing an
@@ -122,7 +125,7 @@ struct WindowState {
     /// Active space (every space renders the existing UI for now). Starts in
     /// Home, never persisted; media updates never touch it. Changed only through
     /// `select_space`, which keeps the renderer's selector in sync.
-    space: NottSpace,
+    space: OecaSpace,
     /// Last tick of the control feedback timer (Some only while it runs).
     feedback_tick: Option<std::time::Instant>,
     /// Last tick of the playback live timer (Some only while it runs), and
@@ -134,7 +137,7 @@ struct WindowState {
     /// Active OLE drag over the notch (image-file drops into the history).
     drag: DragSession,
     /// User settings (memory only; every launch starts from the defaults).
-    settings: NottSettings,
+    settings: OecaSettings,
     /// The Settings page is open over the active space (which stays selected).
     settings_open: bool,
     /// Outside-click auto-collapse (see `GracePeriod`), and whether the Raw
@@ -144,11 +147,26 @@ struct WindowState {
     /// The Clipboard space asks "Clear clipboard history?" (Cancel / Clear).
     /// Any view change (space, Settings page, collapse) cancels it.
     clear_pending: bool,
+    /// Home's countdown timer (memory only), its collapsed presentations
+    /// (bubble beside the notch during playback, else the visualizer's
+    /// slot), the bubble's window (created on first use, owned by the
+    /// notch) and whether it is showing, and a drag along the scale.
+    timer: Countdown,
+    bubble_presence: Presence,
+    slot_presence: Presence,
+    bubble: Option<HWND>,
+    bubble_shown: bool,
+    timer_drag: bool,
+    /// The countdown as last shown collapsed (kept while that fades out).
+    timer_shown: Countdown,
+    /// A drag along the Music scrubber: where it is (0..1 of the track). The
+    /// notch holds the mouse capture for the whole gesture.
+    scrub: Option<f32>,
 }
 
 /// `SetWindowPos` z-order arguments for routine moves and resizes: topmost
 /// re-asserts the topmost band; otherwise the z-order is left untouched
-/// (`SWP_NOZORDER`), so windows that covered Nott stay above it.
+/// (`SWP_NOZORDER`), so windows that covered Oeca stay above it.
 fn z_order(always_on_top: bool) -> (Option<HWND>, SET_WINDOW_POS_FLAGS) {
     if always_on_top {
         (Some(HWND_TOPMOST), SET_WINDOW_POS_FLAGS(0))
@@ -173,7 +191,7 @@ impl WindowState {
         if self.state != NotchState::Expanded
             || self.animation.is_some()
             || self.media_content.is_none()
-            || self.space == NottSpace::Clipboard
+            || self.space == OecaSpace::Clipboard
             || self.settings_open
         {
             return None;
@@ -202,8 +220,14 @@ impl WindowState {
     /// Starts the short-lived control feedback timer if a hover/press level needs
     /// to animate. It stops itself once every level reaches its target.
     fn kick_feedback(&mut self, hwnd: HWND) {
-        let animating =
-            self.renderer.feedback().is_animating() || self.renderer.switches_animating();
+        // Reduced motion: hover changes show at once (presses still ease)
+        if !self.motion_enabled() {
+            self.renderer.feedback().snap_hover();
+        }
+        let animating = self.renderer.feedback().is_animating()
+            || self.renderer.switches_animating()
+            || self.renderer.media_motion_animating()
+            || self.timer_animating();
         if self.feedback_tick.is_none() && animating {
             self.feedback_tick = Some(std::time::Instant::now());
             unsafe {
@@ -263,12 +287,15 @@ impl WindowState {
                 let _ = KillTimer(Some(hwnd), MEDIA_FEEDBACK_TIMER_ID);
             }
         }
+        // The timer's presentations and the Settings switches share that
+        // timer: whatever of them still moves keeps its frames
+        self.kick_feedback(hwnd);
     }
 
     /// Space capsule under a client-area point: on the expanded notch, settled
     /// or mid width transition (the selector is drawn from the same interpolated
     /// dimensions, so what is clicked is what is seen). Not during expand/collapse.
-    fn space_at(&self, lparam: LPARAM) -> Option<NottSpace> {
+    fn space_at(&self, lparam: LPARAM) -> Option<OecaSpace> {
         let (selector, x, y) = self.header_at(lparam)?;
         selector.space_at(x, y)
     }
@@ -304,12 +331,13 @@ impl WindowState {
         Some((selector, x, y))
     }
 
-    /// Selects a space (the selector's only route to `NottSpace::switch_to`); a
+    /// Selects a space (the selector's only route to `OecaSpace::switch_to`); a
     /// no-op when already active. On the settled expanded notch the width
     /// transitions to the space's width on the existing animation timer; while
     /// collapsed (or mid expand/collapse) the space is only stored, and the next
     /// expansion opens straight into its width.
-    fn select_space(&mut self, hwnd: HWND, space: NottSpace) {
+    fn select_space(&mut self, hwnd: HWND, space: OecaSpace) {
+        self.end_scrub(hwnd, false);
         let before = self.scene();
         let changed = self.space.switch_to(space);
         // A pill on the Settings page also closes it (back to that space)
@@ -331,6 +359,7 @@ impl WindowState {
                 &self.clipboard,
                 self.clear_pending,
                 self.settings_title(),
+                self.timer_title().as_deref(),
             );
         }
     }
@@ -338,7 +367,7 @@ impl WindowState {
     /// The space whose expanded size the notch takes: the active space's, or
     /// for Settings and the drop page the panel (Clipboard) size, whichever
     /// space is active.
-    fn size_space(&self) -> NottSpace {
+    fn size_space(&self) -> OecaSpace {
         self.scene().size_space()
     }
 
@@ -354,7 +383,7 @@ impl WindowState {
     }
 
     /// The Settings page's accessible state (Some(settings) while open).
-    fn settings_title(&self) -> Option<NottSettings> {
+    fn settings_title(&self) -> Option<OecaSettings> {
         self.settings_open.then_some(self.settings)
     }
 
@@ -365,6 +394,8 @@ impl WindowState {
         self.renderer
             .set_settings(self.settings_open, self.settings);
         settings_window::sync(self.settings);
+        // Timer presentations snap (and the done pulse stops) from now on
+        self.refresh_timer_presence(hwnd);
         // The page's switch slides (control-feedback timer)
         self.kick_feedback(hwnd);
         self.redraw(hwnd);
@@ -377,6 +408,7 @@ impl WindowState {
             &self.clipboard,
             self.clear_pending,
             self.settings_title(),
+            self.timer_title().as_deref(),
         );
     }
 
@@ -501,6 +533,7 @@ impl WindowState {
         if self.settings_open == open {
             return;
         }
+        self.end_scrub(hwnd, false);
         let before = self.scene();
         self.set_clear_pending(hwnd, false);
         self.settings_open = open;
@@ -516,6 +549,7 @@ impl WindowState {
             &self.clipboard,
             self.clear_pending,
             self.settings_title(),
+            self.timer_title().as_deref(),
         );
     }
 
@@ -535,6 +569,18 @@ impl WindowState {
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
+            // The countdown bubble shares the notch's band
+            if let Some(bubble) = self.bubble {
+                let _ = SetWindowPos(
+                    bubble,
+                    Some(z_band(on)),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
         }
         self.renderer
             .set_settings(self.settings_open, self.settings);
@@ -551,6 +597,7 @@ impl WindowState {
             &self.clipboard,
             self.clear_pending,
             self.settings_title(),
+            self.timer_title().as_deref(),
         );
     }
 
@@ -617,7 +664,7 @@ impl WindowState {
     }
 
     /// Places history entry `index` back on the system clipboard and makes it
-    /// the newest entry. The update Windows then sends is Nott's own (owner
+    /// the newest entry. The update Windows then sends is Oeca's own (owner
     /// check), so no duplicate is stored. Failures leave everything unchanged.
     fn restore_clipboard(
         &mut self,
@@ -690,7 +737,7 @@ impl WindowState {
         };
         match event {
             DragEvent::Enter { images, at } => {
-                self.grace(hwnd, GraceEvent::NottInteraction);
+                self.grace(hwnd, GraceEvent::OecaInteraction);
                 self.drag.enter(images);
                 over(self, at)
             }
@@ -757,8 +804,10 @@ impl WindowState {
             .find(|(r, _)| r.contains(x, y))
             .map(|(_, hit)| hit);
         }
-        if self.space != NottSpace::Clipboard {
-            return None;
+        if self.space != OecaSpace::Clipboard {
+            // Home: the timer's buttons, and its scale during setup
+            let idle = self.timer.phase() == Phase::Idle;
+            return self.timer_layout()?.hit(x, y, idle);
         }
         let l = resolve_clipboard_layout(&self.dimensions)?;
         if self.clear_pending {
@@ -772,7 +821,7 @@ impl WindowState {
     /// is on screen, redraw it and refresh its accessible title.
     fn clipboard_changed(&mut self, hwnd: HWND) {
         self.renderer.set_clipboard(&self.clipboard);
-        if self.state == NotchState::Expanded && self.space == NottSpace::Clipboard {
+        if self.state == NotchState::Expanded && self.space == OecaSpace::Clipboard {
             self.redraw(hwnd);
             notify_accessibility_state_changed(
                 hwnd,
@@ -783,8 +832,385 @@ impl WindowState {
                 &self.clipboard,
                 self.clear_pending,
                 self.settings_title(),
+                self.timer_title().as_deref(),
             );
         }
+    }
+
+    /// A transport command was sent: its glyph answers at once (play/pause
+    /// heads for the other glyph; a skip rolls its way).
+    fn control_clicked(&mut self, hwnd: HWND, control: MediaControl) {
+        let instant = !self.motion_enabled();
+        match control {
+            MediaControl::PlayPause => self
+                .renderer
+                .icons()
+                .clicked_play_pause(std::time::Instant::now(), instant),
+            MediaControl::Previous | MediaControl::Next => {
+                self.renderer.icons().clicked_skip(control, instant);
+            }
+        }
+        self.kick_feedback(hwnd);
+    }
+
+    /// The Music scrubber's track on the settled expanded notch, while the
+    /// session has a timeline (None elsewhere).
+    fn scrub_track(&self) -> Option<crate::layout::RectF> {
+        if self.space != OecaSpace::Music {
+            return None;
+        }
+        self.media_content.as_ref()?.timeline?;
+        self.active_media_layout()?
+            .scrub_track(self.dimensions.scale)
+    }
+
+    /// The point on the scrubber's track (fraction), if a press there would
+    /// scrub.
+    fn scrub_at(&self, lparam: LPARAM) -> Option<f32> {
+        let x = (lparam.0 & 0xFFFF) as i16 as f32;
+        let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+        let track = self.scrub_track()?;
+        track
+            .contains(x, y)
+            .then(|| MediaLayout::scrub_fraction(track, x))
+    }
+
+    /// Starts a scrub (only if the app allows seeking): the notch takes the
+    /// mouse capture so the whole drag, wherever it goes, stays this gesture.
+    fn begin_scrub(&mut self, hwnd: HWND, fraction: f32) {
+        if !self.media.can_seek() {
+            return;
+        }
+        self.scrub = Some(fraction);
+        self.renderer.set_scrub(self.scrub);
+        unsafe {
+            SetCapture(hwnd);
+        }
+        self.redraw(hwnd);
+    }
+
+    /// The scrub follows the pointer (clamped to the track's ends).
+    fn move_scrub(&mut self, hwnd: HWND, lparam: LPARAM) {
+        let Some(track) = self.scrub_track() else {
+            self.end_scrub(hwnd, false);
+            return;
+        };
+        let x = (lparam.0 & 0xFFFF) as i16 as f32;
+        let f = MediaLayout::scrub_fraction(track, x);
+        if self.scrub != Some(f) {
+            self.scrub = Some(f);
+            self.renderer.set_scrub(self.scrub);
+            self.redraw(hwnd);
+        }
+    }
+
+    /// Ends a scrub: on release (`commit`) the session is asked to play from
+    /// there and the bar holds that spot until it reports back; cancelled
+    /// (capture lost, the notch or media changed) nothing is sought.
+    fn end_scrub(&mut self, hwnd: HWND, commit: bool) {
+        let Some(f) = self.scrub.take() else {
+            return;
+        };
+        self.renderer.set_scrub(None);
+        let duration = self
+            .media_content
+            .as_ref()
+            .and_then(|c| c.timeline)
+            .map(|t| t.duration_ms);
+        if let (true, Some(duration)) = (commit, duration) {
+            let position = scrub_position(f, duration);
+            if self.media.send_seek(position) {
+                self.renderer.hold_seek(position);
+            }
+        }
+        unsafe {
+            if GetCapture() == hwnd {
+                let _ = ReleaseCapture();
+            }
+        }
+        self.redraw(hwnd);
+    }
+
+    /// Home's timer panel on the settled expanded notch (None elsewhere: the
+    /// timer is only operable there).
+    fn timer_layout(&self) -> Option<crate::layout::TimerLayout> {
+        if self.state != NotchState::Expanded
+            || self.animation.is_some()
+            || self.space != OecaSpace::Home
+            || self.settings_open
+            || self.renderer.drop_page()
+        {
+            return None;
+        }
+        crate::layout::resolve_home_timer_layout(
+            &self.dimensions,
+            self.media_content.as_ref().map(MediaContent::shape),
+        )
+        .map(|h| h.timer)
+    }
+
+    /// The finished countdown's gentle pulse still needs frames: only while
+    /// it is on screen (Home, the bubble or the slot), never under Reduced
+    /// motion.
+    fn timer_pulsing(&self) -> bool {
+        let home = self.state == NotchState::Expanded
+            && self.space == OecaSpace::Home
+            && !self.settings_open;
+        let on_screen =
+            home || self.bubble_presence.level() > 0.0 || self.slot_presence.level() > 0.0;
+        on_screen
+            && self.motion_enabled()
+            && self
+                .timer
+                .done_for(std::time::Instant::now())
+                .is_some_and(crate::timer::pulsing)
+    }
+
+    /// Something of the timer still moves (bubble, slot, done pulse).
+    fn timer_animating(&self) -> bool {
+        self.bubble_presence.is_animating()
+            || self.slot_presence.is_animating()
+            || self.timer_pulsing()
+    }
+
+    /// Mirrors the countdown (and its slot / pulse) into the renderer; the
+    /// collapsed presentations keep the countdown they last showed.
+    fn push_timer_view(&mut self) {
+        if self.timer.shows_collapsed() {
+            self.timer_shown = self.timer;
+        }
+        let pulse = if self.motion_enabled() {
+            self.timer
+                .done_for(std::time::Instant::now())
+                .map_or(1.0, crate::timer::done_pulse)
+        } else {
+            1.0
+        };
+        self.renderer.set_timer(crate::renderer::TimerView {
+            countdown: self.timer,
+            collapsed: self.timer_shown,
+            slot: self.slot_presence.level(),
+            pulse,
+        });
+    }
+
+    /// Aims the collapsed presentations at what the countdown, the notch and
+    /// playback now call for (bubble during playback, else the slot; only
+    /// while collapsed, i.e. once a collapse's own content fades in), and
+    /// starts frames if they move. Cheap: called on every notch frame.
+    fn refresh_timer_presence(&mut self, hwnd: HWND) {
+        let collapsed = match &self.animation {
+            None => self.state == NotchState::Collapsed,
+            Some(a) => a.target_state == NotchState::Collapsed && a.collapsed_alpha > 0.0,
+        };
+        let playing = self
+            .media_content
+            .as_ref()
+            .is_some_and(|c| crate::media::shows_visualizer(c.playback));
+        let running = matches!(self.timer.phase(), Phase::Running { .. });
+        let (bubble, slot) = crate::timer::collapsed_targets(
+            running,
+            self.timer.shows_collapsed(),
+            collapsed,
+            playing,
+        );
+        let instant = !self.motion_enabled();
+        self.bubble_presence.set(bubble, instant);
+        self.slot_presence.set(slot, instant);
+        self.push_timer_view();
+        self.kick_feedback(hwnd);
+        self.update_bubble(hwnd);
+    }
+
+    /// Draws the bubble where the notch's right edge is now (shown on first
+    /// need, hidden once fully gone). Never activated, never hit.
+    fn update_bubble(&mut self, hwnd: HWND) {
+        let p = self.bubble_presence.level();
+        if p <= 0.0 && !self.bubble_presence.is_animating() {
+            if std::mem::take(&mut self.bubble_shown)
+                && let Some(bubble) = self.bubble
+            {
+                unsafe {
+                    let _ = ShowWindow(bubble, SW_HIDE);
+                }
+            }
+            return;
+        }
+        if self.bubble.is_none() {
+            self.bubble = create_bubble(hwnd);
+        }
+        let Some(bubble) = self.bubble else {
+            return;
+        };
+        // The notch body's right edge (past its top shoulder)
+        let right = self.pos_x + self.dimensions.width
+            - (self.dimensions.shadow_margin_x + self.dimensions.curvature.top_transition_radius)
+                .round() as i32;
+        let _ = self
+            .renderer
+            .render_bubble(bubble, right, self.pos_y, self.dimensions.dpi, p);
+        if !self.bubble_shown {
+            self.bubble_shown = true;
+            let (after, flags) = z_order(self.settings.always_on_top);
+            unsafe {
+                let _ = SetWindowPos(
+                    bubble,
+                    after,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | flags,
+                );
+            }
+            // Its ring now sets the pace of the countdown's wake-ups
+            self.arm_timer_tick(hwnd);
+        }
+    }
+
+    /// (Re)arms the countdown's one wake-up: when its displayed second next
+    /// changes, or when a finished one's hold ends; none otherwise.
+    fn arm_timer_tick(&mut self, hwnd: HWND) {
+        let mut wake = self.timer.next_wake(std::time::Instant::now());
+        // The bubble's ring depletes smoothly: often enough while it shows
+        if self.bubble_shown && matches!(self.timer.phase(), Phase::Running { .. }) {
+            let ring = crate::layout::timer_bubble_geometry(self.dimensions.dpi, 1.0)
+                .ring
+                .0;
+            let step = crate::timer::ring_step_ms(self.timer.duration().as_millis() as u64, ring);
+            wake = wake.map(|w| w.min(std::time::Duration::from_millis(step)));
+        }
+        match wake {
+            Some(wait) => unsafe {
+                let ms = u32::try_from(wait.as_millis()).unwrap_or(u32::MAX).max(1);
+                let _ = SetTimer(Some(hwnd), TIMER_TICK_TIMER_ID, ms, None);
+            },
+            None => unsafe {
+                let _ = KillTimer(Some(hwnd), TIMER_TICK_TIMER_ID);
+            },
+        }
+    }
+
+    /// After the countdown's phase changed: re-arm its wake-up, re-aim the
+    /// collapsed presentations, redraw, and announce the new state.
+    fn timer_changed(&mut self, hwnd: HWND) {
+        self.arm_timer_tick(hwnd);
+        self.refresh_timer_presence(hwnd);
+        self.redraw(hwnd);
+        notify_accessibility_state_changed(
+            hwnd,
+            self.state,
+            self.clock.state(),
+            self.media_content.as_ref(),
+            self.space,
+            &self.clipboard,
+            self.clear_pending,
+            self.settings_title(),
+            self.timer_title().as_deref(),
+        );
+    }
+
+    /// The timer's wake-up: completes / dismisses through the countdown's
+    /// own deadline (a stale wake-up changes nothing), else shows the new
+    /// second.
+    fn on_timer_tick(&mut self, hwnd: HWND) {
+        if self.timer.poll(std::time::Instant::now()).is_some() {
+            self.timer_changed(hwnd);
+            return;
+        }
+        self.arm_timer_tick(hwnd);
+        self.push_timer_view();
+        self.redraw(hwnd);
+        if self.bubble_shown {
+            self.update_bubble(hwnd);
+        }
+    }
+
+    /// The round primary button: start / pause / resume / restart. Media
+    /// playback is never touched.
+    fn timer_primary(&mut self, hwnd: HWND) {
+        if self.timer.primary(std::time::Instant::now()) {
+            self.timer_changed(hwnd);
+        }
+    }
+
+    /// Cancel: back to the idle setup (the duration is kept).
+    fn timer_cancel(&mut self, hwnd: HWND) {
+        if self.timer.cancel() {
+            self.timer_changed(hwnd);
+        }
+    }
+
+    /// The scale under the pointer (setup only): the nearest stop.
+    fn drag_timer_to(&mut self, hwnd: HWND, lparam: LPARAM) {
+        let x = (lparam.0 & 0xFFFF) as i16 as f32;
+        let Some(l) = self.timer_layout() else {
+            return;
+        };
+        if self.timer.set_stop(l.stop_at(x, crate::timer::STOPS.len())) {
+            self.push_timer_view();
+            self.redraw(hwnd);
+        }
+    }
+
+    /// A drag along the scale ended: announce the chosen duration once.
+    fn end_timer_drag(&mut self, hwnd: HWND) {
+        self.timer_drag = false;
+        self.announce_timer(hwnd);
+    }
+
+    /// Refreshes the accessible title for a new timer duration.
+    fn announce_timer(&self, hwnd: HWND) {
+        notify_accessibility_clock_changed(
+            hwnd,
+            self.state,
+            self.clock.state(),
+            self.media_content.as_ref(),
+            self.space,
+            &self.clipboard,
+            self.clear_pending,
+            self.settings_title(),
+            self.timer_title().as_deref(),
+        );
+    }
+
+    /// The timer's part of the accessible title: on the expanded Home, its
+    /// state and controls; on the collapsed notch, a running or finished
+    /// countdown. Elsewhere nothing.
+    fn timer_title(&self) -> Option<String> {
+        use crate::timer::describe;
+        let now = std::time::Instant::now();
+        let t = &self.timer;
+        let home = self.state == NotchState::Expanded
+            && self.space == OecaSpace::Home
+            && !self.settings_open;
+        if home {
+            return Some(match t.phase() {
+                Phase::Idle => format!(
+                    "Timer, {} - Start button, duration scale",
+                    describe(t.duration().as_secs(), true)
+                ),
+                Phase::Running { .. } => format!(
+                    "Timer running, set for {} - Pause button, Cancel button",
+                    describe(t.duration().as_secs(), true)
+                ),
+                Phase::Paused { .. } => format!(
+                    "Timer paused, {} left - Resume button, Cancel button",
+                    describe(t.display_secs(now), true)
+                ),
+                Phase::Done { .. } => "Timer done - Restart button, Cancel button".to_string(),
+            });
+        }
+        if self.state == NotchState::Collapsed && t.shows_collapsed() {
+            return Some(
+                match t.phase() {
+                    Phase::Done { .. } => "Timer done",
+                    _ => "Timer running",
+                }
+                .to_string(),
+            );
+        }
+        None
     }
 
     /// Transport control under a client-area point (only when media UI is visible).
@@ -797,7 +1223,7 @@ impl WindowState {
 
 /// The Clipboard space's clear flow. Clear: asks first when `confirm` is on
 /// (sets `pending`), otherwise forgets the history at once. Cancel: dismisses,
-/// history untouched. Confirmed Clear: forgets it. Only Nott's in-memory
+/// history untouched. Confirmed Clear: forgets it. Only Oeca's in-memory
 /// history changes; the system clipboard is never touched.
 fn clear_flow(hit: PanelHit, confirm: bool, pending: &mut bool, history: &mut ClipboardHistory) {
     match hit {
@@ -812,8 +1238,8 @@ fn clear_flow(hit: PanelHit, confirm: bool, pending: &mut bool, history: &mut Cl
 }
 
 /// Outside-click auto-collapse. The expanded notch stays open until a click
-/// lands outside Nott; that starts a grace period (`AUTO_COLLAPSE_MS`), and a
-/// later outside click restarts it. Using Nott (a click in the notch, a drag
+/// lands outside Oeca; that starts a grace period (`AUTO_COLLAPSE_MS`), and a
+/// later outside click restarts it. Using Oeca (a click in the notch, a drag
 /// onto it, the Settings window) cancels it; so does any expand / collapse.
 /// When it runs out the notch collapses through the normal path.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -824,7 +1250,7 @@ pub struct GracePeriod {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraceEvent {
     OutsideClick,
-    NottInteraction,
+    OecaInteraction,
     StateChanged,
     TimerFired,
     /// The closing delay setting changed.
@@ -850,7 +1276,7 @@ impl GracePeriod {
                 GraceAction::Arm
             }
             GraceEvent::OutsideClick => GraceAction::None,
-            GraceEvent::NottInteraction | GraceEvent::StateChanged => {
+            GraceEvent::OecaInteraction | GraceEvent::StateChanged => {
                 if std::mem::take(&mut self.pending) {
                     GraceAction::Disarm
                 } else {
@@ -880,7 +1306,7 @@ impl GracePeriod {
 impl GraceEvent {
     const ALL: [Self; 5] = [
         Self::OutsideClick,
-        Self::NottInteraction,
+        Self::OecaInteraction,
         Self::StateChanged,
         Self::TimerFired,
         Self::DelayChanged,
@@ -891,18 +1317,36 @@ impl GraceEvent {
 /// Settings window, or the timer) so it is applied through the state guard.
 pub const WM_APP_GRACE: u32 = WM_APP + 40;
 
+/// Posted when the countdown's wake-up fires (see `TIMER_TICK_TIMER_ID`).
+const WM_APP_TIMER_TICK: u32 = WM_APP + 41;
+
 /// Whose a click is, by the top-level window under it: the notch itself
-/// (handled by its own mouse messages), Nott's Settings window (Nott in use),
+/// (handled by its own mouse messages), Oeca's Settings window (Oeca in use),
 /// or anything else (outside). The notch's transparent margins pass clicks
 /// through, so they count as outside.
 fn classify_click(root: HWND, notch: HWND, settings: Option<HWND>) -> Option<GraceEvent> {
     if root == notch {
         None
     } else if Some(root) == settings {
-        Some(GraceEvent::NottInteraction)
+        Some(GraceEvent::OecaInteraction)
     } else {
         Some(GraceEvent::OutsideClick)
     }
+}
+
+/// Whether the notch's own gesture (a scrub, a drag on the timer's scale)
+/// is in progress: it holds the mouse capture, so every button event belongs
+/// to that gesture and none can count as an outside click.
+fn gesture_owns_buttons(capture: HWND, notch: HWND) -> bool {
+    !capture.is_invalid() && capture == notch
+}
+
+/// Where a scrub released at `fraction` of the track seeks to (ms), for a
+/// track `duration_ms` long: always inside the track, however far past its
+/// ends the pointer was let go.
+fn scrub_position(fraction: f32, duration_ms: i64) -> i64 {
+    ((f64::from(fraction.clamp(0.0, 1.0)) * duration_ms as f64).round() as i64)
+        .clamp(0, duration_ms.max(0))
 }
 
 /// Registers (`on`) or removes this process's Raw Input mouse sink: button
@@ -990,8 +1434,8 @@ pub(crate) fn is_client_animation_enabled() -> bool {
 
 /// Accessible description of the space selector, e.g. "Home space selected
 /// (spaces: Home, Music, Clipboard)".
-fn accessible_space(space: NottSpace) -> String {
-    let all: Vec<&str> = NottSpace::ALL.iter().map(|s| s.label()).collect();
+fn accessible_space(space: OecaSpace) -> String {
+    let all: Vec<&str> = OecaSpace::ALL.iter().map(|s| s.label()).collect();
     format!(
         "{} space selected (spaces: {})",
         space.label(),
@@ -1001,7 +1445,7 @@ fn accessible_space(space: NottSpace) -> String {
 
 /// The clear confirmation's accessible text: its message, then its two
 /// buttons by name (Cancel first).
-const CLEAR_CONFIRM_ACCESSIBLE: &str = "Clear clipboard history? Only Nott's history is removed, the Windows clipboard is not changed - Cancel button - Clear button";
+const CLEAR_CONFIRM_ACCESSIBLE: &str = "Clear clipboard history? Only Oeca's history is removed, the Windows clipboard is not changed - Cancel button - Clear button";
 
 /// Accessible title including the Clipboard space: there it describes the
 /// history (count, newest entry's kind, the Clear control), never contents.
@@ -1009,10 +1453,10 @@ fn accessible_title(
     state: NotchState,
     clock: &crate::clock::ClockDateState,
     media: Option<&MediaContent>,
-    space: NottSpace,
+    space: OecaSpace,
     clipboard: &ClipboardHistory,
     clear_pending: bool,
-    settings: Option<NottSettings>,
+    settings: Option<OecaSettings>,
 ) -> String {
     if let (NotchState::Expanded, Some(s)) = (state, settings) {
         let enabled = |on| if on { "enabled" } else { "disabled" };
@@ -1028,7 +1472,7 @@ fn accessible_title(
             accessible_space(space)
         );
     }
-    if state != NotchState::Expanded || space != NottSpace::Clipboard {
+    if state != NotchState::Expanded || space != OecaSpace::Clipboard {
         return accessible_title_for_clock(state, clock, media, space);
     }
     let history = match (clipboard.len(), clipboard.get(0)) {
@@ -1058,7 +1502,7 @@ fn accessible_title_for_clock(
     state: NotchState,
     clock: &crate::clock::ClockDateState,
     media: Option<&MediaContent>,
-    space: NottSpace,
+    space: OecaSpace,
 ) -> String {
     match (state, media) {
         (NotchState::Collapsed, _) => clock.formatted_time.clone(),
@@ -1081,6 +1525,14 @@ fn accessible_title_for_clock(
     }
 }
 
+/// The title with the timer's part (if any) after it.
+fn with_timer(title: String, timer: Option<&str>) -> String {
+    match timer {
+        Some(t) => format!("{title} - {t}"),
+        None => title,
+    }
+}
+
 /// Notifies Windows accessibility clients (screen readers, UI Automation bridge)
 /// of a settled state change and updates the top-level window title.
 #[allow(clippy::too_many_arguments)]
@@ -1089,19 +1541,23 @@ fn notify_accessibility_state_changed(
     new_state: NotchState,
     clock: &crate::clock::ClockDateState,
     media: Option<&MediaContent>,
-    space: NottSpace,
+    space: OecaSpace,
     clipboard: &ClipboardHistory,
     clear_pending: bool,
-    settings: Option<NottSettings>,
+    settings: Option<OecaSettings>,
+    timer: Option<&str>,
 ) {
-    let title = accessible_title(
-        new_state,
-        clock,
-        media,
-        space,
-        clipboard,
-        clear_pending,
-        settings,
+    let title = with_timer(
+        accessible_title(
+            new_state,
+            clock,
+            media,
+            space,
+            clipboard,
+            clear_pending,
+            settings,
+        ),
+        timer,
     );
     let wide_title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
@@ -1118,19 +1574,23 @@ fn notify_accessibility_clock_changed(
     state: NotchState,
     clock: &crate::clock::ClockDateState,
     media: Option<&MediaContent>,
-    space: NottSpace,
+    space: OecaSpace,
     clipboard: &ClipboardHistory,
     clear_pending: bool,
-    settings: Option<NottSettings>,
+    settings: Option<OecaSettings>,
+    timer: Option<&str>,
 ) {
-    let title = accessible_title(
-        state,
-        clock,
-        media,
-        space,
-        clipboard,
-        clear_pending,
-        settings,
+    let title = with_timer(
+        accessible_title(
+            state,
+            clock,
+            media,
+            space,
+            clipboard,
+            clear_pending,
+            settings,
+        ),
+        timer,
     );
     let wide_title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
@@ -1153,6 +1613,8 @@ fn start_or_reverse_animation(hwnd: HWND, state: &mut WindowState) -> Result<()>
             NotchState::Expanded => NotchState::Collapsed,
         }
     };
+    // A scrub in progress ends without seeking
+    state.end_scrub(hwnd, false);
     // Collapsing closes the Settings page; the next expansion shows the space
     if target_state == NotchState::Collapsed && state.settings_open {
         state.settings_open = false;
@@ -1242,7 +1704,10 @@ fn start_or_reverse_animation(hwnd: HWND, state: &mut WindowState) -> Result<()>
             &state.clipboard,
             state.clear_pending,
             state.settings_title(),
+            state.timer_title().as_deref(),
         );
+        // The countdown's collapsed presentations follow at once
+        state.refresh_timer_presence(hwnd);
         return Ok(());
     }
 
@@ -1278,6 +1743,9 @@ fn start_or_reverse_animation(hwnd: HWND, state: &mut WindowState) -> Result<()>
             None,
         );
     }
+    // Expanding: the bubble / slot leave at once; collapsing: they follow
+    // once the collapsed content fades in (re-aimed on every frame)
+    state.refresh_timer_presence(hwnd);
     Ok(())
 }
 
@@ -1349,6 +1817,7 @@ fn set_notch_state(hwnd: HWND, state: &mut WindowState, new_state: NotchState) -
         &state.clipboard,
         state.clear_pending,
         state.settings_title(),
+        state.timer_title().as_deref(),
     );
     Ok(())
 }
@@ -1545,7 +2014,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_INPUT => {
             // Read now: the raw handle is only valid while this message is
             // handled. Only button presses outside the notch matter.
-            if raw_button_down(lparam) {
+            // While the notch holds the mouse capture (a scrub or a drag on
+            // the timer's scale), every button belongs to that gesture: none
+            // is an outside click
+            if !gesture_owns_buttons(unsafe { GetCapture() }, hwnd) && raw_button_down(lparam) {
                 let mut pt = POINT::default();
                 let event = unsafe { GetCursorPos(&mut pt) }.ok().and_then(|()| {
                     let under = unsafe { WindowFromPoint(pt) };
@@ -1577,6 +2049,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
 
+        WM_APP_TIMER_TICK => {
+            with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                state.on_timer_tick(hwnd);
+            });
+            LRESULT(0)
+        }
+
+        WM_MOUSEWHEEL => {
+            // Over the timer during setup: one stop per notch of the wheel
+            with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
+                let mut pt = POINT {
+                    x: (lparam.0 & 0xFFFF) as i16 as i32,
+                    y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+                };
+                unsafe {
+                    let _ = ScreenToClient(hwnd, &mut pt);
+                }
+                let over = state
+                    .timer_layout()
+                    .is_some_and(|l| l.panel.contains(pt.x as f32, pt.y as f32));
+                if over && delta != 0 && state.timer.step_stop(delta.signum().into()) {
+                    state.push_timer_view();
+                    state.redraw(hwnd);
+                    state.announce_timer(hwnd);
+                }
+            });
+            LRESULT(0)
+        }
+
         WM_APP_GRACE => {
             with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
                 if let Some(event) = GraceEvent::ALL.get(wparam.0) {
@@ -1598,6 +2100,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         WPARAM(GraceEvent::TimerFired as usize),
                         LPARAM(0),
                     );
+                }
+                return LRESULT(0);
+            }
+            if wparam.0 == TIMER_TICK_TIMER_ID {
+                // Applied as a message so a busy state replays it (timer
+                // messages would be dropped); re-armed by its handler
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), TIMER_TICK_TIMER_ID);
+                    let _ = PostMessageW(Some(hwnd), WM_APP_TIMER_TICK, WPARAM(0), LPARAM(0));
                 }
                 return LRESULT(0);
             }
@@ -1639,6 +2150,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         state.hovered,
                         state.clock.state(),
                     );
+                    // The bubble rides the notch's edge; collapsed
+                    // presentations follow the collapsed content's fade
+                    state.refresh_timer_presence(hwnd);
 
                     if !still_active {
                         // Animation complete: snap cleanly to target state and deactivate timer
@@ -1669,6 +2183,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 &state.clipboard,
                                 state.clear_pending,
                                 state.settings_title(),
+                                state.timer_title().as_deref(),
                             );
                         }
                         state.last_frame_time = None;
@@ -1727,6 +2242,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         );
                         // Settled somewhere showing a visualizer/scrubber again
                         state.kick_live(hwnd);
+                        state.refresh_timer_presence(hwnd);
                     }
                 });
             } else if wparam.0 == MEDIA_FEEDBACK_TIMER_ID {
@@ -1742,8 +2258,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // this timer (both step every tick)
                     let feedback = state.renderer.feedback().step(dt);
                     let switches = state.renderer.step_switches(dt);
-                    let animating = feedback || switches;
+                    // ...transport glyphs and the artwork turn...
+                    let media = state.renderer.step_media_motion(dt);
+                    // ...and the countdown's bubble / slot / done pulse
+                    state
+                        .bubble_presence
+                        .step_on(dt, crate::timer::ABSORB_SPRING);
+                    state.slot_presence.step(dt);
+                    state.push_timer_view();
+                    let animating = feedback || switches || media || state.timer_animating();
                     state.redraw(hwnd);
+                    state.update_bubble(hwnd);
                     if !animating {
                         state.feedback_tick = None;
                         unsafe {
@@ -1815,6 +2340,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             &state.clipboard,
                             state.clear_pending,
                             state.settings_title(),
+                            state.timer_title().as_deref(),
                         );
                         if state.animation.is_none() {
                             let _ = state.renderer.render(
@@ -1838,6 +2364,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
         WM_MOUSEMOVE => {
             with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                if state.timer_drag {
+                    state.drag_timer_to(hwnd, lparam);
+                }
+                if state.scrub.is_some() {
+                    state.move_scrub(hwnd, lparam);
+                }
                 if !state.hovered {
                     state.hovered = true;
                     let mut tme = TRACKMOUSEEVENT {
@@ -1875,7 +2407,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     | PanelHit::Settings
                     | PanelHit::AlwaysOnTop
                     | PanelHit::ReducedMotion
-                    | PanelHit::FullSettings => None,
+                    | PanelHit::FullSettings
+                    | PanelHit::TimerPrimary
+                    | PanelHit::TimerCancel
+                    | PanelHit::TimerScale => None,
                 });
                 let changed = {
                     let mut feedback = state.renderer.feedback();
@@ -1920,7 +2455,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
             // Using the notch: a pending auto-collapse is cancelled
             with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
-                state.grace(hwnd, GraceEvent::NottInteraction);
+                state.grace(hwnd, GraceEvent::OecaInteraction);
             });
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
@@ -1929,8 +2464,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
                 // Cancel a pending auto-collapse first, then the click as
                 // always (a collapsing click still collapses)
-                state.grace(hwnd, GraceEvent::NottInteraction);
-                if let Some(control) = state.media_control_at(lparam) {
+                state.grace(hwnd, GraceEvent::OecaInteraction);
+                if let Some(f) = state.scrub_at(lparam) {
+                    // The scrubber: jump there, then follow the drag
+                    state.begin_scrub(hwnd, f);
+                } else if let Some(control) = state.media_control_at(lparam) {
                     // Tactile compression; capture so the release is always seen
                     state.renderer.feedback().press(control);
                     unsafe {
@@ -1938,6 +2476,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                     // Press compresses smoothly on the shared feedback timer
                     state.kick_feedback(hwnd);
+                } else if state.panel_hit(lparam) == Some(PanelHit::TimerScale) {
+                    // The timer's scale: jump to the stop, then follow the drag
+                    state.timer_drag = true;
+                    unsafe {
+                        SetCapture(hwnd);
+                    }
+                    state.drag_timer_to(hwnd, lparam);
                 } else if let Some(button) = state.panel_hit(lparam).filter(|h| h.is_button()) {
                     // Clipboard icon button: grows a little more while pressed
                     state.renderer.feedback().press_clip(button);
@@ -1953,6 +2498,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if state.renderer.feedback().release_clip() {
                     state.kick_feedback(hwnd);
                 }
+                // A scrub ends: seek where it was released (inside the
+                // track or not); never toggles the notch
+                if state.scrub.is_some() {
+                    state.end_scrub(hwnd, true);
+                    return;
+                }
+                // A drag along the timer's scale ends (never toggles the notch)
+                if state.timer_drag {
+                    state.end_timer_drag(hwnd);
+                    unsafe {
+                        let _ = ReleaseCapture();
+                    }
+                    return;
+                }
                 let pressed = state.renderer.feedback().release();
                 if let Some(pressed) = pressed {
                     unsafe {
@@ -1960,14 +2519,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                     // Press started on a control: never toggles the notch. The command
                     // fires only if released over the same control.
-                    if state.media_control_at(lparam) == Some(pressed) {
-                        state.media.send_command(pressed);
+                    if state.media_control_at(lparam) == Some(pressed)
+                        && state.media.send_command(pressed)
+                    {
+                        state.control_clicked(hwnd, pressed);
                     }
                     state.kick_feedback(hwnd);
                 } else if let Some(control) = state.media_control_at(lparam) {
                     // Transport control: send to the current session; never toggles the notch.
                     // Resulting playback/metadata state arrives through media events.
-                    state.media.send_command(control);
+                    if state.media.send_command(control) {
+                        state.control_clicked(hwnd, control);
+                    }
+                } else if state.scrub_at(lparam).is_some() {
+                    // On the scrubber of an app that does not allow seeking:
+                    // still not a click on the notch's background
                 } else if let Some(hit) = state.panel_hit(lparam) {
                     // Settings icon: open / close the page. Switch: apply
                     // Always on top. Clipboard row: back onto the system
@@ -1991,6 +2557,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             state.open_full_settings(hwnd);
                             return;
                         }
+                        PanelHit::TimerPrimary => {
+                            state.timer_primary(hwnd);
+                            return;
+                        }
+                        PanelHit::TimerCancel => {
+                            state.timer_cancel(hwnd);
+                            return;
+                        }
+                        PanelHit::TimerScale => return,
                         PanelHit::Row(index) | PanelHit::Copy(index) => {
                             // Clipboard busy: nothing changes; no retry
                             let _ = state.restore_clipboard(hwnd, index);
@@ -2024,6 +2599,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_CAPTURECHANGED => {
             // Capture lost mid-press (e.g. another window took it): cancel the press
             with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                if state.timer_drag {
+                    state.end_timer_drag(hwnd);
+                }
+                // A scrub whose capture was taken away seeks nowhere
+                state.end_scrub(hwnd, false);
                 let cancelled = state.renderer.feedback().release().is_some();
                 if cancelled {
                     state.kick_feedback(hwnd);
@@ -2080,6 +2660,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 | SWP_SHOWWINDOW
                                 | z_order(state.settings.always_on_top).1,
                         );
+                        // The countdown bubble follows the notch's new size
+                        state.update_bubble(hwnd);
                     }
                 }
             });
@@ -2123,6 +2705,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 | SWP_SHOWWINDOW
                                 | z_order(state.settings.always_on_top).1,
                         );
+                        // The countdown bubble follows the notch's new size
+                        state.update_bubble(hwnd);
                     }
                 }
             });
@@ -2142,6 +2726,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         &state.clipboard,
                         state.clear_pending,
                         state.settings_title(),
+                        state.timer_title().as_deref(),
                     );
                     if state.animation.is_none() {
                         let _ = state.renderer.render(
@@ -2177,6 +2762,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             &state.clipboard,
                             state.clear_pending,
                             state.settings_title(),
+                            state.timer_title().as_deref(),
                         );
                         if state.animation.is_none() {
                             let _ = state.renderer.render(
@@ -2193,6 +2779,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     unsafe {
                         let _ = SetTimer(Some(hwnd), CLOCK_TIMER_ID, next_ms, None);
                     }
+                    // A countdown that ran out while asleep finishes now
+                    state.on_timer_tick(hwnd);
                     // Media sessions may have changed while asleep: re-query once
                     // through the normal event messages (generation-protected).
                     for media_msg in [
@@ -2221,10 +2809,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             c.as_ref().map(|c| (c.accessible_text(), c.icon))
                         };
                         let a11y_changed = spoken(&content) != spoken(&state.media_content);
+                        let app =
+                            |c: &Option<MediaContent>| c.as_ref().map(|c| c.source.app_id.clone());
+                        if app(&content) != app(&state.media_content) {
+                            state.end_scrub(hwnd, false);
+                        }
                         state.media_content = content;
                         let changed = state.renderer.set_media(state.media_content.as_ref());
                         // Play/pause starts the visualizer fade in either notch state
                         state.kick_live(hwnd);
+                        // ...and moves a collapsed countdown between the
+                        // bubble and the visualizer's slot (never resets it)
+                        state.refresh_timer_presence(hwnd);
                         // Media is only visible in the settled expanded state; an in-flight
                         // animation picks the new content up on its next frame.
                         let visible =
@@ -2234,8 +2830,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             // A new track fades in on the shared feedback timer
                             state.kick_feedback(hwnd);
                         } else if !visible {
-                            // Off-screen track changes never run a fade
+                            // Off-screen track changes never run a fade (nor
+                            // a glyph morph or an artwork turn)
                             state.renderer.feedback().finish_track_fade();
+                            state.renderer.settle_media_motion();
+                        }
+                        // The collapsed notch's album art: fades on the
+                        // feedback timer where that notch shows, else
+                        // settles so it never reappears mid-fade
+                        if state.state == NotchState::Collapsed || state.animation.is_some() {
+                            if changed {
+                                state.redraw(hwnd);
+                                state.kick_feedback(hwnd);
+                            }
+                        } else {
+                            state.renderer.settle_collapsed_art();
+                        }
+                        // A scrub ends (unsought) if its timeline went away
+                        // or another app's session took over
+                        if state.scrub.is_some() && state.scrub_track().is_none() {
+                            state.end_scrub(hwnd, false);
                         }
                         if a11y_changed
                             && state.state == NotchState::Expanded
@@ -2250,6 +2864,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 &state.clipboard,
                                 state.clear_pending,
                                 state.settings_title(),
+                                state.timer_title().as_deref(),
                             );
                         }
                     }
@@ -2276,7 +2891,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
 
         WM_CLIPBOARDUPDATE => {
-            // Nott's own restore: the history already holds (and fronts) it.
+            // Oeca's own restore: the history already holds (and fronts) it.
             // Otherwise read once the copying app has settled (one-shot timer;
             // re-arming coalesces a burst of updates into a single read).
             if !clipboard::owned_by(hwnd) {
@@ -2318,7 +2933,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
 
         WM_DESTROY => {
-            // The Settings window shuts down with Nott
+            // The Settings window shuts down with Oeca
             settings_window::close();
             unsafe {
                 let _ = KillTimer(Some(hwnd), ANIMATION_TIMER_ID);
@@ -2327,6 +2942,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = KillTimer(Some(hwnd), MEDIA_LIVE_TIMER_ID);
                 let _ = KillTimer(Some(hwnd), CLIPBOARD_TIMER_ID);
                 let _ = KillTimer(Some(hwnd), AUTO_COLLAPSE_TIMER_ID);
+                let _ = KillTimer(Some(hwnd), TIMER_TICK_TIMER_ID);
                 PostQuitMessage(0);
             }
             // Stop reporting outside clicks (no-op if never registered)
@@ -2338,11 +2954,70 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             // Release a resolution request still held by an in-flight animation
             // (if the state is busy, HighResTimer's Drop releases it on free).
-            let _ = with_state(hwnd, |state| state.high_res_timer.set(false));
+            // The countdown bubble goes too (owned by the notch, it would be
+            // destroyed with it anyway)
+            let _ = with_state(hwnd, |state| {
+                state.high_res_timer.set(false);
+                if let Some(bubble) = state.bubble.take() {
+                    unsafe {
+                        let _ = DestroyWindow(bubble);
+                    }
+                }
+            });
             LRESULT(0)
         }
 
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// The countdown bubble's window class: it only shows what the notch renders
+/// into it, so it has no state of its own.
+const BUBBLE_CLASS_NAME: windows::core::PCWSTR = windows::core::w!("OecaTimerBubbleClass");
+
+unsafe extern "system" fn bubble_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        // Click-through and never activated: it must never take input
+        WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// Creates the (hidden) countdown bubble: a layered, click-through popup
+/// that never activates, owned by the notch so it can never outlive it.
+fn create_bubble(owner: HWND) -> Option<HWND> {
+    unsafe {
+        let hinstance = GetModuleHandleW(None).ok()?;
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(bubble_wndproc),
+            hInstance: hinstance.into(),
+            lpszClassName: BUBBLE_CLASS_NAME,
+            ..Default::default()
+        };
+        // Already registered (an earlier bubble): fails harmlessly
+        let _ = RegisterClassExW(&wc);
+        CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            BUBBLE_CLASS_NAME,
+            windows::core::w!("Oeca timer"),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            Some(owner),
+            None,
+            Some(hinstance.into()),
+            None,
+        )
+        .ok()
     }
 }
 
@@ -2358,7 +3033,7 @@ fn handle_drag(hwnd: HWND, event: DragEvent) -> bool {
 
 pub fn run() -> Result<()> {
     // OLE drag-and-drop needs this (UI) thread in a single-threaded apartment.
-    // Failure is non-fatal: Nott simply runs without being a drop target.
+    // Failure is non-fatal: Oeca simply runs without being a drop target.
     let ole = unsafe { OleInitialize(None) }.is_ok();
     let result = run_window(ole);
     if ole {
@@ -2457,7 +3132,7 @@ fn run_window(ole: bool) -> Result<()> {
         let rollover_ms = clock.ms_until_next_minute();
 
         let initial_title =
-            accessible_title_for_clock(dimensions.state, clock.state(), None, NottSpace::default());
+            accessible_title_for_clock(dimensions.state, clock.state(), None, OecaSpace::default());
         let title_wide: Vec<u16> = initial_title
             .encode_utf16()
             .chain(std::iter::once(0))
@@ -2477,17 +3152,25 @@ fn run_window(ole: bool) -> Result<()> {
             clock,
             media: MediaEngine::new(),
             media_content: None,
-            space: NottSpace::default(),
+            space: OecaSpace::default(),
             feedback_tick: None,
             live_tick: None,
             live_ms: MEDIA_LIVE_FRAME_MS,
             clipboard: ClipboardHistory::default(),
             drag: DragSession::default(),
-            settings: NottSettings::default(),
+            settings: OecaSettings::default(),
             settings_open: false,
             clear_pending: false,
             grace: GracePeriod::default(),
             outside_watch: false,
+            timer: Countdown::default(),
+            bubble_presence: Presence::default(),
+            slot_presence: Presence::default(),
+            bubble: None,
+            bubble_shown: false,
+            timer_drag: false,
+            timer_shown: Countdown::default(),
+            scrub: None,
         });
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
 
@@ -2543,8 +3226,9 @@ fn run_window(ole: bool) -> Result<()> {
             DispatchMessageW(&msg);
         };
 
-        // Clean up registered window class
+        // Clean up registered window classes
         let _ = UnregisterClassW(WINDOW_CLASS_NAME, Some(hinstance.into()));
+        let _ = UnregisterClassW(BUBBLE_CLASS_NAME, Some(hinstance.into()));
 
         loop_result
     }
@@ -2675,7 +3359,7 @@ mod tests {
             crate::clock::ClockDateState::from_pure_components(2026, 10, 6, 2, 0, 47, 0, 0, false);
         let time = clock.formatted_time.clone();
         let date = clock.formatted_date.clone();
-        let home = NottSpace::Home;
+        let home = OecaSpace::Home;
         let playing = MediaContent {
             title: "Song".into(),
             subtitle: "Artist".into(),
@@ -2697,7 +3381,7 @@ mod tests {
                 .contains("Previous track, Play, Next track")
         );
         // Collapsed title is unchanged (no selector there)
-        for space in NottSpace::ALL {
+        for space in OecaSpace::ALL {
             assert_eq!(
                 accessible_title_for_clock(NotchState::Collapsed, &clock, Some(&playing), space),
                 time
@@ -2725,7 +3409,7 @@ mod tests {
                 state,
                 &clock,
                 Some(&media),
-                NottSpace::Clipboard,
+                OecaSpace::Clipboard,
                 h,
                 false,
                 None,
@@ -2756,7 +3440,7 @@ mod tests {
             NotchState::Expanded,
             &clock,
             Some(&media),
-            NottSpace::Clipboard,
+            OecaSpace::Clipboard,
             &history,
             true,
             None,
@@ -2766,7 +3450,7 @@ mod tests {
         assert!(!confirming.contains("secret"));
         // Collapsed and the other spaces are unchanged
         assert_eq!(title(&history, NotchState::Collapsed), time);
-        for s in [NottSpace::Home, NottSpace::Music] {
+        for s in [OecaSpace::Home, OecaSpace::Music] {
             assert_eq!(
                 accessible_title(
                     NotchState::Expanded,
@@ -2784,10 +3468,10 @@ mod tests {
 
     #[test]
     fn test_always_on_top_defaults_on_and_maps_to_z_order() {
-        let mut settings = NottSettings::default();
+        let mut settings = OecaSettings::default();
         assert!(
             settings.always_on_top,
-            "Nott starts topmost, as it always has"
+            "Oeca starts topmost, as it always has"
         );
         // Routine moves keep the band: topmost re-asserted, or z-order untouched
         assert_eq!(z_order(true), (Some(HWND_TOPMOST), SET_WINDOW_POS_FLAGS(0)));
@@ -2803,7 +3487,7 @@ mod tests {
 
     #[test]
     fn test_reduced_motion_setting_uses_the_snap_path() {
-        let mut settings = NottSettings::default();
+        let mut settings = OecaSettings::default();
         assert!(!settings.reduced_motion, "animations on by default");
         assert!(motion_allowed(settings.reduced_motion, true));
         settings.reduced_motion = !settings.reduced_motion;
@@ -2822,8 +3506,8 @@ mod tests {
     fn test_settings_target_is_the_clipboard_size_from_every_space() {
         use crate::layout::expanded_size_dip;
         for dpi in [96, 120, 144, 192] {
-            let clipboard = expanded_size_dip(NottSpace::Clipboard, dpi);
-            for space in NottSpace::ALL {
+            let clipboard = expanded_size_dip(OecaSpace::Clipboard, dpi);
+            for space in OecaSpace::ALL {
                 let open = Scene::current(false, true, space);
                 assert_eq!(
                     expanded_size_dip(open.size_space(), dpi),
@@ -2840,7 +3524,7 @@ mod tests {
             }
         }
         // Still exactly three product spaces
-        assert_eq!(NottSpace::ALL.len(), 3);
+        assert_eq!(OecaSpace::ALL.len(), 3);
     }
 
     #[test]
@@ -2854,7 +3538,7 @@ mod tests {
             title: "Song".into(),
             ..MediaContent::test_default()
         };
-        for space in NottSpace::ALL {
+        for space in OecaSpace::ALL {
             let t = |always_on_top, reduced_motion| {
                 accessible_title(
                     NotchState::Expanded,
@@ -2863,10 +3547,10 @@ mod tests {
                     space,
                     &history,
                     false,
-                    Some(NottSettings {
+                    Some(OecaSettings {
                         always_on_top,
                         reduced_motion,
-                        ..NottSettings::default()
+                        ..OecaSettings::default()
                     }),
                 )
             };
@@ -2885,10 +3569,10 @@ mod tests {
                 NotchState::Collapsed,
                 &clock,
                 None,
-                NottSpace::Home,
+                OecaSpace::Home,
                 &history,
                 false,
-                Some(NottSettings::default())
+                Some(OecaSettings::default())
             ),
             clock.formatted_time
         );
@@ -2902,16 +3586,16 @@ mod tests {
             title: "Song".into(),
             ..MediaContent::test_default()
         };
-        let mut space = NottSpace::default();
+        let mut space = OecaSpace::default();
         let title = |s| accessible_title_for_clock(NotchState::Expanded, &clock, Some(&media), s);
         assert!(title(space).ends_with("Home space selected (spaces: Home, Music, Clipboard)"));
-        space.switch_to(NottSpace::Music);
+        space.switch_to(OecaSpace::Music);
         assert!(title(space).ends_with("Music space selected (spaces: Home, Music, Clipboard)"));
         // The media part is identical in both spaces
         let media_part = |t: String| t.split(" - Home space").next().unwrap().to_string();
         assert_eq!(
-            media_part(title(NottSpace::Home)),
-            title(NottSpace::Music)
+            media_part(title(OecaSpace::Home)),
+            title(OecaSpace::Music)
                 .split(" - Music space")
                 .next()
                 .unwrap()
@@ -2946,7 +3630,7 @@ mod tests {
         assert!(!pending);
         assert_eq!(history.len(), 2);
         assert_eq!(history.get(0), Some(&ClipboardItem::Text("two".into())));
-        // Ask again, then confirm: Nott's history is gone
+        // Ask again, then confirm: Oeca's history is gone
         clear_flow(PanelHit::Clear, true, &mut pending, &mut history);
         clear_flow(PanelHit::ConfirmClear, true, &mut pending, &mut history);
         assert!(!pending && history.is_empty());
@@ -3021,7 +3705,7 @@ mod tests {
         assert_eq!(g.handle(TimerFired, true), Disarm, "a second fire is stale");
         // A click in the notch (or the Settings window) cancels it first
         g.handle(OutsideClick, true);
-        assert_eq!(g.handle(NottInteraction, true), Disarm);
+        assert_eq!(g.handle(OecaInteraction, true), Disarm);
         assert_eq!(g.handle(TimerFired, true), Disarm, "cancelled: no collapse");
         // An explicit collapse cancels; a stale fire after re-expanding is
         // ignored
@@ -3052,7 +3736,7 @@ mod tests {
         );
         assert_eq!(
             classify_click(settings, notch, Some(settings)),
-            Some(GraceEvent::NottInteraction),
+            Some(GraceEvent::OecaInteraction),
             "using Settings never collapses the notch"
         );
         assert_eq!(
@@ -3111,7 +3795,7 @@ mod tests {
         use crate::config::CollapseDelay;
         use GraceAction::*;
         use GraceEvent::*;
-        assert_eq!(NottSettings::default().collapse_delay, CollapseDelay::Five);
+        assert_eq!(OecaSettings::default().collapse_delay, CollapseDelay::Five);
         assert_eq!(
             CollapseDelay::ALL.map(CollapseDelay::ms),
             [5_000, 10_000, 15_000]
@@ -3129,7 +3813,7 @@ mod tests {
         assert!(g.pending());
         // Later outside clicks restart it; inside clicks / Settings cancel it
         assert_eq!(g.handle(OutsideClick, true), Arm);
-        assert_eq!(g.handle(NottInteraction, true), Disarm);
+        assert_eq!(g.handle(OecaInteraction, true), Disarm);
         assert_eq!(
             g.handle(DelayChanged, true),
             None,
@@ -3139,5 +3823,156 @@ mod tests {
         g.handle(OutsideClick, true);
         assert_eq!(g.handle(StateChanged, false), Disarm);
         assert_eq!(g.handle(TimerFired, false), Disarm, "no late collapse");
+    }
+
+    #[test]
+    fn test_timer_bubble_is_click_through_renders_and_dies_with_the_notch() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GW_OWNER, GWL_EXSTYLE, GetWindow, IsWindow, IsWindowVisible, SendMessageW,
+        };
+        // A stand-in notch (hidden, stateless) owning the bubble
+        let owner = create_bubble(HWND::default()).expect("owner");
+        let bubble = create_bubble(owner).expect("bubble");
+        let renderer = Renderer::new().expect("renderer");
+        let mut countdown = Countdown::default();
+        countdown.primary(std::time::Instant::now());
+        renderer.set_timer(crate::renderer::TimerView {
+            countdown,
+            ..Default::default()
+        });
+        unsafe {
+            assert_eq!(
+                GetWindow(bubble, GW_OWNER).ok(),
+                Some(owner),
+                "owned by the notch"
+            );
+            let ex = GetWindowLongPtrW(bubble, GWL_EXSTYLE) as u32;
+            for flag in [
+                WS_EX_TRANSPARENT,
+                WS_EX_NOACTIVATE,
+                WS_EX_LAYERED,
+                WS_EX_TOOLWINDOW,
+            ] {
+                assert!(ex & flag.0 != 0, "style {flag:?}");
+            }
+            // Never takes the mouse, never activates
+            let hit = SendMessageW(bubble, WM_NCHITTEST, None, None);
+            assert_eq!(hit.0, HTTRANSPARENT as isize);
+            let activate = SendMessageW(bubble, WM_MOUSEACTIVATE, None, None);
+            assert_eq!(activate.0, MA_NOACTIVATE as isize);
+            assert!(!IsWindowVisible(bubble).as_bool(), "hidden until needed");
+            for dpi in [96u32, 144] {
+                let collapsed = NotchDimensions::from_state_and_dpi(NotchState::Collapsed, dpi);
+                let h = collapsed.height;
+                let alpha = |p: u32| p >> 24;
+                let orange = |p: u32| {
+                    let (b, g, r) = (p & 0xFF, (p >> 8) & 0xFF, (p >> 16) & 0xFF);
+                    r > 120 && r > g + 30 && g > b + 30
+                };
+                // Absorbed: nothing past the notch's wall (what is left of the
+                // drop is under the notch's own black body)
+                let g = renderer.render_bubble(bubble, 100, 0, dpi, 0.0).unwrap();
+                let (w, wall) = (g.window.0, g.wall.ceil() as usize);
+                let (px, stride) = renderer.surface(h);
+                let outside = (0..h as usize)
+                    .any(|y| (wall..w as usize).any(|x| alpha(px[y * stride + x]) > 0));
+                assert!(!outside, "fully absorbed at {dpi}");
+                let any = |px: &[u32], f: &dyn Fn(u32) -> bool| {
+                    (0..h as usize).any(|y| (0..w as usize).any(|x| f(px[y * stride + x])))
+                };
+                // Budding: the black drop shows first, the ring not yet
+                renderer.render_bubble(bubble, 100, 0, dpi, 0.5).unwrap();
+                let (px, _) = renderer.surface(h);
+                assert!(any(&px, &|p| alpha(p) > 0), "shape at {dpi}");
+                assert!(!any(&px, &orange), "numerals come last at {dpi}");
+                // Shown: a floating pure-black circle with the orange ring
+                let g = renderer.render_bubble(bubble, 100, 0, dpi, 1.0).unwrap();
+                let w = g.window.0;
+                let (px, _) = renderer.surface(h);
+                let any = |f: &dyn Fn(u32) -> bool| {
+                    (0..h as usize).any(|y| (0..w as usize).any(|x| f(px[y * stride + x])))
+                };
+                assert!(any(&orange), "ring at {dpi}");
+                let ((cx, cy), r) = (g.center, g.radius);
+                let centre = px[cy as usize * stride + cx as usize];
+                assert_eq!(alpha(centre), 255, "solid at {dpi}");
+                assert_eq!(centre & 0x00FF_FFFF, 0, "pure black at {dpi}");
+                // Not attached to the screen edge: its top rows are clear...
+                for y in 0..(cy - r).floor() as usize {
+                    assert!(
+                        (0..w as usize).all(|x| alpha(px[y * stride + x]) == 0),
+                        "row {y} clear at {dpi}"
+                    );
+                }
+                // ...and it is round: its bounding box's corners stay clear
+                let (l, t, rr, b) = (cx - r, cy - r, cx + r - 1.0, cy + r - 1.0);
+                for (x, y) in [(l, t), (rr, t), (l, b), (rr, b)] {
+                    assert!(
+                        alpha(px[y as usize * stride + x as usize]) < 40,
+                        "round at {dpi}"
+                    );
+                }
+                // The ring sits at 12 o'clock first (a full countdown)
+                let top_of_ring = px[(cy - g.ring.0) as usize * stride + cx as usize];
+                assert!(orange(top_of_ring), "ring starts at 12 at {dpi}");
+                // Close to the notch: joined to the wall by the liquid neck
+                let g = renderer.render_bubble(bubble, 100, 0, dpi, 0.45).unwrap();
+                let (px, _) = renderer.surface(h);
+                assert!(g.neck > 0.0, "neck at {dpi}");
+                let wall_px = px[g.center.1 as usize * stride + g.wall as usize + 1];
+                assert_eq!(alpha(wall_px), 255, "joined to the wall at {dpi}");
+            }
+            // Shutting the notch down takes the bubble with it
+            let _ = DestroyWindow(owner);
+            assert!(
+                !IsWindow(Some(bubble)).as_bool(),
+                "destroyed with its owner"
+            );
+            assert!(!IsWindow(Some(owner)).as_bool());
+        }
+    }
+
+    #[test]
+    fn test_timer_title_parts() {
+        assert_eq!(with_timer("12:47 AM".into(), None), "12:47 AM");
+        assert_eq!(
+            with_timer("12:47 AM".into(), Some("Timer running")),
+            "12:47 AM - Timer running"
+        );
+    }
+
+    #[test]
+    fn test_scrub_gesture_is_never_an_outside_click() {
+        let notch = create_bubble(HWND::default()).expect("stand-in notch");
+        let other = create_bubble(HWND::default()).expect("another window");
+        // Capture held by the notch: its gesture owns every button
+        assert!(gesture_owns_buttons(notch, notch));
+        // Nobody / someone else holds it: clicks are classified as usual
+        assert!(!gesture_owns_buttons(HWND::default(), notch));
+        assert!(!gesture_owns_buttons(other, notch));
+        // ...and a genuine outside click still arms the countdown
+        let mut g = GracePeriod::default();
+        let event = classify_click(other, notch, None).unwrap();
+        assert_eq!(event, GraceEvent::OutsideClick);
+        assert_eq!(g.handle(event, true), GraceAction::Arm);
+        // A press on the notch itself (where a scrub starts) is not outside
+        assert_eq!(classify_click(notch, notch, None), None);
+        unsafe {
+            let _ = DestroyWindow(notch);
+            let _ = DestroyWindow(other);
+        }
+    }
+
+    #[test]
+    fn test_scrub_release_position_stays_on_the_track() {
+        assert_eq!(scrub_position(0.0, 200_000), 0);
+        assert_eq!(scrub_position(0.5, 200_000), 100_000);
+        assert_eq!(scrub_position(1.0, 200_000), 200_000);
+        // Released past either end (the fraction is already clamped by the
+        // track, and again here): never outside the track
+        assert_eq!(scrub_position(-3.0, 200_000), 0);
+        assert_eq!(scrub_position(7.0, 200_000), 200_000);
+        assert_eq!(scrub_position(0.3, 0), 0);
+        assert_eq!(scrub_position(f32::NAN.max(0.0), 1000), 0);
     }
 }
