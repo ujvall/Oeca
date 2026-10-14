@@ -1,0 +1,207 @@
+@import "tailwindcss";
+
+/* Oeca: matte black, warm whites, neutral greys. One theme, no accent colour:
+   the only colour on the page comes from the real logo and app captures. */
+@theme {
+  --color-ink: #0b0b0b;
+  --color-raised: #111111;
+  --color-line: rgb(255 255 255 / 0.08);
+  --color-line-strong: rgb(255 255 255 / 0.14);
+  --color-paper: #f4f2ee;
+  --color-muted: #9b9893;
+  --color-faint: #75726d;
+
+  --font-sans: "General Sans", ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+
+  --ease-out-soft: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+:root {
+  color-scheme: dark;
+  --page-gutter: clamp(1rem, 4vw, 2.5rem);
+}
+
+html {
+  background: var(--color-ink);
+  -webkit-text-size-adjust: 100%;
+  scroll-padding-top: 5rem;
+}
+
+body {
+  background: var(--color-ink);
+  color: var(--color-paper);
+  font-family: var(--font-sans);
+  font-size: 1.0625rem;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: "ss01" 0;
+  overflow-x: clip;
+}
+
+::selection {
+  background: rgb(244 242 238 / 0.9);
+  color: #0b0b0b;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-paper);
+  outline-offset: 3px;
+  border-radius: 6px;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  html {
+    scroll-behavior: smooth;
+  }
+}
+
+@layer components {
+  .shell {
+    width: 100%;
+    max-width: 76rem;
+    margin-inline: auto;
+    padding-inline: var(--page-gutter);
+  }
+
+  /* Type scale: size, weight, leading and tracking set together */
+  .t-display {
+    font-size: clamp(2.5rem, 1.4rem + 4.6vw, 5rem);
+    font-weight: 600;
+    line-height: 1;
+    letter-spacing: -0.038em;
+    text-wrap: balance;
+  }
+  .t-title {
+    font-size: clamp(2rem, 1.35rem + 2.6vw, 3.5rem);
+    font-weight: 600;
+    line-height: 1.04;
+    letter-spacing: -0.032em;
+    text-wrap: balance;
+  }
+  .t-heading {
+    font-size: 1.375rem;
+    font-weight: 500;
+    line-height: 1.25;
+    letter-spacing: -0.012em;
+  }
+  .t-lead {
+    font-size: clamp(1.0625rem, 0.98rem + 0.4vw, 1.25rem);
+    line-height: 1.5;
+    color: var(--color-muted);
+    text-wrap: pretty;
+  }
+  .t-body {
+    color: var(--color-muted);
+    text-wrap: pretty;
+  }
+  .t-caption {
+    font-size: 0.8125rem;
+    line-height: 1.45;
+    letter-spacing: 0.005em;
+    color: var(--color-faint);
+  }
+
+  /* Buttons: the only pill shapes on the page */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    height: 3rem;
+    padding-inline: 1.375rem;
+    border-radius: 999px;
+    font-size: 0.9688rem;
+    font-weight: 500;
+    letter-spacing: -0.005em;
+    white-space: nowrap;
+    transition:
+      background-color 160ms ease,
+      border-color 160ms ease,
+      transform 120ms ease-out;
+  }
+  .btn:active {
+    transform: scale(0.97);
+  }
+  .btn-primary {
+    background: var(--color-paper);
+    color: #0b0b0b;
+  }
+  .btn-primary:hover {
+    background: #ffffff;
+  }
+  .btn-ghost {
+    color: var(--color-paper);
+    box-shadow: inset 0 0 0 1px var(--color-line-strong);
+  }
+  .btn-ghost:hover {
+    background: rgb(255 255 255 / 0.05);
+  }
+  .btn-sm {
+    height: 2.25rem;
+    padding-inline: 1rem;
+    font-size: 0.875rem;
+  }
+
+  /* Squircle icon tile: superellipse where supported, close radius elsewhere */
+  .squircle {
+    display: inline-grid;
+    place-items: center;
+    flex: none;
+    width: 2.5rem;
+    height: 2.5rem;
+    border-radius: 30%;
+    background: var(--color-raised);
+    box-shadow: inset 0 0 0 1px var(--color-line);
+    color: var(--color-paper);
+  }
+  @supports (corner-shape: squircle) {
+    .squircle {
+      border-radius: 50%;
+      corner-shape: squircle;
+    }
+  }
+
+  /* The changelog keeps the left margin free for its fixed timeline (13rem
+     at left 1.5rem): content starts at 17rem from the screen edge or later. */
+  @media (min-width: 64rem) {
+    .with-rail {
+      padding-left: max(var(--page-gutter), calc(17rem - max(0px, (100vw - 76rem) / 2)));
+    }
+  }
+
+  .link {
+    color: var(--color-paper);
+    text-decoration: underline;
+    text-decoration-color: rgb(244 242 238 / 0.3);
+    text-underline-offset: 0.2em;
+    transition: text-decoration-color 160ms ease;
+  }
+  .link:hover {
+    text-decoration-color: currentColor;
+  }
+}
+
+/* Notch stage: real captures stacked top-centre, positioned in % of the stage */
+.stage {
+  position: relative;
+  margin-inline: auto;
+}
+.stage > img {
+  position: absolute;
+  top: 0;
+  height: auto;
+  max-width: none;
+  user-select: none;
+  -webkit-user-drag: none;
+  /* GSAP tweens --clip, not clip-path: custom properties keep the exact
+     string, while clip-path gets normalised and loses its shape. */
+  clip-path: var(--clip, none);
+}
+
+/* Motion gate: set by an inline script only when motion is allowed. Without
+   JavaScript, or under reduced motion, nothing is ever hidden. */
+html.motion [data-intro] {
+  opacity: 0;
+}
