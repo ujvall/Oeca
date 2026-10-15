@@ -7205,7 +7205,12 @@ mod tests {
             brightest(&fading) < brightest(&settled),
             "text starts dimmed"
         );
-        assert!(renderer.flip.borrow().is_some(), "the cover turns");
+        // The cover turns, unless the system disables motion (then it swaps)
+        assert_eq!(
+            renderer.flip.borrow().is_some(),
+            crate::window::is_client_animation_enabled(),
+            "the cover turns"
+        );
         renderer.settle_media_motion();
         // Clock is environmental: identical while the track fades
         let time = m.time_bounds;
@@ -8455,6 +8460,10 @@ mod tests {
 
     #[test]
     fn test_artwork_flips_on_a_real_artwork_change_only() {
+        // The flip needs system animations, which CI runners turn off
+        if !crate::window::is_client_animation_enabled() {
+            return;
+        }
         let renderer = Renderer::new().expect("renderer");
         let a = content("A", Some(cover([200, 40, 40])));
         let b = content("B", Some(cover([40, 40, 200])));
@@ -8535,6 +8544,10 @@ mod tests {
     #[test]
     fn test_rapid_track_changes_retarget_without_restart_or_snap() {
         use std::f32::consts::{FRAC_PI_2, PI};
+        // The flip needs system animations, which CI runners turn off
+        if !crate::window::is_client_animation_enabled() {
+            return;
+        }
         let renderer = Renderer::new().expect("renderer");
         let (a, b, c, d) = (
             content("A", Some(cover([200, 40, 40]))),
@@ -8599,6 +8612,10 @@ mod tests {
     #[test]
     fn test_artwork_flip_frames_one_flat_photo_about_its_centre() {
         use std::f32::consts::PI;
+        // The flip needs system animations, which CI runners turn off
+        if !crate::window::is_client_animation_enabled() {
+            return;
+        }
         let renderer = Renderer::new().expect("renderer");
         let (red, green, blue, yellow) =
             ([230, 30, 30], [30, 220, 30], [30, 30, 230], [230, 230, 30]);
