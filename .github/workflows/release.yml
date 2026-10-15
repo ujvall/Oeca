@@ -1,0 +1,79 @@
+# Builds, tests and packages Oeca on a GitHub-hosted Windows runner, and keeps
+# the unsigned Oeca.exe and Oeca-Setup.exe as a workflow artifact.
+#
+# Code signing (SignPath Foundation) is not active yet: the application is
+# pending. Once it is accepted, add the signing step at the end (template
+# below) with the organisation, project and policy that SignPath assigns, and
+# the SIGNPATH_API_TOKEN repository secret. Every signing request is then
+# approved manually in SignPath before signed files are released.
+
+name: Build
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust (stable, MSVC)
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release executable
+        run: cargo build --release --locked
+
+      - name: Install Inno Setup 6.7.1
+        run: choco install innosetup --version=6.7.1 --allow-downgrade --no-progress -y
+
+      - name: Build installer
+        run: '& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer\Oeca.iss'
+
+      - name: Upload unsigned build
+        id: upload-unsigned
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Oeca-unsigned-${{ github.sha }}
+          path: |
+            target/release/Oeca.exe
+            target/installer/Oeca-Setup.exe
+            LICENSE
+            THIRD-PARTY-NOTICES.txt
+          if-no-files-found: error
+
+      # Signing template (inactive until SignPath Foundation accepts Oeca).
+      # Uncomment and fill in the values SignPath provides; never commit the
+      # API token itself.
+      #
+      # - name: Submit signing request (SignPath)
+      #   uses: signpath/github-action-submit-signing-request@v3
+      #   with:
+      #     api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+      #     organization-id: <from SignPath>
+      #     project-slug: <from SignPath>
+      #     signing-policy-slug: <from SignPath>
+      #     github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
+      #     wait-for-completion: true
+      #     output-artifact-directory: signed

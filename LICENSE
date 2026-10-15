@@ -1,184 +1,21 @@
-Oeca Source-Available License
-Version 1.0, effective 15 October 2026
+MIT License
 
-Copyright (c) 2026 Ujval Sai. All rights reserved.
+Copyright (c) 2026 Ujval Sai
 
-Oeca is source-available, proprietary software. It is not open source. The
-source code is published so that people can read and inspect how Oeca works.
-Publishing it does not, by itself, give anyone permission to reuse it.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-1. Definitions
-
-"Licensor" means Ujval Sai, the copyright holder.
-
-"Software" means the original works authored by or for the Licensor in this
-repository and in versions of Oeca distributed by the Licensor with this
-License, including source code, build scripts, the installer script,
-documentation, the website, images, and other original materials, together
-with compiled versions of them. The Software does not include Third-Party
-Materials (section 7).
-
-"Branding" means the name "Oeca", the Oeca icon, logo and wordmark, and other
-marks, names, artwork and imagery that identify Oeca or the Licensor.
-
-
-2. Which versions this License covers
-
-This License applies to versions of the Software that the Licensor first
-publishes with this License, starting with the commit in which this file
-replaces the MIT License.
-
-Some earlier versions of the Software were published under the MIT License,
-including the v0.1.0 release and the repository commits that contained the
-MIT License text. This License does not revoke, narrow or replace any rights
-that anyone received under the MIT License for those earlier versions. Those
-versions remain governed by the MIT License as published with them. Where a
-later version contains material that was already published under the MIT
-License, that material stays available under the MIT License as it appeared in
-the earlier version; this License governs material that is new or changed in
-the later version.
-
-
-3. What you may do
-
-Subject to this License, you may:
-
-  a. view, read and inspect the source code where the Licensor makes it
-     publicly available, including on GitHub;
-
-  b. use, display and fork the repository through GitHub, as GitHub's Terms of
-     Service permit for public repositories (section 3.1);
-
-  c. download, install and use official compiled releases of Oeca that the
-     Licensor publishes, on devices you own or control, for your own use,
-     including while you work or study (section 3.2); and
-
-  d. build and run an unmodified copy of the source code on devices you own or
-     control, only to evaluate, test or review the Software, and make the
-     local copies that this requires, without distributing them.
-
-3.1 GitHub. Because the repository is public on GitHub, GitHub's Terms of
-Service let other GitHub users view it and copy it within GitHub, including by
-forking. This License does not take those platform permissions away. They are
-limited to what GitHub's functionality provides within GitHub; they do not
-grant a license to copy, publish, distribute, modify or use the Software
-outside GitHub.
-
-3.2 Official releases. Section 3(c) covers using Oeca yourself, whether for
-personal matters, work or study. It does not cover installing, deploying or
-providing Oeca for other people, for example across the computers of a school
-or business; that requires the Licensor's permission.
-
-Making the source code publicly available does not grant any rights beyond
-those stated in this section, those that GitHub's Terms of Service require,
-and those that applicable law provides (section 6).
-
-
-4. What requires prior written permission
-
-Except as allowed in section 3 or by applicable law, you may not do any of the
-following without the Licensor's prior written permission:
-
-  a. copy, reproduce or redistribute the Software, in source or compiled form,
-     in whole or in part;
-
-  b. publish, distribute or make available modified versions of the Software
-     or works based on it;
-
-  c. use the source code of the Software, or any part of it, in another
-     product, project or service, or exploit the Software commercially, for
-     example by selling, licensing, hosting or offering it, or any part of it,
-     as or within a product or service (using an official release yourself
-     under section 3(c) is not commercial exploitation);
-
-  d. sublicense, rent, lease or transfer any rights in the Software;
-
-  e. use the Branding, or any name or mark confusingly similar to it, including
-     to identify a modified or derived version. This does not restrict using the
-     name "Oeca" to identify or refer to Oeca, for example in factual
-     discussion, reviews, comparisons or commentary; or
-
-  f. remove, obscure or alter any copyright, license or attribution notice.
-
-Permission granted for one purpose does not extend to any other purpose. To
-request permission, contact the Licensor through
-https://github.com/ujvall.
-
-
-5. Reserved rights
-
-The Licensor reserves all rights in the Software and the Branding that this
-License does not expressly grant. No license, whether express, implied, by
-estoppel or otherwise, is granted except as stated in this License. Apart from
-referring to Oeca by name as section 4(e) describes, nothing in this License
-grants any right to use the Branding.
-
-
-6. Rights under applicable law
-
-Nothing in this License limits or excludes any right that cannot be limited or
-excluded under the law that applies to you, such as fair use, fair dealing, or
-rights to study or adapt software for interoperability where the law grants
-them. Where such a right applies, this License does not restrict it.
-
-
-7. Third-Party Materials
-
-Parts of this repository and of compiled releases are owned by others and are
-licensed under their own terms ("Third-Party Materials"). The Licensor does not
-claim ownership of Third-Party Materials, and this License does not restrict
-any rights you have under their licenses. They include:
-
-  a. Rust dependencies listed in Cargo.toml and Cargo.lock, including
-     Microsoft's windows and windows-core crates and their dependencies, each
-     under the license stated in its own package metadata (for example,
-     MIT OR Apache-2.0);
-
-  b. the Clipboard, House blank, Music-alt, Palette, Info, Settings and Trash
-     icons, designed by UIcons from Flaticon, used under Flaticon's free
-     license with attribution;
-
-  c. the "Inbox" icon, created by Jivan from the Noun Project, used under the
-     Noun Project free license with attribution;
-
-  d. the General Sans typeface by the Indian Type Foundry, which is not
-     included in this repository and is used under the ITF Free Font License;
-
-  e. the desktop wallpaper from wallhaven shown in a screenshot, which belongs
-     to its creator; and
-
-  f. on the website, third-party packages listed in website/package.json and
-     website/package-lock.json, each under its own license.
-
-Notices and attributions for Third-Party Materials must be kept. Those for the
-Third-Party Materials included in compiled releases are in
-THIRD-PARTY-NOTICES.txt.
-
-
-8. Contributions
-
-The Licensor does not currently accept contributions of code or other
-material, such as pull requests, and has no contributor agreement. Please do
-not submit them. Opening an issue, for example to report a problem or suggest
-a feature, is welcome; it does not grant you any rights in the Software, and
-it does not make you a contributor to it.
-
-
-9. Termination
-
-If you breach this License, your permissions under it end automatically. They
-do not end for rights you have under the MIT License for earlier versions
-(section 2), under GitHub's Terms of Service (section 3.1), under Third-Party
-Material licenses (section 7), or under applicable law (section 6).
-
-
-10. No warranty and limitation of liability
-
-TO THE EXTENT PERMITTED BY APPLICABLE LAW, THE SOFTWARE IS PROVIDED "AS IS",
-WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
-THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
-NONINFRINGEMENT, AND IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY CLAIM,
-DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
-OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE
-OR OTHER DEALINGS IN THE SOFTWARE.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

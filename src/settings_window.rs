@@ -180,7 +180,7 @@ impl Category {
         }
     }
 
-    /// Sidebar icon: the project's licensed UIcons glyphs.
+    /// Sidebar icon: Material Symbols glyphs (Apache-2.0; see renderer.rs).
     fn icon(self) -> &'static [IconSeg] {
         match self {
             Self::General => GEAR,

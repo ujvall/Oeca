@@ -16,9 +16,9 @@
 <br>
 
 <p align="center">
-  <img src="assets/readme/clipboard.png" alt="The expanded notch showing the Clipboard space with four items" width="680">
+  <img src="assets/readme/clipboard.png" alt="The expanded notch showing the Clipboard space with four items" width="570">
   <br>
-  <sub>The Clipboard space, captured from the running app (example clipboard items).</sub>
+  <sub>The Clipboard space, captured from Oeca 0.1.0 (example clipboard items).</sub>
 </p>
 
 ## Features
@@ -46,7 +46,7 @@ Click an item in the Clipboard space to copy it again, or drag image files onto 
   <img src="assets/readme/chip-noruntime.png" alt="No runtime" height="36">
 </p>
 
-Oeca is a single Rust executable whose only dependencies are Microsoft's [`windows`](https://crates.io/crates/windows) and `windows-core` crates: no runtime, UI framework or web view.
+Oeca is a free, open-source (MIT) single Rust executable whose only dependencies are Microsoft's [`windows`](https://crates.io/crates/windows) and `windows-core` crates: no runtime, UI framework or web view.
 
 - **Window.** One layered, per-monitor-DPI-aware Win32 window. Pixels outside the notch shape pass clicks through to the windows below.
 - **Rendering.** Direct2D and DirectWrite draw into a premultiplied 32-bit bitmap that is composited with `UpdateLayeredWindow`. Brushes, text formats and bitmaps are cached per artwork and DPI.
@@ -60,13 +60,11 @@ Oeca is a single Rust executable whose only dependencies are Microsoft's [`windo
 2. Run it. Oeca installs for your Windows account only, to `%LOCALAPPDATA%\Programs\Oeca`; no administrator rights are needed.
 3. Look for the notch at the top of your screen and the Oeca icon in the notification area.
 
-The installer and app are not code-signed, so Windows SmartScreen may ask you to confirm. Oeca adds nothing that runs at startup unless you turn on **Start on launch** in Settings.
+The installer and app are not code-signed yet, so Windows SmartScreen may ask you to confirm; see the [code signing policy](#code-signing-policy). Oeca adds nothing that runs at startup unless you turn on **Start on launch** in Settings.
 
-Uninstall from **Settings → Apps → Installed apps**. This removes the app, its shortcuts and its Start on launch entry, and keeps your data in `%LOCALAPPDATA%\Oeca`; delete that folder yourself to remove it. After a reinstall, Start on launch is off until you turn it on again.
+Uninstall from **Settings â†’ Apps â†’ Installed apps**. This removes the app, its shortcuts and its Start on launch entry, and keeps your data in `%LOCALAPPDATA%\Oeca`; delete that folder yourself to remove it. After a reinstall, Start on launch is off until you turn it on again.
 
 ## Build from source
-
-You may build and run an unmodified copy to evaluate, test or review Oeca; redistributing builds needs permission (see [LICENSE](LICENSE)).
 
 Requires Windows 10 or later (x64), Rust with the MSVC toolchain (edition 2024), and the Windows 10/11 SDK, which comes with the Visual Studio C++ build tools. `build.rs` embeds the icon and version information with the SDK's `rc.exe` (set `RC` to use a specific one).
 
@@ -87,47 +85,60 @@ cargo build --release --locked
 & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" installer\Oeca.iss
 ```
 
-The output is `target\installer\Oeca-Setup.exe`, and its version comes from `Cargo.toml`. Upgrading or reinstalling asks a running Oeca to quit, replaces it in place and keeps settings, clipboard history and Start on launch. Adjust the compiler path if Inno Setup is installed elsewhere.
+The output is `target\installer\Oeca-Setup.exe`, and its version comes from `Cargo.toml`. The same steps run on GitHub Actions in [`.github/workflows/release.yml`](.github/workflows/release.yml), which builds, tests and packages Oeca on GitHub-hosted Windows runners. Upgrading or reinstalling asks a running Oeca to quit, replaces it in place and keeps settings, clipboard history and Start on launch. Adjust the compiler path if Inno Setup is installed elsewhere.
 
 ## Project structure
 
 ```text
 Oeca/
-├── src/
-│   ├── main.rs                Entry point
-│   ├── window.rs              Window, message loop, gestures, single instance, lifecycle
-│   ├── renderer.rs            Direct2D and DirectWrite rendering
-│   ├── layout.rs              DPI-scaled layout
-│   ├── config.rs              Geometry, springs and colours
-│   ├── space.rs               Spaces and the settings model
-│   ├── media.rs               Media sessions, artwork and visualizer
-│   ├── clock.rs               Clock
-│   ├── timer.rs               Countdown timer
-│   ├── clipboard.rs           Clipboard history
-│   ├── clipboard_store.rs     Session-scoped history storage
-│   ├── dragdrop.rs            Image drag and drop
-│   ├── settings_window.rs     Settings window
-│   ├── settings_store.rs      Settings file
-│   ├── startup.rs             Start on launch
-│   └── tray.rs                Notification area icon and menu
-├── assets/                    Icon, version resource and README images
-├── installer/                 Inno Setup script and wizard images
-└── build.rs                   Embeds the icon and version information
+â”œâ”€â”€ src/
+â”‚   â”œâ”€â”€ main.rs                Entry point
+â”‚   â”œâ”€â”€ window.rs              Window, message loop, gestures, single instance, lifecycle
+â”‚   â”œâ”€â”€ renderer.rs            Direct2D and DirectWrite rendering
+â”‚   â”œâ”€â”€ layout.rs              DPI-scaled layout
+â”‚   â”œâ”€â”€ config.rs              Geometry, springs and colours
+â”‚   â”œâ”€â”€ space.rs               Spaces and the settings model
+â”‚   â”œâ”€â”€ media.rs               Media sessions, artwork and visualizer
+â”‚   â”œâ”€â”€ clock.rs               Clock
+â”‚   â”œâ”€â”€ timer.rs               Countdown timer
+â”‚   â”œâ”€â”€ clipboard.rs           Clipboard history
+â”‚   â”œâ”€â”€ clipboard_store.rs     Session-scoped history storage
+â”‚   â”œâ”€â”€ dragdrop.rs            Image drag and drop
+â”‚   â”œâ”€â”€ settings_window.rs     Settings window
+â”‚   â”œâ”€â”€ settings_store.rs      Settings file
+â”‚   â”œâ”€â”€ startup.rs             Start on launch
+â”‚   â””â”€â”€ tray.rs                Notification area icon and menu
+â”œâ”€â”€ assets/                    Icon, version resource and README images
+â”œâ”€â”€ installer/                 Inno Setup script and wizard images
+â””â”€â”€ build.rs                   Embeds the icon and version information
 ```
+
+## Privacy
+
+Oeca makes no network requests: it has no telemetry, analytics, crash reporting or update checks. Its settings and its clipboard history are stored only on your PC, in `%LOCALAPPDATA%\Oeca`; the clipboard history is not encrypted and is discarded when you sign out or restart Windows. The full [privacy policy](website/app/privacy/page.tsx) covers the app, the installer and the website. It will also be published on the Oeca website once that is online.
+
+## Code signing policy
+
+**Status: pending.** Oeca is applying for free code signing from [SignPath Foundation](https://signpath.org). Current releases, including v0.1.0, are not signed. Once the application is accepted, releases will be built by the GitHub Actions workflow in this repository, signed through SignPath and published here, with this notice: Free code signing provided by SignPath.io, certificate by SignPath Foundation.
+
+- Authors, Reviewers and Approvers: [Ujval Sai (@ujvall)](https://github.com/ujvall), currently the only maintainer.
+- Every signing request is approved manually by the maintainer, for releases built from this repository only.
+- Privacy: this program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it.
+
+The full [code signing policy](website/app/code-signing/page.tsx) will also be published on the Oeca website.
 
 ## Contributing
 
-Contributions (pull requests or other code) are not being accepted at the moment, and there is no contributor agreement. Bug reports and feature requests in [Issues](https://github.com/ujvall/Oeca/issues) are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
+Bug reports, feature requests and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to report a problem, propose a change and build and test Oeca locally. Contributions are accepted under the MIT License.
 
 ## License and credits
 
-Oeca is source-available and proprietary. It is not open source. The repository is public so that you can read and inspect how Oeca works, but public visibility does not by itself give you permission to copy, modify, redistribute or reuse the code. You may view the code, use and fork it through GitHub as GitHub's Terms of Service allow (forks stay on GitHub; that is not permission to publish or distribute the code elsewhere), and install and use the official releases yourself, including for work or study. Anything else, such as redistributing the code, publishing modified versions, commercial reuse, sublicensing or deploying Oeca for other people, needs the author's prior written permission, except where applicable law allows it. Referring to Oeca by name, for example in reviews or discussion, is fine. The full terms are in [LICENSE](LICENSE).
+Oeca is free and open-source software, released under the [MIT License](LICENSE). The MIT License covers Oeca's source code and its own assets, including the Oeca icon and the images in `assets/` and `installer/images/`. It does not grant rights to the Oeca name or logo as trademarks: please don't use them to brand other software or imply endorsement.
 
-Earlier versions were published under the MIT License, including the v0.1.0 release and the commits that contained the MIT text. The new licence applies to versions published with it, and within those, to what is new or changed. It does not take back the rights anyone already received under the MIT License: those earlier versions, and the code as it appeared in them, stay available under the MIT License.
+Oeca was first published under the MIT License, including the v0.1.0 release. For a short time one commit (`c627fd2`) replaced it with a proprietary source-available licence; that change has been reversed, and it never revoked any rights granted under the MIT License.
 
-The Oeca name, icon and branding assets remain the property of the author: `assets/branding/` and the images rendered from the Oeca icon, including the installer's `installer/images/` and this README's `assets/readme/`. Third-party materials are not the author's and stay under their own licences: the Rust dependencies (each under the licence in its own package metadata, such as MIT OR Apache-2.0 for Microsoft's `windows` crates) and the items credited below. The notices for the third-party components that ship with Oeca (the `windows` crates compiled into `Oeca.exe`, the icons it draws, and Inno Setup) are in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt), which the installer places beside `Oeca.exe`.
+Third-party components keep their own licences. Those shipped with Oeca, Microsoft's `windows` crates (MIT), the icons it draws (Material Symbols, Apache-2.0; Phosphor Icons, MIT) and Inno Setup, are listed with their notices in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt), which the installer places beside `Oeca.exe`.
 
-- Clipboard, House blank, Music-alt, Palette, Info, Settings and Trash icons: [designed by UIcons from Flaticon](https://www.flaticon.com/uicons), used under Flaticon's free licence (free for commercial use with attribution).
-- Drop page icon: "Inbox", created by Jivan from the [Noun Project](https://thenounproject.com/icon/1052548/), used under the Noun Project free licence (with attribution).
+- Icons in the app: [Material Symbols](https://fonts.google.com/icons) by Google (Apache License 2.0) and, for Copy, Trash and the drop page, [Phosphor Icons](https://phosphoricons.com) (MIT License), converted to vector outlines.
+- Screenshots of Oeca 0.1.0 in this README and on the website show its earlier icons, [designed by UIcons from Flaticon](https://www.flaticon.com/uicons), used under Flaticon's free licence with attribution.
 - The Oeca wordmark is set in General Sans by the Indian Type Foundry ([Fontshare](https://www.fontshare.com)); the font itself is not included in this repository.
-- The screenshot's background is a desktop wallpaper from [wallhaven](https://wallhaven.cc); it remains its creator's and is not covered by Oeca's licence.

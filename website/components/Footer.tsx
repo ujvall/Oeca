@@ -11,10 +11,9 @@ export function Footer() {
             <span className="text-[1.0625rem] font-semibold tracking-[-0.02em]">Oeca</span>
           </div>
           <p className="t-caption mt-4 max-w-md">
-            &copy; 2026 Ujval Sai. Oeca is source-available, proprietary software; its code is public to read,
-            not to reuse without permission. Third-party materials keep their own licences: the site and
-            wordmark are set in General Sans by the Indian Type Foundry, via Fontshare, and the in-app icons
-            in the captures are{" "}
+            &copy; 2026 Ujval Sai. Oeca is free and open-source software under the MIT License.
+            Third-party materials keep their own licences: the site and wordmark are set in General Sans by
+            the Indian Type Foundry, via Fontshare, and the in-app icons in these captures of Oeca 0.1.0 are{" "}
             <a className="link" href="https://www.flaticon.com/uicons">
               designed by UIcons from Flaticon
             </a>
@@ -40,7 +39,17 @@ export function Footer() {
             </li>
             <li>
               <a className="transition-colors hover:text-paper" href={LICENSE_URL}>
-                License
+                MIT License
+              </a>
+            </li>
+            <li>
+              <a className="transition-colors hover:text-paper" href="/privacy/">
+                Privacy policy
+              </a>
+            </li>
+            <li>
+              <a className="transition-colors hover:text-paper" href="/code-signing/">
+                Code signing policy
               </a>
             </li>
           </ul>

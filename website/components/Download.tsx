@@ -44,9 +44,9 @@ export function Download() {
           Get Oeca for Windows.
         </h2>
         <p className="t-lead mx-auto mt-5 max-w-lg">
-          Version {VERSION}. Free to download, with source code you can read under its{" "}
+          Version {VERSION}. Free and open source under the{" "}
           <a className="link" href={LICENSE_URL}>
-            license
+            MIT License
           </a>
           .
         </p>
@@ -73,16 +73,32 @@ export function Download() {
             </dd>
           </div>
           <div>
-            <dt className="text-[0.9375rem] font-medium">SmartScreen</dt>
+            <dt className="text-[0.9375rem] font-medium">Code signing</dt>
             <dd className="t-body mt-1.5 text-[0.9375rem]">
-              The installer is not code-signed, so Windows may ask you to confirm. The{" "}
-              <a className="link" href={REPO_URL}>
-                source
-              </a>{" "}
-              is public.
+              Not signed yet, so Windows SmartScreen may ask you to confirm. Free signing through SignPath
+              Foundation is pending; see the{" "}
+              <a className="link" href="/code-signing/">
+                Code signing policy
+              </a>
+              .
             </dd>
           </div>
         </dl>
+        <p className="t-caption mx-auto mt-10 max-w-4xl text-left">
+          Oeca makes no network requests. Read the{" "}
+          <a className="link" href="/privacy/">
+            Privacy policy
+          </a>{" "}
+          and the{" "}
+          <a className="link" href="/code-signing/">
+            Code signing policy
+          </a>
+          , or browse the{" "}
+          <a className="link" href={REPO_URL}>
+            source on GitHub
+          </a>
+          .
+        </p>
       </div>
     </section>
   );

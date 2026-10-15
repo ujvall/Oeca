@@ -494,7 +494,7 @@ pub const BASE_MEDIA_VISUALIZER_GAP: f32 = 8.0;
 pub const BASE_SPACE_SELECTOR_TOP: f32 = 7.0;
 pub const BASE_SPACE_PILL_WIDTH: f32 = 34.0;
 pub const BASE_SPACE_PILL_HEIGHT: f32 = 22.0;
-/// Space icons (Flaticon UIcons solid-rounded house-blank / music-alt): glyph
+/// Space icons (Material Symbols home / music_note / content_paste): glyph
 /// box (DIP); the glyphs fill their box edge to edge.
 pub const BASE_SPACE_ICON_SIZE: f32 = 12.0;
 pub const BASE_SPACE_PILL_GAP: f32 = 4.0;
