@@ -4,3 +4,5 @@ graphify-out/
 CLAUDE.md
 .agents/skills/
 skills-lock.json
+# General Sans (ITF Free Font License): may not be published in this public repository
+/assets/fonts/*.otf

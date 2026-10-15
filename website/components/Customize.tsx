@@ -6,7 +6,7 @@ const OPTIONS = [
   { term: "Reduced motion", desc: "Oeca’s own transitions become instant changes." },
   { term: "Start on launch", desc: "Off until you turn it on. Uninstalling removes it." },
   { term: "Clipboard size", desc: "Keep 5, 10 or 20 items, and choose whether clearing asks first." },
-  { term: "Closing delay", desc: "Close 5, 10 or 15 seconds after you click elsewhere." },
+  { term: "Closing delay", desc: "Close as soon as you click elsewhere, or 5, 10 or 15 seconds after." },
   { term: "What it shows", desc: "Show or hide the visualizer and the name of the playing app." },
   { term: "Notification area", desc: "Open Oeca, Open Settings and Quit Oeca from the tray icon." },
 ];

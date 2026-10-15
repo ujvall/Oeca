@@ -264,11 +264,49 @@ mod tests {
     }
 
     #[test]
+    fn test_closing_delay_zero_default_and_saved_values_kept() {
+        let file = |delay: &str| format!("version = {VERSION}\ncollapse_delay_seconds = {delay}\n");
+        // New: 0 s, and it round-trips
+        assert_eq!(OecaSettings::default().collapse_delay, CollapseDelay::Zero);
+        assert_eq!(
+            decode(&file("0")).unwrap().collapse_delay,
+            CollapseDelay::Zero
+        );
+        let zero = OecaSettings {
+            collapse_delay: CollapseDelay::Zero,
+            ..OecaSettings::default()
+        };
+        assert_eq!(decode(&encode(&zero)).unwrap(), zero);
+        // A user's saved choice is kept as it is (no migration resets it)
+        for (text, d) in [
+            ("5", CollapseDelay::Five),
+            ("10", CollapseDelay::Ten),
+            ("15", CollapseDelay::Fifteen),
+        ] {
+            assert_eq!(decode(&file(text)).unwrap().collapse_delay, d);
+        }
+        // Missing or invalid: the default, with the rest of the file intact
+        let other = format!("version = {VERSION}\nalways_on_top = false\n");
+        let s = decode(&other).unwrap();
+        assert_eq!(
+            (s.collapse_delay, s.always_on_top),
+            (CollapseDelay::Zero, false)
+        );
+        for bad in ["7", "-1", "0.5", "", "zero"] {
+            assert_eq!(
+                decode(&file(bad)).unwrap().collapse_delay,
+                CollapseDelay::Zero,
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_new_user_defaults() {
         let d = OecaSettings::default();
         assert!(d.always_on_top && !d.reduced_motion);
         assert!(d.close_settings_on_escape && d.confirm_clear_clipboard);
-        assert_eq!(d.collapse_delay, CollapseDelay::Five);
+        assert_eq!(d.collapse_delay, CollapseDelay::Zero);
         assert_eq!(d.accent, AccentChoice::White);
         assert_eq!(d.clipboard_capacity, ClipboardCapacity::Twenty);
         assert!(d.show_source_app && d.show_visualizer);

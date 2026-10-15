@@ -14,6 +14,21 @@ fn main() {
     println!("cargo:rerun-if-changed=assets/branding/Oeca.ico");
     println!("cargo:rerun-if-env-changed=RC");
 
+    // General Sans is embedded only when its files are present: its licence
+    // forbids publishing them in the repository (see assets/fonts/README.md)
+    println!("cargo:rustc-check-cfg=cfg(oeca_bundled_font)");
+    println!("cargo:rerun-if-changed=assets/fonts");
+    let fonts =
+        ["Regular", "Medium", "Semibold"].map(|w| format!("assets/fonts/GeneralSans-{w}.otf"));
+    if fonts.iter().all(|f| Path::new(f).is_file()) {
+        println!("cargo:rustc-cfg=oeca_bundled_font");
+    } else if env::var("PROFILE").as_deref() == Ok("release") {
+        println!(
+            "cargo:warning=General Sans is not bundled (assets/fonts/README.md): \
+             this build uses the installed fonts"
+        );
+    }
+
     let target = env::var("TARGET").unwrap_or_default();
     if !target.contains("windows-msvc") {
         return;

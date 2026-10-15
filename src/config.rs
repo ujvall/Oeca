@@ -115,10 +115,11 @@ pub const BASE_SPACING: f32 = 8.0;
 // ── Typography ──────────────────────────────────────────────────────────
 //
 // One typeface for everything, resolved once at run time
-// (`renderer::ui_font`): the first of these installed. General Sans and
-// Satoshi (Fontshare) are used only when the user has installed them, never
-// bundled; Bahnschrift ships with every Windows 10 / 11, so it is the
-// guaranteed fallback. To try another face, put it first.
+// (`renderer::ui_font`): General Sans from the copy embedded in official
+// builds (`renderer::BUNDLED_FONTS`), else the first of these installed.
+// Satoshi (Fontshare) is used only when the user has installed it;
+// Bahnschrift ships with every Windows 10 / 11, so it is the guaranteed
+// fallback. The first entry is the family the embedded fonts must provide.
 pub const UI_FONT_CANDIDATES: [(&str, PCWSTR); 3] = [
     ("General Sans", w!("General Sans")),
     ("Satoshi", w!("Satoshi")),
@@ -340,22 +341,28 @@ pub const CLIPBOARD_MAX_TEXT_UNITS: usize = 256 * 1024;
 pub const CLIPBOARD_TIMER_ID: usize = 1005;
 /// One-shot: the expanded notch collapses `CollapseDelay` after a click
 /// outside Oeca, unless Oeca is used again first (restarted by each outside
-/// click).
+/// click). Never armed for the 0 s delay: that collapses at once.
 pub const AUTO_COLLAPSE_TIMER_ID: usize = 1006;
+/// One-shot: a drop's result ("Item copied to clipboard", or why not) stays
+/// on the drop page this long, then gives way to the space (or the notch the
+/// drop's drag opened closes). Runs only while a result is on show.
+pub const DROP_RESULT_TIMER_ID: usize = 1008;
+pub const DROP_RESULT_MS: u32 = 1_600;
 
 /// How long after an outside click the expanded notch collapses (Settings >
-/// General > Notch closing behaviour). 5 s is the default (the original
-/// behaviour).
+/// General > Notch closing behaviour). At once (0 s) by default; the
+/// collapse itself always animates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CollapseDelay {
     #[default]
+    Zero,
     Five,
     Ten,
     Fifteen,
 }
 
 impl CollapseDelay {
-    pub const ALL: [Self; 3] = [Self::Five, Self::Ten, Self::Fifteen];
+    pub const ALL: [Self; 4] = [Self::Zero, Self::Five, Self::Ten, Self::Fifteen];
 
     pub fn index(self) -> usize {
         self as usize
@@ -368,6 +375,7 @@ impl CollapseDelay {
     /// The countdown (ms).
     pub fn ms(self) -> u32 {
         match self {
+            Self::Zero => 0,
             Self::Five => 5_000,
             Self::Ten => 10_000,
             Self::Fifteen => 15_000,
@@ -377,6 +385,7 @@ impl CollapseDelay {
     /// Accessible name ("5 seconds") and compact segment label ("5s").
     pub fn name(self) -> &'static str {
         match self {
+            Self::Zero => "0 seconds",
             Self::Five => "5 seconds",
             Self::Ten => "10 seconds",
             Self::Fifteen => "15 seconds",
@@ -385,6 +394,7 @@ impl CollapseDelay {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Zero => "0s",
             Self::Five => "5s",
             Self::Ten => "10s",
             Self::Fifteen => "15s",
@@ -494,7 +504,7 @@ pub const BASE_MEDIA_VISUALIZER_GAP: f32 = 8.0;
 pub const BASE_SPACE_SELECTOR_TOP: f32 = 7.0;
 pub const BASE_SPACE_PILL_WIDTH: f32 = 34.0;
 pub const BASE_SPACE_PILL_HEIGHT: f32 = 22.0;
-/// Space icons (Material Symbols home / music_note / content_paste): glyph
+/// Space icons (Oeca's own house / notes / clipboard, renderer.rs): glyph
 /// box (DIP); the glyphs fill their box edge to edge.
 pub const BASE_SPACE_ICON_SIZE: f32 = 12.0;
 pub const BASE_SPACE_PILL_GAP: f32 = 4.0;
@@ -584,6 +594,11 @@ pub const BASE_DROP_OUTLINE_WIDTH: f32 = 1.5;
 /// Dash and gap lengths in stroke widths (round caps add one width to each dash).
 pub const DROP_OUTLINE_DASHES: [f32; 2] = [2.0, 3.5];
 pub const BASE_DROP_ICON_SIZE: f32 = 34.0;
+/// A drop's result and the "only images" hint: the glyph, then one line of
+/// text under it, centred together on the drop page (DIP).
+pub const BASE_DROP_RESULT_ICON_SIZE: f32 = 30.0;
+pub const BASE_DROP_MESSAGE_GAP: f32 = 10.0;
+pub const BASE_DROP_MESSAGE_LINE: f32 = 18.0;
 
 /// Inline scrubber in the controls row: `[controls]  0:49 ━━━●── -2:08`.
 pub const BASE_MEDIA_TIMELINE_LEAD: f32 = 4.0;

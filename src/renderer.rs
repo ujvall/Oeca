@@ -16,7 +16,7 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT,
     DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
     DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP,
-    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
+    DWriteCreateFactory, IDWriteFactory, IDWriteFactory5, IDWriteFontCollection, IDWriteTextFormat,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_FEATURE, DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, DWRITE_TEXT_METRICS,
@@ -42,8 +42,9 @@ use crate::config::{
     AccentChoice, BASE_SETTINGS_CHEVRON_SIZE, BASE_SETTINGS_TOGGLE_KNOB_INSET, rgb_color,
 };
 use crate::config::{
-    BASE_DROP_ICON_SIZE, BASE_DROP_OUTLINE_INSET, BASE_DROP_OUTLINE_RADIUS,
-    BASE_DROP_OUTLINE_WIDTH, COLOR_DROP_ICON, COLOR_DROP_OUTLINE, DROP_OUTLINE_DASHES,
+    BASE_DROP_ICON_SIZE, BASE_DROP_MESSAGE_GAP, BASE_DROP_MESSAGE_LINE, BASE_DROP_OUTLINE_INSET,
+    BASE_DROP_OUTLINE_RADIUS, BASE_DROP_OUTLINE_WIDTH, BASE_DROP_RESULT_ICON_SIZE, COLOR_DROP_ICON,
+    COLOR_DROP_OUTLINE, DROP_OUTLINE_DASHES,
 };
 use crate::config::{
     BASE_MEDIA_ARTWORK_RADIUS_EXTRA, BASE_MEDIA_BADGE_OVERHANG, BASE_MEDIA_BADGE_RING,
@@ -196,7 +197,10 @@ pub struct Renderer {
     /// sets it on every switch).
     space: Cell<OecaSpace>,
     /// An image drag is over the notch: the expanded notch shows the drop page.
-    drop_page: Cell<bool>,
+    /// What the drop page shows (`DropPage::Off`: no drop page), and the
+    /// last drop's outcome (kept while its result fades out).
+    drop: Cell<crate::dragdrop::DropPage>,
+    drop_outcome: Cell<crate::dragdrop::DropOutcome>,
     /// The running animation's content blend and opacity (None when settled).
     transition: Cell<Option<Transition>>,
     /// Settings page open / settings values (mirror `WindowState`, which sets
@@ -794,6 +798,9 @@ struct MediaFormats {
     clip_text: IDWriteTextFormat,
 }
 
+/// The drop page's hint for files that are not images Oeca can add.
+const DROP_UNSUPPORTED_LABEL: &str = "Only images can be added";
+
 /// Music space empty state (no media session): a quiet label, never metadata.
 const MUSIC_EMPTY_LABEL: &str = "Nothing playing";
 
@@ -847,22 +854,108 @@ fn resample_area_rect(src: &Artwork, w: u32, h: u32) -> Artwork {
     Artwork::new(dw as u32, dh as u32, out).unwrap_or_else(|| src.clone())
 }
 
-/// Oeca's typeface: the first `UI_FONT_CANDIDATES` family installed (system
-/// and per-user fonts), else the documented `FONT_FAMILY_FALLBACK`. Resolved
-/// once per process; shared by the notch and the Settings window.
-pub(crate) fn ui_font(dwrite: &IDWriteFactory) -> (&'static str, windows::core::PCWSTR) {
-    static CHOICE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    let choice = *CHOICE.get_or_init(|| {
-        let families = UI_FONT_CANDIDATES.map(|(_, f)| f);
-        first_installed(dwrite, &families)
-    });
-    match choice {
+/// General Sans (Indian Type Foundry, ITF Free Font License), embedded only
+/// when its files are present at build time (`build.rs`): the licence
+/// forbids publishing them in the repository. Regular, Medium and Semibold:
+/// the weights `TextRole` uses.
+#[cfg(oeca_bundled_font)]
+pub(crate) const BUNDLED_FONTS: &[&[u8]] = &[
+    include_bytes!("../assets/fonts/GeneralSans-Regular.otf"),
+    include_bytes!("../assets/fonts/GeneralSans-Medium.otf"),
+    include_bytes!("../assets/fonts/GeneralSans-Semibold.otf"),
+];
+#[cfg(not(oeca_bundled_font))]
+pub(crate) const BUNDLED_FONTS: &[&[u8]] = &[];
+
+/// Oeca's typeface: a family name and the collection it is found in (`None`:
+/// the installed fonts). Every text format is made from it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct UiFont {
+    pub name: &'static str,
+    pub family: windows::core::PCWSTR,
+    pub collection: Option<IDWriteFontCollection>,
+}
+
+/// Oeca's typeface: the bundled General Sans when this build embeds it, else
+/// the first `UI_FONT_CANDIDATES` family installed (system and per-user
+/// fonts), else the documented `FONT_FAMILY_FALLBACK`. Resolved once per
+/// thread (the UI thread in the app); shared by the notch and the Settings
+/// window.
+pub(crate) fn ui_font(dwrite: &IDWriteFactory) -> UiFont {
+    thread_local! {
+        static FONT: std::cell::OnceCell<UiFont> = const { std::cell::OnceCell::new() };
+    }
+    FONT.with(|f| {
+        f.get_or_init(|| resolve_ui_font(dwrite, BUNDLED_FONTS))
+            .clone()
+    })
+}
+
+fn resolve_ui_font(dwrite: &IDWriteFactory, bundled: &[&'static [u8]]) -> UiFont {
+    let (name, family) = UI_FONT_CANDIDATES[0];
+    if let Some(collection) = bundled_collection(dwrite, bundled).filter(|c| has_family(c, family))
+    {
+        return UiFont {
+            name,
+            family,
+            collection: Some(collection),
+        };
+    }
+    let families = UI_FONT_CANDIDATES.map(|(_, f)| f);
+    let (name, family) = match first_installed(dwrite, &families) {
         Some(i) => UI_FONT_CANDIDATES[i],
         None => (
             crate::config::FONT_FAMILY_FALLBACK_NAME,
             FONT_FAMILY_FALLBACK,
         ),
+    };
+    UiFont {
+        name,
+        family,
+        collection: None,
     }
+}
+
+/// A private, in-memory font collection of `fonts` (OpenType file data),
+/// visible only to this process: nothing is installed or registered with
+/// Windows. `None` when there are no fonts, the data is unusable, or the
+/// system predates `IDWriteFactory5` (Windows 10 1703); Oeca then uses the
+/// installed fonts.
+fn bundled_collection(
+    dwrite: &IDWriteFactory,
+    fonts: &[&'static [u8]],
+) -> Option<IDWriteFontCollection> {
+    if fonts.is_empty() {
+        return None;
+    }
+    let factory: IDWriteFactory5 = windows::core::Interface::cast(dwrite).ok()?;
+    unsafe {
+        // Stays registered for the process's lifetime, as the collection's
+        // font files refer to it
+        let loader = factory.CreateInMemoryFontFileLoader().ok()?;
+        factory.RegisterFontFileLoader(&loader).ok()?;
+        let builder = factory.CreateFontSetBuilder().ok()?;
+        for data in fonts {
+            let file = loader
+                .CreateInMemoryFontFileReference(
+                    &factory,
+                    data.as_ptr().cast(),
+                    u32::try_from(data.len()).ok()?,
+                    None::<&windows::core::IUnknown>,
+                )
+                .ok()?;
+            builder.AddFontFile(&file).ok()?;
+        }
+        let set = builder.CreateFontSet().ok()?;
+        let collection = factory.CreateFontCollectionFromFontSet(&set).ok()?;
+        windows::core::Interface::cast(&collection).ok()
+    }
+}
+
+fn has_family(collection: &IDWriteFontCollection, family: windows::core::PCWSTR) -> bool {
+    let (mut index, mut exists) = (0u32, windows::core::BOOL(0));
+    unsafe { collection.FindFamilyName(family, &mut index, &mut exists) }.is_ok()
+        && exists.as_bool()
 }
 
 /// Index of the first of `families` installed, if any.
@@ -873,11 +966,9 @@ pub(crate) fn first_installed(
     let mut collection = None;
     unsafe { dwrite.GetSystemFontCollection(&mut collection, false) }.ok()?;
     let collection = collection?;
-    families.iter().position(|family| {
-        let (mut index, mut exists) = (0u32, windows::core::BOOL(0));
-        unsafe { collection.FindFamilyName(*family, &mut index, &mut exists) }.is_ok()
-            && exists.as_bool()
-    })
+    families
+        .iter()
+        .position(|family| has_family(&collection, *family))
 }
 
 /// Text rendering for the notch's layered surface: the system's own gamma
@@ -958,6 +1049,8 @@ pub(crate) fn fill_glyph(
     };
     let path = unsafe { factory.CreatePathGeometry()? };
     let sink = unsafe { path.Open()? };
+    // Solid parts overlap and merge; holes run the other way (see `IconSeg`)
+    unsafe { sink.SetFillMode(windows::Win32::Graphics::Direct2D::Common::D2D1_FILL_MODE_WINDING) };
     let helper = unsafe { GeometrySinkHelper::from_raw(windows::core::Interface::as_raw(&sink)) };
     unsafe {
         for seg in segments {
@@ -1525,11 +1618,7 @@ impl Renderer {
     /// opacity.
     fn scene_view(&self) -> Transition {
         self.transition.get().unwrap_or_else(|| {
-            let scene = Scene::current(
-                self.drop_page.get(),
-                self.settings_open.get(),
-                self.space.get(),
-            );
+            let scene = Scene::current(self.drop.get(), self.settings_open.get(), self.space.get());
             Transition {
                 from: scene,
                 to: scene,
@@ -1539,14 +1628,25 @@ impl Renderer {
         })
     }
 
-    /// Whether the drop page is showing (the window sizes the notch for it).
+    /// Whether the drop page (or a drop's result) is showing (the window
+    /// sizes the notch for it).
     pub fn drop_page(&self) -> bool {
-        self.drop_page.get()
+        self.drop.get() != crate::dragdrop::DropPage::Off
     }
 
-    /// Shows/hides the drop page; true if it changed (caller redraws).
-    pub fn set_drop_page(&self, on: bool) -> bool {
-        self.drop_page.replace(on) != on
+    pub fn drop_state(&self) -> crate::dragdrop::DropPage {
+        self.drop.get()
+    }
+
+    /// Sets what the drop page shows; true if it changed (caller redraws).
+    pub fn set_drop(&self, page: crate::dragdrop::DropPage) -> bool {
+        self.drop.replace(page) != page
+    }
+
+    /// Shows a drop's outcome (`DropPage::Result`); true if anything changed.
+    pub fn set_drop_result(&self, outcome: crate::dragdrop::DropOutcome) -> bool {
+        let changed = self.drop_outcome.replace(outcome) != outcome;
+        self.set_drop(crate::dragdrop::DropPage::Result) || changed
     }
 
     /// Rebuilds the Clipboard space rows from the history (call on every
@@ -1672,7 +1772,8 @@ impl Renderer {
             collapsed_thumbs: RefCell::new(Vec::new()),
             scrub: Cell::new(None),
             seek_hold: Cell::new(None),
-            drop_page: Cell::new(false),
+            drop: Cell::new(crate::dragdrop::DropPage::Off),
+            drop_outcome: Cell::new(crate::dragdrop::DropOutcome::Copied),
             transition: Cell::new(None),
             settings_open: Cell::new(false),
             settings: Cell::new(OecaSettings::default()),
@@ -1833,7 +1934,7 @@ impl Renderer {
         weight: windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT,
         style: windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STYLE,
     ) -> Result<IDWriteTextFormat> {
-        self.create_text_format_in(ui_font(&self.dwrite_factory).1, font_size, weight, style)
+        self.create_text_format_in(&ui_font(&self.dwrite_factory), font_size, weight, style)
     }
 
     /// A role's single-line format at `scale`, aligned `align`.
@@ -1845,17 +1946,17 @@ impl Renderer {
     ) -> Result<IDWriteTextFormat> {
         let style = role.style();
         self.create_line_format(
-            ui_font(&self.dwrite_factory).1,
+            &ui_font(&self.dwrite_factory),
             style.size * scale,
             DWRITE_FONT_WEIGHT(style.weight),
             align,
         )
     }
 
-    /// Text format in `family`, falling back to Segoe UI if it is not installed.
+    /// Text format in `font` (its family, in its collection).
     fn create_text_format_in(
         &self,
-        family: windows::core::PCWSTR,
+        font: &UiFont,
         font_size: f32,
         weight: windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT,
         style: windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STYLE,
@@ -1863,8 +1964,8 @@ impl Renderer {
         let locale: Vec<u16> = "en-us\0".encode_utf16().collect();
         let format_result = unsafe {
             self.dwrite_factory.CreateTextFormat(
-                family,
-                None,
+                font.family,
+                font.collection.as_ref(),
                 weight,
                 style,
                 DWRITE_FONT_STRETCH_NORMAL,
@@ -2328,9 +2429,24 @@ fn build_shadow_mask(
             y as f32,
         );
         let bottom_fade = smoothstep(0.0, edge_fade, (height - 1 - y) as f32);
+        // The row's share of the weight, once per row; zero rows stay zero
+        let row_weight = peak * vertical * bottom_fade;
+        if row_weight == 0.0 {
+            row.fill(0);
+            continue;
+        }
         for (x, v) in row.iter_mut().enumerate() {
+            // Never drawn under the opaque body (`composite_shadow`)
+            if alpha_at(x, y) == 255 {
+                continue;
+            }
             let side = x.min(width - 1 - x) as f32;
-            let weight = peak * vertical * bottom_fade * smoothstep(0.0, edge_fade, side);
+            // Away from the side edges the edge factor is exactly 1.0
+            let weight = if side >= edge_fade {
+                row_weight
+            } else {
+                row_weight * smoothstep(0.0, edge_fade, side)
+            };
             *v = (f32::from(*v) * weight).round().min(255.0) as u8;
         }
     }
@@ -2368,51 +2484,98 @@ const SHADOW_EDGE_FADE: f32 = 4.0;
 const SHADOW_SHOULDER_FADE: f32 = 28.0;
 /// Multiplier on the per-state shadow opacity (0.28 expanded -> ~0.78 peak).
 const SHADOW_STRENGTH: f32 = 2.8;
+/// `(sum + w / 2) / w`, the box blurs' rounded average, as a multiply and a
+/// shift: exact for every sum a window of `w` u8 values can reach (tested
+/// for every odd `w` up to 121; blur windows are ~11-61 wide).
+#[derive(Clone, Copy)]
+struct RoundDiv {
+    half: u32,
+    inv: u64,
+}
+
+impl RoundDiv {
+    fn new(w: u32) -> Self {
+        Self {
+            half: w / 2,
+            inv: (1u64 << 32).div_ceil(u64::from(w)),
+        }
+    }
+
+    #[inline]
+    fn apply(self, sum: u32) -> u8 {
+        ((u64::from(sum + self.half) * self.inv) >> 32) as u8
+    }
+}
+
 #[inline]
 fn box_blur_horizontal(src: &[u8], dst: &mut [u8], width: usize, height: usize, radius: usize) {
-    let window_size = (radius * 2 + 1) as u32;
+    let div = RoundDiv::new((radius * 2 + 1) as u32);
 
     for y in 0..height {
         let row_offset = y * width;
+        // A row like the one above blurs like it (most of the notch body)
+        if y > 0 && src[row_offset..row_offset + width] == src[row_offset - width..row_offset] {
+            dst.copy_within(row_offset - width..row_offset, row_offset);
+            continue;
+        }
         let mut sum: u32 = 0;
 
         for x_rel in -(radius as isize)..=(radius as isize) {
             let clamped_x = x_rel.clamp(0, (width - 1) as isize) as usize;
             sum += src[row_offset + clamped_x] as u32;
         }
-        dst[row_offset] = ((sum + window_size / 2) / window_size) as u8;
+        dst[row_offset] = div.apply(sum);
 
         for x in 1..width {
             let add_x = (x + radius).min(width - 1);
             let sub_x = (x as isize - radius as isize - 1).max(0) as usize;
             sum += src[row_offset + add_x] as u32;
             sum -= src[row_offset + sub_x] as u32;
-            dst[row_offset + x] = ((sum + window_size / 2) / window_size) as u8;
+            dst[row_offset + x] = div.apply(sum);
         }
     }
 }
 
+/// The vertical pass, walked row by row (cache-friendly) with one running sum
+/// per column: the same sums, in the same order, as a column-by-column walk.
 #[inline]
 fn box_blur_vertical(src: &[u8], dst: &mut [u8], width: usize, height: usize, radius: usize) {
-    let window_size = (radius * 2 + 1) as u32;
+    thread_local! {
+        // Kept between frames: no allocation once it has grown to the width
+        static SUMS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let div = RoundDiv::new((radius * 2 + 1) as u32);
+    let row = |y: usize| &src[y * width..(y + 1) * width];
 
-    for x in 0..width {
-        let mut sum: u32 = 0;
-
+    SUMS.with_borrow_mut(|sums| {
+        sums.clear();
+        sums.resize(width, 0);
         for y_rel in -(radius as isize)..=(radius as isize) {
             let clamped_y = y_rel.clamp(0, (height - 1) as isize) as usize;
-            sum += src[clamped_y * width + x] as u32;
+            for (s, &v) in sums.iter_mut().zip(row(clamped_y)) {
+                *s += u32::from(v);
+            }
         }
-        dst[x] = ((sum + window_size / 2) / window_size) as u8;
+        for (d, &s) in dst[..width].iter_mut().zip(sums.iter()) {
+            *d = div.apply(s);
+        }
 
         for y in 1..height {
-            let add_y = (y + radius).min(height - 1);
-            let sub_y = (y as isize - radius as isize - 1).max(0) as usize;
-            sum += src[add_y * width + x] as u32;
-            sum -= src[sub_y * width + x] as u32;
-            dst[y * width + x] = ((sum + window_size / 2) / window_size) as u8;
+            let add = row((y + radius).min(height - 1));
+            let sub = row((y as isize - radius as isize - 1).max(0) as usize);
+            // The row entering the window equals the one leaving: the sums,
+            // and so the output row, are unchanged
+            if add == sub {
+                dst.copy_within((y - 1) * width..y * width, y * width);
+                continue;
+            }
+            let out = &mut dst[y * width..(y + 1) * width];
+            for x in 0..width {
+                sums[x] = sums[x] + u32::from(add[x]) - u32::from(sub[x]);
+                out[x] = div.apply(sums[x]);
+            }
         }
-    }
+    });
 }
 
 impl Renderer {
@@ -2579,7 +2742,7 @@ impl Renderer {
         Ok(())
     }
 
-    /// Space icons (Material Symbols; see `HOUSE_BLANK` /
+    /// Space icons (Oeca's own; see `HOUSE_BLANK` /
     /// `MUSIC_ALT`), filled in a `u`-sized box centred on (cx, cy).
     fn draw_space_icon(
         &self,
@@ -2635,9 +2798,10 @@ impl Renderer {
         Ok(())
     }
 
-    /// Drop page, a fresh surface while an image is dragged over the notch: a
+    /// Drop page, a fresh surface while files are dragged over the notch: a
     /// rounded dashed outline inset from the notch body (same corner profile as
-    /// the notch) with the inbox glyph centred in it. Nothing else is drawn.
+    /// the notch) with the inbox glyph centred in it. Files that are not
+    /// images dim the glyph and add a one-line hint under it.
     /// The page is always laid out for its one universal size (the Clipboard
     /// notch) and clipped to the current silhouette, so while the notch opens
     /// or resizes it is revealed in place: the dashes never re-flow or crawl.
@@ -2667,16 +2831,111 @@ impl Renderer {
         );
         let path = self.smooth_rect_path(outline, profile.span, profile.handle)?;
         let silhouette = self.create_notch_geometry(dimensions)?;
+        let unsupported = self.drop.get() == crate::dragdrop::DropPage::Unsupported;
         self.with_layer(rt, Some(&silhouette), 1.0, || unsafe {
             let dashes = rt.CreateSolidColorBrush(&COLOR_DROP_OUTLINE, None)?;
             rt.DrawGeometry(&path, &dashes, width, &self.drop_stroke);
-            let icon = rt.CreateSolidColorBrush(&COLOR_DROP_ICON, None)?;
             let (cx, cy) = (
                 (outline.left + outline.right) / 2.0,
                 (outline.top + outline.bottom) / 2.0,
             );
-            self.draw_glyph(rt, INBOX, cx, cy, px(BASE_DROP_ICON_SIZE), &icon)
+            if !unsupported {
+                let icon = rt.CreateSolidColorBrush(&COLOR_DROP_ICON, None)?;
+                return self.draw_glyph(rt, INBOX, cx, cy, px(BASE_DROP_ICON_SIZE), &icon);
+            }
+            let icon = rt.CreateSolidColorBrush(&COLOR_TEXT_TERTIARY, None)?;
+            self.draw_drop_message(
+                rt,
+                &target,
+                outline,
+                INBOX,
+                &icon,
+                DROP_UNSUPPORTED_LABEL,
+                &COLOR_TEXT_TERTIARY,
+            )
         })
+    }
+
+    /// A drop's result, on the drop page's surface: a check and "Item copied
+    /// to clipboard", or an alert and why not. Laid out like the drop page
+    /// (one universal size, clipped to the current silhouette); it fades in
+    /// over the page through the scene blend.
+    fn draw_drop_result(&self, rt: &ID2D1RenderTarget, dimensions: &NotchDimensions) -> Result<()> {
+        let target = drop_page_dimensions(dimensions.dpi);
+        let px = |v: f32| (v * target.scale).round();
+        let wall = target.shadow_margin_x + target.curvature.top_transition_radius;
+        let inset = px(BASE_DROP_OUTLINE_INSET);
+        let dx = ((dimensions.width - target.width) as f32 / 2.0).round();
+        let area = RectF::new(
+            dx + wall + inset,
+            inset,
+            dx + target.width as f32 - wall - inset,
+            target.height as f32 - target.shadow_margin_bottom - inset,
+        );
+        if area.width() <= 0.0 || area.height() <= 0.0 {
+            return Ok(());
+        }
+        let outcome = self.drop_outcome.get();
+        let (glyph, glyph_color, text_color) = if outcome.succeeded() {
+            (DONE, COLOR_DROP_ICON, COLOR_TEXT_PRIMARY)
+        } else {
+            (ALERT, COLOR_TEXT_TERTIARY, COLOR_TEXT_SECONDARY)
+        };
+        let silhouette = self.create_notch_geometry(dimensions)?;
+        self.with_layer(rt, Some(&silhouette), 1.0, || unsafe {
+            let icon = rt.CreateSolidColorBrush(&glyph_color, None)?;
+            self.draw_drop_message(
+                rt,
+                &target,
+                area,
+                glyph,
+                &icon,
+                outcome.message(),
+                &text_color,
+            )
+        })
+    }
+
+    /// A glyph with a one-line message under it, centred as a pair in `area`
+    /// (laid out at the drop page's size, `target`).
+    #[allow(clippy::too_many_arguments)]
+    fn draw_drop_message(
+        &self,
+        rt: &ID2D1RenderTarget,
+        target: &NotchDimensions,
+        area: RectF,
+        glyph: &[IconSeg],
+        icon: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
+        message: &str,
+        color: &D2D1_COLOR_F,
+    ) -> Result<()> {
+        let px = |v: f32| (v * target.scale).round();
+        let size = px(BASE_DROP_RESULT_ICON_SIZE);
+        let line = px(BASE_DROP_MESSAGE_LINE);
+        let gap = px(BASE_DROP_MESSAGE_GAP);
+        let top = ((area.top + area.bottom) - (size + gap + line)) / 2.0;
+        let cx = (area.left + area.right) / 2.0;
+        self.draw_glyph(rt, glyph, cx, top + size / 2.0, size, icon)?;
+        let formats = self.media_formats(target)?;
+        let text: Vec<u16> = message.encode_utf16().collect();
+        let row = RectF::new(
+            area.left,
+            top + size + gap,
+            area.right,
+            top + size + gap + line,
+        );
+        unsafe {
+            let brush = rt.CreateSolidColorBrush(color, None)?;
+            rt.DrawText(
+                &text,
+                &formats.empty,
+                &row.to_d2d_rect(),
+                &brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+        Ok(())
     }
 
     /// Runs `draw` inside a layer clipped to `mask` (if any) at `opacity`.
@@ -2765,7 +3024,7 @@ impl Renderer {
                     0.0
                 }
             };
-            let selector_alpha = 1.0 - weight(Scene::Drop);
+            let selector_alpha = 1.0 - weight(Scene::Drop) - weight(Scene::Dropped);
             if selector_alpha > 0.0 {
                 let mix = if blending { t.mix } else { 1.0 };
                 self.draw_selector_blended(rt, dims, t.from, t.to, mix, selector_alpha)?;
@@ -2806,6 +3065,7 @@ impl Renderer {
     ) -> Result<()> {
         let (space, settings) = match scene {
             Scene::Drop => return self.draw_drop_page(rt, dims),
+            Scene::Dropped => return self.draw_drop_result(rt, dims),
             Scene::Settings => (PANEL_SPACE, true),
             Scene::Space(space) => (space, false),
         };
@@ -4211,13 +4471,13 @@ impl Renderer {
     /// Single-line text format with ellipsis trimming (never wraps, never overflows).
     fn create_line_format(
         &self,
-        family: windows::core::PCWSTR,
+        font: &UiFont,
         font_size: f32,
         weight: windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT,
         alignment: DWRITE_TEXT_ALIGNMENT,
     ) -> Result<IDWriteTextFormat> {
         let format =
-            self.create_text_format_in(family, font_size, weight, DWRITE_FONT_STYLE_NORMAL)?;
+            self.create_text_format_in(font, font_size, weight, DWRITE_FONT_STYLE_NORMAL)?;
         unsafe {
             format.SetTextAlignment(alignment)?;
             format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
@@ -5032,7 +5292,8 @@ impl Drop for Renderer {
 }
 
 /// One step of an icon outline in a unit box (-0.5..0.5, y down): move, line,
-/// cubic Bezier (two controls, end), close.
+/// cubic Bezier (two controls, end), close. Outlines fill with the nonzero
+/// (winding) rule (`fill_glyph`).
 #[derive(Clone, Copy)]
 pub(crate) enum IconSeg {
     M(f32, f32),
@@ -5041,411 +5302,514 @@ pub(crate) enum IconSeg {
     Z,
 }
 
-// Icons: Material Symbols (Rounded) by Google (https://fonts.google.com/icons,
-// Apache License 2.0), converted from their SVG paths (24 x 24 grid, quadratics
-// turned into cubics) and scaled to the box each icon occupies. Filled
-// even-odd, like every IconSeg path.
-/// Material Symbols `home` (rounded, filled): the Home space.
+// Icons: Oeca's own, made by `assets/icons/generate.py` (edit and re-run it
+// rather than these numbers): rounded polygons, circles and arcs on a 24 x 24
+// grid, and Ujval's own Copy icon from its SVG path; each scaled to the box it
+// occupies. Solid shapes and holes run in opposite directions: filled with the
+// nonzero rule, overlaps merge and holes cut out.
+/// Home: a soft-roofed house with an arched door; the Home space.
 const HOUSE_BLANK: &[IconSeg] = &[
-    IconSeg::M(-0.4571, 0.3857),
-    IconSeg::L(-0.4571, -0.1286),
-    IconSeg::C(-0.4571, -0.1467, -0.4531, -0.1638, -0.4450, -0.1800),
-    IconSeg::C(-0.4369, -0.1962, -0.4257, -0.2095, -0.4114, -0.2200),
-    IconSeg::L(-0.0686, -0.4771),
-    IconSeg::C(-0.0486, -0.4924, -0.0257, -0.5000, 0.0000, -0.5000),
-    IconSeg::C(0.0257, -0.5000, 0.0486, -0.4924, 0.0686, -0.4771),
-    IconSeg::L(0.4114, -0.2200),
-    IconSeg::C(0.4257, -0.2095, 0.4369, -0.1962, 0.4450, -0.1800),
-    IconSeg::C(0.4531, -0.1638, 0.4572, -0.1467, 0.4571, -0.1286),
-    IconSeg::L(0.4571, 0.3857),
-    IconSeg::C(0.4571, 0.4171, 0.4459, 0.4441, 0.4235, 0.4665),
-    IconSeg::C(0.4011, 0.4889, 0.3742, 0.5000, 0.3429, 0.5000),
-    IconSeg::L(0.1714, 0.5000),
-    IconSeg::C(0.1552, 0.5000, 0.1417, 0.4945, 0.1307, 0.4835),
-    IconSeg::C(0.1198, 0.4726, 0.1143, 0.4590, 0.1143, 0.4429),
-    IconSeg::L(0.1143, 0.1571),
-    IconSeg::C(0.1143, 0.1410, 0.1088, 0.1274, 0.0978, 0.1165),
-    IconSeg::C(0.0869, 0.1055, 0.0733, 0.1000, 0.0571, 0.1000),
-    IconSeg::L(-0.0571, 0.1000),
-    IconSeg::C(-0.0733, 0.1000, -0.0869, 0.1055, -0.0978, 0.1165),
-    IconSeg::C(-0.1088, 0.1274, -0.1142, 0.1410, -0.1143, 0.1571),
-    IconSeg::L(-0.1143, 0.4429),
-    IconSeg::C(-0.1143, 0.4590, -0.1198, 0.4726, -0.1307, 0.4836),
-    IconSeg::C(-0.1417, 0.4946, -0.1553, 0.5000, -0.1714, 0.5000),
-    IconSeg::L(-0.3429, 0.5000),
-    IconSeg::C(-0.3743, 0.5000, -0.4012, 0.4888, -0.4235, 0.4665),
-    IconSeg::C(-0.4459, 0.4441, -0.4571, 0.4172, -0.4571, 0.3857),
+    IconSeg::M(0.0900, -0.4521),
+    IconSeg::L(0.4625, -0.1444),
+    IconSeg::C(0.4863, -0.1248, 0.5000, -0.0956, 0.5000, -0.0648),
+    IconSeg::L(0.5000, 0.3540),
+    IconSeg::C(0.5000, 0.4320, 0.4367, 0.4953, 0.3587, 0.4953),
+    IconSeg::L(0.2011, 0.4953),
+    IconSeg::C(0.1681, 0.4953, 0.1413, 0.4685, 0.1413, 0.4355),
+    IconSeg::L(0.1413, 0.2942),
+    IconSeg::C(0.1413, 0.2312, 0.0902, 0.1801, 0.0272, 0.1801),
+    IconSeg::L(-0.0272, 0.1801),
+    IconSeg::C(-0.0902, 0.1801, -0.1413, 0.2312, -0.1413, 0.2942),
+    IconSeg::L(-0.1413, 0.4355),
+    IconSeg::C(-0.1413, 0.4685, -0.1681, 0.4953, -0.2011, 0.4953),
+    IconSeg::L(-0.3587, 0.4953),
+    IconSeg::C(-0.4367, 0.4953, -0.5000, 0.4320, -0.5000, 0.3540),
+    IconSeg::L(-0.5000, -0.0648),
+    IconSeg::C(-0.5000, -0.0956, -0.4863, -0.1248, -0.4625, -0.1444),
+    IconSeg::L(-0.0900, -0.4521),
+    IconSeg::C(-0.0378, -0.4953, 0.0378, -0.4953, 0.0900, -0.4521),
     IconSeg::Z,
 ];
-/// Material Symbols `music_note` pair (rounded, filled): the Music space.
+/// Music: two beamed notes; the Music space.
 pub(crate) const MUSIC_ALT: &[IconSeg] = &[
-    IconSeg::M(-0.4347, 0.4296),
-    IconSeg::C(-0.4782, 0.3861, -0.5000, 0.3338, -0.5000, 0.2727),
-    IconSeg::C(-0.5000, 0.2115, -0.4782, 0.1592, -0.4347, 0.1157),
-    IconSeg::C(-0.3912, 0.0722, -0.3389, 0.0504, -0.2778, 0.0504),
-    IconSeg::C(-0.2565, 0.0504, -0.2368, 0.0530, -0.2187, 0.0581),
-    IconSeg::C(-0.2006, 0.0632, -0.1833, 0.0708, -0.1667, 0.0810),
-    IconSeg::L(-0.1667, -0.3468),
-    IconSeg::C(-0.1667, -0.3607, -0.1623, -0.3729, -0.1534, -0.3836),
-    IconSeg::C(-0.1446, -0.3942, -0.1338, -0.4005, -0.1208, -0.4023),
-    IconSeg::L(0.4347, -0.4940),
-    IconSeg::C(0.4514, -0.4968, 0.4664, -0.4928, 0.4799, -0.4822),
-    IconSeg::C(0.4933, -0.4715, 0.5000, -0.4574, 0.5000, -0.4398),
-    IconSeg::L(0.5000, 0.1615),
-    IconSeg::C(0.5000, 0.2227, 0.4782, 0.2750, 0.4347, 0.3185),
-    IconSeg::C(0.3912, 0.3620, 0.3389, 0.3838, 0.2778, 0.3838),
-    IconSeg::C(0.2167, 0.3838, 0.1644, 0.3620, 0.1208, 0.3185),
-    IconSeg::C(0.0773, 0.2750, 0.0556, 0.2227, 0.0556, 0.1615),
-    IconSeg::C(0.0556, 0.1004, 0.0773, 0.0481, 0.1208, 0.0046),
-    IconSeg::C(0.1644, -0.0389, 0.2167, -0.0607, 0.2778, -0.0607),
-    IconSeg::C(0.2991, -0.0607, 0.3188, -0.0581, 0.3368, -0.0530),
-    IconSeg::C(0.3549, -0.0479, 0.3723, -0.0403, 0.3889, -0.0301),
-    IconSeg::L(0.3889, -0.2593),
-    IconSeg::L(-0.0556, -0.1718),
-    IconSeg::L(-0.0556, 0.2727),
-    IconSeg::C(-0.0556, 0.3338, -0.0773, 0.3861, -0.1208, 0.4296),
-    IconSeg::C(-0.1644, 0.4731, -0.2167, 0.4949, -0.2778, 0.4949),
-    IconSeg::C(-0.3389, 0.4949, -0.3912, 0.4731, -0.4347, 0.4296),
+    IconSeg::M(-0.1000, 0.2895),
+    IconSeg::C(-0.1000, 0.3999, -0.1895, 0.4895, -0.3000, 0.4895),
+    IconSeg::C(-0.4105, 0.4895, -0.5000, 0.3999, -0.5000, 0.2895),
+    IconSeg::C(-0.5000, 0.1790, -0.4105, 0.0895, -0.3000, 0.0895),
+    IconSeg::C(-0.1895, 0.0895, -0.1000, 0.1790, -0.1000, 0.2895),
+    IconSeg::Z,
+    IconSeg::M(0.5000, 0.1450),
+    IconSeg::C(0.5000, 0.2555, 0.4105, 0.3450, 0.3000, 0.3450),
+    IconSeg::C(0.1895, 0.3450, 0.1000, 0.2555, 0.1000, 0.1450),
+    IconSeg::C(0.1000, 0.0346, 0.1895, -0.0550, 0.3000, -0.0550),
+    IconSeg::C(0.4105, -0.0550, 0.5000, 0.0346, 0.5000, 0.1450),
+    IconSeg::Z,
+    IconSeg::M(-0.1556, -0.2994),
+    IconSeg::L(-0.1500, -0.2994),
+    IconSeg::C(-0.1224, -0.2994, -0.1000, -0.2770, -0.1000, -0.2494),
+    IconSeg::L(-0.1000, 0.2395),
+    IconSeg::C(-0.1000, 0.2671, -0.1224, 0.2895, -0.1500, 0.2895),
+    IconSeg::L(-0.1556, 0.2895),
+    IconSeg::C(-0.1832, 0.2895, -0.2056, 0.2671, -0.2056, 0.2395),
+    IconSeg::L(-0.2056, -0.2494),
+    IconSeg::C(-0.2056, -0.2770, -0.1832, -0.2994, -0.1556, -0.2994),
+    IconSeg::Z,
+    IconSeg::M(0.4444, -0.4550),
+    IconSeg::L(0.4500, -0.4550),
+    IconSeg::C(0.4776, -0.4550, 0.5000, -0.4326, 0.5000, -0.4050),
+    IconSeg::L(0.5000, 0.0950),
+    IconSeg::C(0.5000, 0.1227, 0.4776, 0.1450, 0.4500, 0.1450),
+    IconSeg::L(0.4444, 0.1450),
+    IconSeg::C(0.4168, 0.1450, 0.3944, 0.1227, 0.3944, 0.0950),
+    IconSeg::L(0.3944, -0.4050),
+    IconSeg::C(0.3944, -0.4326, 0.4168, -0.4550, 0.4444, -0.4550),
+    IconSeg::Z,
+    IconSeg::M(-0.1544, -0.3280),
+    IconSeg::L(0.4234, -0.4793),
+    IconSeg::C(0.4621, -0.4895, 0.5000, -0.4603, 0.5000, -0.4202),
+    IconSeg::L(0.5000, -0.3299),
+    IconSeg::C(0.5000, -0.3021, 0.4813, -0.2778, 0.4544, -0.2708),
+    IconSeg::L(-0.1234, -0.1195),
+    IconSeg::C(-0.1621, -0.1093, -0.2000, -0.1385, -0.2000, -0.1786),
+    IconSeg::L(-0.2000, -0.2689),
+    IconSeg::C(-0.2000, -0.2967, -0.1813, -0.3210, -0.1544, -0.3280),
     IconSeg::Z,
 ];
-/// Material Symbols `content_paste` (rounded): the Clipboard space.
+/// Clipboard: a board and its clip; the Clipboard space.
 pub(crate) const CLIPBOARD: &[IconSeg] = &[
-    IconSeg::M(-0.3500, 0.5000),
-    IconSeg::C(-0.3775, 0.5000, -0.4010, 0.4902, -0.4206, 0.4707),
-    IconSeg::C(-0.4402, 0.4511, -0.4500, 0.4275, -0.4500, 0.4000),
-    IconSeg::L(-0.4500, -0.3000),
-    IconSeg::C(-0.4500, -0.3275, -0.4402, -0.3510, -0.4206, -0.3706),
-    IconSeg::C(-0.4010, -0.3902, -0.3775, -0.4000, -0.3500, -0.4000),
-    IconSeg::L(-0.1412, -0.4000),
-    IconSeg::C(-0.1321, -0.4292, -0.1142, -0.4531, -0.0875, -0.4718),
-    IconSeg::C(-0.0608, -0.4906, -0.0317, -0.5000, 0.0000, -0.5000),
-    IconSeg::C(0.0333, -0.5000, 0.0631, -0.4906, 0.0894, -0.4718),
-    IconSeg::C(0.1157, -0.4531, 0.1334, -0.4291, 0.1425, -0.4000),
-    IconSeg::L(0.3500, -0.4000),
-    IconSeg::C(0.3775, -0.4000, 0.4011, -0.3902, 0.4207, -0.3706),
-    IconSeg::C(0.4403, -0.3510, 0.4500, -0.3275, 0.4500, -0.3000),
-    IconSeg::L(0.4500, 0.4000),
-    IconSeg::C(0.4500, 0.4275, 0.4402, 0.4511, 0.4207, 0.4707),
-    IconSeg::C(0.4011, 0.4903, 0.3775, 0.5000, 0.3500, 0.5000),
+    IconSeg::M(-0.2647, -0.3627),
+    IconSeg::L(-0.3088, -0.3627),
+    IconSeg::C(-0.2845, -0.3627, -0.2647, -0.3430, -0.2647, -0.3186),
+    IconSeg::L(-0.2647, -0.2451),
+    IconSeg::C(-0.2647, -0.2018, -0.2296, -0.1667, -0.1863, -0.1667),
+    IconSeg::L(0.1863, -0.1667),
+    IconSeg::C(0.2296, -0.1667, 0.2647, -0.2018, 0.2647, -0.2451),
+    IconSeg::L(0.2647, -0.3186),
+    IconSeg::C(0.2647, -0.3430, 0.2845, -0.3627, 0.3088, -0.3627),
+    IconSeg::L(0.2647, -0.3627),
+    IconSeg::C(0.3459, -0.3627, 0.4118, -0.2969, 0.4118, -0.2157),
+    IconSeg::L(0.4118, 0.3529),
+    IconSeg::C(0.4118, 0.4344, 0.3459, 0.5000, 0.2647, 0.5000),
+    IconSeg::L(-0.2647, 0.5000),
+    IconSeg::C(-0.3459, 0.5000, -0.4118, 0.4344, -0.4118, 0.3529),
+    IconSeg::L(-0.4118, -0.2157),
+    IconSeg::C(-0.4118, -0.2969, -0.3459, -0.3627, -0.2647, -0.3627),
     IconSeg::Z,
-    IconSeg::M(-0.3500, 0.4000),
-    IconSeg::L(0.3500, 0.4000),
-    IconSeg::L(0.3500, -0.3000),
-    IconSeg::L(0.2500, -0.3000),
-    IconSeg::L(0.2500, -0.2000),
-    IconSeg::C(0.2500, -0.1858, 0.2452, -0.1740, 0.2356, -0.1643),
-    IconSeg::C(0.2260, -0.1547, 0.2141, -0.1500, 0.2000, -0.1500),
-    IconSeg::L(-0.2000, -0.1500),
-    IconSeg::C(-0.2142, -0.1500, -0.2260, -0.1548, -0.2356, -0.1644),
-    IconSeg::C(-0.2452, -0.1740, -0.2500, -0.1859, -0.2500, -0.2000),
-    IconSeg::L(-0.2500, -0.3000),
-    IconSeg::L(-0.3500, -0.3000),
-    IconSeg::Z,
-    IconSeg::M(0.0357, -0.3144),
-    IconSeg::C(0.0452, -0.3240, 0.0500, -0.3358, 0.0500, -0.3500),
-    IconSeg::C(0.0500, -0.3642, 0.0452, -0.3760, 0.0356, -0.3856),
-    IconSeg::C(0.0260, -0.3952, 0.0141, -0.4000, 0.0000, -0.4000),
-    IconSeg::C(-0.0141, -0.4000, -0.0260, -0.3952, -0.0356, -0.3856),
-    IconSeg::C(-0.0452, -0.3760, -0.0500, -0.3641, -0.0500, -0.3500),
-    IconSeg::C(-0.0500, -0.3359, -0.0452, -0.3240, -0.0356, -0.3144),
-    IconSeg::C(-0.0260, -0.3047, -0.0141, -0.2999, 0.0000, -0.3000),
-    IconSeg::C(0.0141, -0.3001, 0.0260, -0.3049, 0.0356, -0.3144),
+    IconSeg::M(-0.0686, -0.5000),
+    IconSeg::L(0.0686, -0.5000),
+    IconSeg::C(0.1174, -0.5000, 0.1569, -0.4605, 0.1569, -0.4118),
+    IconSeg::L(0.1569, -0.3529),
+    IconSeg::C(0.1569, -0.3042, 0.1174, -0.2647, 0.0686, -0.2647),
+    IconSeg::L(-0.0686, -0.2647),
+    IconSeg::C(-0.1174, -0.2647, -0.1569, -0.3042, -0.1569, -0.3529),
+    IconSeg::L(-0.1569, -0.4118),
+    IconSeg::C(-0.1569, -0.4605, -0.1174, -0.5000, -0.0686, -0.5000),
     IconSeg::Z,
 ];
-/// Material Symbols `palette` (rounded, filled): Settings window, Appearance.
+/// Palette: three paint wells and a thumb notch; Settings window, Appearance.
 pub(crate) const PALETTE: &[IconSeg] = &[
-    IconSeg::M(0.0000, 0.5000),
-    IconSeg::C(-0.0683, 0.5000, -0.1329, 0.4869, -0.1938, 0.4606),
-    IconSeg::C(-0.2546, 0.4344, -0.3077, 0.3985, -0.3531, 0.3531),
-    IconSeg::C(-0.3985, 0.3077, -0.4344, 0.2546, -0.4606, 0.1938),
-    IconSeg::C(-0.4869, 0.1329, -0.5000, 0.0683, -0.5000, 0.0000),
-    IconSeg::C(-0.5000, -0.0692, -0.4864, -0.1342, -0.4594, -0.1950),
-    IconSeg::C(-0.4323, -0.2558, -0.3956, -0.3088, -0.3494, -0.3538),
-    IconSeg::C(-0.3031, -0.3987, -0.2492, -0.4344, -0.1875, -0.4606),
-    IconSeg::C(-0.1258, -0.4868, -0.0600, -0.5000, 0.0100, -0.5000),
-    IconSeg::C(0.0767, -0.5000, 0.1396, -0.4885, 0.1987, -0.4656),
-    IconSeg::C(0.2579, -0.4427, 0.3098, -0.4110, 0.3544, -0.3706),
-    IconSeg::C(0.3990, -0.3302, 0.4344, -0.2823, 0.4607, -0.2269),
-    IconSeg::C(0.4869, -0.1714, 0.5000, -0.1116, 0.5000, -0.0475),
-    IconSeg::C(0.5000, 0.0483, 0.4708, 0.1219, 0.4125, 0.1732),
-    IconSeg::C(0.3542, 0.2244, 0.2833, 0.2500, 0.2000, 0.2500),
-    IconSeg::L(0.1075, 0.2500),
-    IconSeg::C(0.1000, 0.2500, 0.0948, 0.2521, 0.0919, 0.2563),
-    IconSeg::C(0.0890, 0.2604, 0.0875, 0.2650, 0.0875, 0.2700),
-    IconSeg::C(0.0875, 0.2800, 0.0938, 0.2944, 0.1063, 0.3131),
-    IconSeg::C(0.1188, 0.3319, 0.1250, 0.3534, 0.1250, 0.3775),
-    IconSeg::C(0.1250, 0.4192, 0.1136, 0.4500, 0.0907, 0.4700),
-    IconSeg::C(0.0678, 0.4900, 0.0375, 0.5000, 0.0000, 0.5000),
+    IconSeg::M(0.1376, 0.4790),
+    IconSeg::L(0.1219, 0.4850),
+    IconSeg::L(0.0935, 0.4912),
+    IconSeg::L(0.0649, 0.4958),
+    IconSeg::L(0.0360, 0.4988),
+    IconSeg::L(0.0070, 0.5000),
+    IconSeg::L(-0.0221, 0.4996),
+    IconSeg::L(-0.0510, 0.4974),
+    IconSeg::L(-0.0798, 0.4936),
+    IconSeg::L(-0.1083, 0.4882),
+    IconSeg::L(-0.1365, 0.4811),
+    IconSeg::L(-0.1641, 0.4723),
+    IconSeg::L(-0.1913, 0.4620),
+    IconSeg::L(-0.2178, 0.4501),
+    IconSeg::L(-0.2435, 0.4367),
+    IconSeg::L(-0.2685, 0.4219),
+    IconSeg::L(-0.2925, 0.4056),
+    IconSeg::L(-0.3155, 0.3879),
+    IconSeg::L(-0.3375, 0.3689),
+    IconSeg::L(-0.3583, 0.3487),
+    IconSeg::L(-0.3780, 0.3274),
+    IconSeg::L(-0.3963, 0.3049),
+    IconSeg::L(-0.4134, 0.2814),
+    IconSeg::L(-0.4290, 0.2569),
+    IconSeg::L(-0.4432, 0.2316),
+    IconSeg::L(-0.4559, 0.2054),
+    IconSeg::L(-0.4670, 0.1786),
+    IconSeg::L(-0.4766, 0.1512),
+    IconSeg::L(-0.4846, 0.1233),
+    IconSeg::L(-0.4909, 0.0950),
+    IconSeg::L(-0.4956, 0.0663),
+    IconSeg::L(-0.4986, 0.0375),
+    IconSeg::L(-0.5000, 0.0085),
+    IconSeg::L(-0.4996, -0.0206),
+    IconSeg::L(-0.4976, -0.0495),
+    IconSeg::L(-0.4939, -0.0783),
+    IconSeg::L(-0.4885, -0.1068),
+    IconSeg::L(-0.4815, -0.1350),
+    IconSeg::L(-0.4728, -0.1627),
+    IconSeg::L(-0.4626, -0.1899),
+    IconSeg::L(-0.4508, -0.2164),
+    IconSeg::L(-0.4375, -0.2422),
+    IconSeg::L(-0.4227, -0.2672),
+    IconSeg::L(-0.4065, -0.2913),
+    IconSeg::L(-0.3889, -0.3144),
+    IconSeg::L(-0.3700, -0.3364),
+    IconSeg::L(-0.3498, -0.3573),
+    IconSeg::L(-0.3285, -0.3770),
+    IconSeg::L(-0.3061, -0.3955),
+    IconSeg::L(-0.2826, -0.4125),
+    IconSeg::L(-0.2582, -0.4283),
+    IconSeg::L(-0.2329, -0.4425),
+    IconSeg::L(-0.2069, -0.4553),
+    IconSeg::L(-0.1801, -0.4665),
+    IconSeg::L(-0.1527, -0.4762),
+    IconSeg::L(-0.1248, -0.4843),
+    IconSeg::L(-0.0965, -0.4907),
+    IconSeg::L(-0.0679, -0.4955),
+    IconSeg::L(-0.0390, -0.4986),
+    IconSeg::L(-0.0100, -0.5000),
+    IconSeg::L(0.0190, -0.4997),
+    IconSeg::L(0.0480, -0.4978),
+    IconSeg::L(0.0768, -0.4942),
+    IconSeg::L(0.1053, -0.4889),
+    IconSeg::L(0.1335, -0.4820),
+    IconSeg::L(0.1613, -0.4734),
+    IconSeg::L(0.1885, -0.4632),
+    IconSeg::L(0.2150, -0.4515),
+    IconSeg::L(0.2409, -0.4383),
+    IconSeg::L(0.2659, -0.4236),
+    IconSeg::L(0.2900, -0.4074),
+    IconSeg::L(0.3132, -0.3899),
+    IconSeg::L(0.3353, -0.3711),
+    IconSeg::L(0.3562, -0.3510),
+    IconSeg::L(0.3760, -0.3298),
+    IconSeg::L(0.3945, -0.3074),
+    IconSeg::L(0.4117, -0.2840),
+    IconSeg::L(0.4275, -0.2596),
+    IconSeg::L(0.4418, -0.2344),
+    IconSeg::L(0.4547, -0.2083),
+    IconSeg::L(0.4660, -0.1816),
+    IconSeg::L(0.4757, -0.1543),
+    IconSeg::L(0.4839, -0.1264),
+    IconSeg::L(0.4904, -0.0981),
+    IconSeg::L(0.4953, -0.0695),
+    IconSeg::L(0.4985, -0.0406),
+    IconSeg::L(0.5000, -0.0116),
+    IconSeg::L(0.4998, 0.0174),
+    IconSeg::L(0.4979, 0.0464),
+    IconSeg::L(0.4944, 0.0752),
+    IconSeg::L(0.4900, 0.0914),
+    IconSeg::C(0.4773, 0.1376, 0.4224, 0.1570, 0.3836, 0.1289),
+    IconSeg::L(0.3815, 0.1274),
+    IconSeg::L(0.3567, 0.1208),
+    IconSeg::L(0.3311, 0.1178),
+    IconSeg::L(0.3054, 0.1186),
+    IconSeg::L(0.2801, 0.1231),
+    IconSeg::L(0.2557, 0.1312),
+    IconSeg::L(0.2327, 0.1429),
+    IconSeg::L(0.2117, 0.1577),
+    IconSeg::L(0.1930, 0.1754),
+    IconSeg::L(0.1771, 0.1957),
+    IconSeg::L(0.1644, 0.2180),
+    IconSeg::L(0.1550, 0.2420),
+    IconSeg::L(0.1492, 0.2670),
+    IconSeg::L(0.1471, 0.2927),
+    IconSeg::L(0.1488, 0.3184),
+    IconSeg::L(0.1542, 0.3435),
+    IconSeg::L(0.1632, 0.3677),
+    IconSeg::L(0.1648, 0.3695),
+    IconSeg::C(0.1964, 0.4055, 0.1824, 0.4620, 0.1376, 0.4790),
     IconSeg::Z,
-    IconSeg::M(-0.2213, 0.0287),
-    IconSeg::C(-0.2071, 0.0146, -0.2000, -0.0033, -0.2000, -0.0250),
-    IconSeg::C(-0.2000, -0.0467, -0.2071, -0.0646, -0.2213, -0.0787),
-    IconSeg::C(-0.2354, -0.0929, -0.2533, -0.1000, -0.2750, -0.1000),
-    IconSeg::C(-0.2967, -0.1000, -0.3146, -0.0929, -0.3288, -0.0787),
-    IconSeg::C(-0.3429, -0.0646, -0.3500, -0.0467, -0.3500, -0.0250),
-    IconSeg::C(-0.3500, -0.0033, -0.3429, 0.0146, -0.3288, 0.0287),
-    IconSeg::C(-0.3146, 0.0429, -0.2967, 0.0500, -0.2750, 0.0500),
-    IconSeg::C(-0.2533, 0.0500, -0.2354, 0.0429, -0.2213, 0.0287),
+    IconSeg::M(-0.1127, -0.0785),
+    IconSeg::C(-0.1127, -0.1353, -0.1588, -0.1814, -0.2157, -0.1814),
+    IconSeg::C(-0.2725, -0.1814, -0.3186, -0.1353, -0.3186, -0.0785),
+    IconSeg::C(-0.3186, -0.0216, -0.2725, 0.0245, -0.2157, 0.0245),
+    IconSeg::C(-0.1588, 0.0245, -0.1127, -0.0216, -0.1127, -0.0785),
     IconSeg::Z,
-    IconSeg::M(-0.0713, -0.1713),
-    IconSeg::C(-0.0571, -0.1854, -0.0500, -0.2033, -0.0500, -0.2250),
-    IconSeg::C(-0.0500, -0.2467, -0.0571, -0.2646, -0.0713, -0.2787),
-    IconSeg::C(-0.0854, -0.2929, -0.1033, -0.3000, -0.1250, -0.3000),
-    IconSeg::C(-0.1467, -0.3000, -0.1646, -0.2929, -0.1787, -0.2787),
-    IconSeg::C(-0.1929, -0.2646, -0.2000, -0.2467, -0.2000, -0.2250),
-    IconSeg::C(-0.2000, -0.2033, -0.1929, -0.1854, -0.1787, -0.1713),
-    IconSeg::C(-0.1646, -0.1571, -0.1467, -0.1500, -0.1250, -0.1500),
-    IconSeg::C(-0.1033, -0.1500, -0.0854, -0.1571, -0.0713, -0.1713),
+    IconSeg::M(0.1226, -0.2501),
+    IconSeg::C(0.1226, -0.3069, 0.0765, -0.3530, 0.0196, -0.3530),
+    IconSeg::C(-0.0372, -0.3530, -0.0833, -0.3069, -0.0833, -0.2501),
+    IconSeg::C(-0.0833, -0.1932, -0.0372, -0.1471, 0.0196, -0.1471),
+    IconSeg::C(0.0765, -0.1471, 0.1226, -0.1932, 0.1226, -0.2501),
     IconSeg::Z,
-    IconSeg::M(0.1787, -0.1713),
-    IconSeg::C(0.1929, -0.1854, 0.2000, -0.2033, 0.2000, -0.2250),
-    IconSeg::C(0.2000, -0.2467, 0.1929, -0.2646, 0.1787, -0.2787),
-    IconSeg::C(0.1646, -0.2929, 0.1467, -0.3000, 0.1250, -0.3000),
-    IconSeg::C(0.1033, -0.3000, 0.0854, -0.2929, 0.0713, -0.2787),
-    IconSeg::C(0.0571, -0.2646, 0.0500, -0.2467, 0.0500, -0.2250),
-    IconSeg::C(0.0500, -0.2033, 0.0571, -0.1854, 0.0713, -0.1713),
-    IconSeg::C(0.0854, -0.1571, 0.1033, -0.1500, 0.1250, -0.1500),
-    IconSeg::C(0.1467, -0.1500, 0.1646, -0.1571, 0.1787, -0.1713),
+    IconSeg::M(0.3481, -0.1177),
+    IconSeg::C(0.3481, -0.1746, 0.3020, -0.2206, 0.2452, -0.2206),
+    IconSeg::C(0.1883, -0.2206, 0.1422, -0.1746, 0.1422, -0.1177),
+    IconSeg::C(0.1422, -0.0608, 0.1883, -0.0147, 0.2452, -0.0147),
+    IconSeg::C(0.3020, -0.0147, 0.3481, -0.0608, 0.3481, -0.1177),
     IconSeg::Z,
-    IconSeg::M(0.3287, 0.0287),
-    IconSeg::C(0.3429, 0.0146, 0.3500, -0.0033, 0.3500, -0.0250),
-    IconSeg::C(0.3500, -0.0467, 0.3429, -0.0646, 0.3287, -0.0787),
-    IconSeg::C(0.3146, -0.0929, 0.2967, -0.1000, 0.2750, -0.1000),
-    IconSeg::C(0.2533, -0.1000, 0.2354, -0.0929, 0.2213, -0.0787),
-    IconSeg::C(0.2071, -0.0646, 0.2000, -0.0467, 0.2000, -0.0250),
-    IconSeg::C(0.2000, -0.0033, 0.2071, 0.0146, 0.2213, 0.0287),
-    IconSeg::C(0.2354, 0.0429, 0.2533, 0.0500, 0.2750, 0.0500),
-    IconSeg::C(0.2967, 0.0500, 0.3146, 0.0429, 0.3287, 0.0287),
+    IconSeg::M(-0.0980, 0.1814),
+    IconSeg::C(-0.0980, 0.1245, -0.1441, 0.0784, -0.2010, 0.0784),
+    IconSeg::C(-0.2578, 0.0784, -0.3039, 0.1245, -0.3039, 0.1814),
+    IconSeg::C(-0.3039, 0.2382, -0.2578, 0.2843, -0.2010, 0.2843),
+    IconSeg::C(-0.1441, 0.2843, -0.0980, 0.2382, -0.0980, 0.1814),
     IconSeg::Z,
 ];
-/// Material Symbols `info` (rounded, filled): Settings window, About.
+/// Info: an "i" cut from a disc; Settings window, About.
 pub(crate) const INFO: &[IconSeg] = &[
-    IconSeg::M(0.0356, 0.2357),
-    IconSeg::C(0.0452, 0.2261, 0.0500, 0.2142, 0.0500, 0.2000),
-    IconSeg::L(0.0500, 0.0000),
-    IconSeg::C(0.0500, -0.0142, 0.0452, -0.0260, 0.0356, -0.0356),
-    IconSeg::C(0.0260, -0.0452, 0.0141, -0.0500, 0.0000, -0.0500),
-    IconSeg::C(-0.0141, -0.0500, -0.0260, -0.0452, -0.0356, -0.0356),
-    IconSeg::C(-0.0452, -0.0260, -0.0500, -0.0141, -0.0500, 0.0000),
-    IconSeg::L(-0.0500, 0.2000),
-    IconSeg::C(-0.0500, 0.2142, -0.0452, 0.2261, -0.0356, 0.2357),
-    IconSeg::C(-0.0260, 0.2453, -0.0141, 0.2500, 0.0000, 0.2500),
-    IconSeg::C(0.0141, 0.2500, 0.0260, 0.2452, 0.0356, 0.2356),
+    IconSeg::M(0.5000, 0.0000),
+    IconSeg::C(0.5000, 0.2761, 0.2761, 0.5000, 0.0000, 0.5000),
+    IconSeg::C(-0.2761, 0.5000, -0.5000, 0.2761, -0.5000, 0.0000),
+    IconSeg::C(-0.5000, -0.2761, -0.2761, -0.5000, 0.0000, -0.5000),
+    IconSeg::C(0.2761, -0.5000, 0.5000, -0.2761, 0.5000, 0.0000),
     IconSeg::Z,
-    IconSeg::M(0.0356, -0.1644),
-    IconSeg::C(0.0452, -0.1740, 0.0500, -0.1858, 0.0500, -0.2000),
-    IconSeg::C(0.0500, -0.2142, 0.0452, -0.2260, 0.0356, -0.2356),
-    IconSeg::C(0.0260, -0.2452, 0.0141, -0.2500, 0.0000, -0.2500),
-    IconSeg::C(-0.0141, -0.2500, -0.0260, -0.2452, -0.0356, -0.2356),
-    IconSeg::C(-0.0452, -0.2260, -0.0500, -0.2141, -0.0500, -0.2000),
-    IconSeg::C(-0.0500, -0.1859, -0.0452, -0.1740, -0.0356, -0.1644),
-    IconSeg::C(-0.0260, -0.1547, -0.0141, -0.1499, 0.0000, -0.1500),
-    IconSeg::C(0.0141, -0.1501, 0.0260, -0.1549, 0.0356, -0.1644),
+    IconSeg::M(0.0784, -0.2255),
+    IconSeg::C(0.0784, -0.2688, 0.0433, -0.3039, 0.0000, -0.3039),
+    IconSeg::C(-0.0433, -0.3039, -0.0784, -0.2688, -0.0784, -0.2255),
+    IconSeg::C(-0.0784, -0.1822, -0.0433, -0.1471, 0.0000, -0.1471),
+    IconSeg::C(0.0433, -0.1471, 0.0784, -0.1822, 0.0784, -0.2255),
     IconSeg::Z,
-    IconSeg::M(0.0000, 0.5000),
-    IconSeg::C(-0.0692, 0.5000, -0.1342, 0.4869, -0.1950, 0.4606),
-    IconSeg::C(-0.2558, 0.4344, -0.3088, 0.3987, -0.3538, 0.3538),
-    IconSeg::C(-0.3987, 0.3088, -0.4344, 0.2559, -0.4606, 0.1950),
-    IconSeg::C(-0.4868, 0.1341, -0.5000, 0.0691, -0.5000, 0.0000),
-    IconSeg::C(-0.5000, -0.0691, -0.4869, -0.1341, -0.4606, -0.1950),
-    IconSeg::C(-0.4344, -0.2559, -0.3987, -0.3088, -0.3538, -0.3538),
-    IconSeg::C(-0.3088, -0.3987, -0.2559, -0.4344, -0.1950, -0.4606),
-    IconSeg::C(-0.1341, -0.4869, -0.0691, -0.5000, 0.0000, -0.5000),
-    IconSeg::C(0.0691, -0.5000, 0.1341, -0.4869, 0.1950, -0.4606),
-    IconSeg::C(0.2559, -0.4344, 0.3088, -0.3987, 0.3538, -0.3538),
-    IconSeg::C(0.3987, -0.3088, 0.4344, -0.2559, 0.4607, -0.1950),
-    IconSeg::C(0.4870, -0.1341, 0.5001, -0.0691, 0.5000, 0.0000),
-    IconSeg::C(0.4999, 0.0691, 0.4868, 0.1341, 0.4606, 0.1950),
-    IconSeg::C(0.4344, 0.2559, 0.3988, 0.3088, 0.3538, 0.3538),
-    IconSeg::C(0.3087, 0.3987, 0.2558, 0.4344, 0.1950, 0.4607),
-    IconSeg::C(0.1342, 0.4870, 0.0692, 0.5001, 0.0000, 0.5000),
+    IconSeg::M(0.0000, 0.3137),
+    IconSeg::L(0.0000, 0.3137),
+    IconSeg::C(0.0379, 0.3137, 0.0686, 0.2830, 0.0686, 0.2451),
+    IconSeg::L(0.0686, -0.0098),
+    IconSeg::C(0.0686, -0.0477, 0.0379, -0.0784, 0.0000, -0.0784),
+    IconSeg::L(0.0000, -0.0784),
+    IconSeg::C(-0.0379, -0.0784, -0.0686, -0.0477, -0.0686, -0.0098),
+    IconSeg::L(-0.0686, 0.2451),
+    IconSeg::C(-0.0686, 0.2830, -0.0379, 0.3137, 0.0000, 0.3137),
     IconSeg::Z,
 ];
-/// Material Symbols `settings` (rounded, filled): the header's Settings icon.
+/// Settings: an eight-tooth gear; the header's Settings icon.
 pub(crate) const GEAR: &[IconSeg] = &[
-    IconSeg::M(-0.0588, 0.5000),
-    IconSeg::C(-0.0813, 0.5000, -0.1006, 0.4925, -0.1169, 0.4775),
-    IconSeg::C(-0.1331, 0.4625, -0.1429, 0.4442, -0.1463, 0.4225),
-    IconSeg::L(-0.1575, 0.3400),
-    IconSeg::C(-0.1683, 0.3358, -0.1785, 0.3308, -0.1881, 0.3250),
-    IconSeg::C(-0.1977, 0.3192, -0.2071, 0.3129, -0.2163, 0.3063),
-    IconSeg::L(-0.2938, 0.3387),
-    IconSeg::C(-0.3146, 0.3479, -0.3354, 0.3487, -0.3563, 0.3412),
-    IconSeg::C(-0.3771, 0.3338, -0.3933, 0.3204, -0.4050, 0.3012),
-    IconSeg::L(-0.4638, 0.1987),
-    IconSeg::C(-0.4754, 0.1796, -0.4788, 0.1592, -0.4738, 0.1375),
-    IconSeg::C(-0.4688, 0.1158, -0.4575, 0.0979, -0.4400, 0.0837),
-    IconSeg::L(-0.3738, 0.0337),
-    IconSeg::C(-0.3746, 0.0279, -0.3750, 0.0223, -0.3750, 0.0168),
-    IconSeg::L(-0.3750, -0.0169),
-    IconSeg::C(-0.3750, -0.0223, -0.3746, -0.0279, -0.3738, -0.0338),
-    IconSeg::L(-0.4400, -0.0838),
-    IconSeg::C(-0.4575, -0.0979, -0.4688, -0.1158, -0.4738, -0.1375),
-    IconSeg::C(-0.4788, -0.1592, -0.4754, -0.1796, -0.4638, -0.1987),
-    IconSeg::L(-0.4050, -0.3013),
-    IconSeg::C(-0.3933, -0.3204, -0.3771, -0.3338, -0.3563, -0.3413),
-    IconSeg::C(-0.3354, -0.3488, -0.3146, -0.3479, -0.2938, -0.3388),
-    IconSeg::L(-0.2163, -0.3063),
-    IconSeg::C(-0.2071, -0.3129, -0.1975, -0.3192, -0.1875, -0.3250),
-    IconSeg::C(-0.1775, -0.3308, -0.1675, -0.3358, -0.1575, -0.3400),
-    IconSeg::L(-0.1463, -0.4225),
-    IconSeg::C(-0.1429, -0.4442, -0.1331, -0.4625, -0.1169, -0.4775),
-    IconSeg::C(-0.1006, -0.4925, -0.0812, -0.5000, -0.0588, -0.5000),
-    IconSeg::L(0.0587, -0.5000),
-    IconSeg::C(0.0812, -0.5000, 0.1006, -0.4925, 0.1169, -0.4775),
-    IconSeg::C(0.1332, -0.4625, 0.1429, -0.4442, 0.1462, -0.4225),
-    IconSeg::L(0.1575, -0.3400),
-    IconSeg::C(0.1683, -0.3358, 0.1785, -0.3308, 0.1881, -0.3250),
-    IconSeg::C(0.1977, -0.3192, 0.2071, -0.3129, 0.2162, -0.3063),
-    IconSeg::L(0.2937, -0.3388),
-    IconSeg::C(0.3146, -0.3479, 0.3354, -0.3488, 0.3562, -0.3413),
-    IconSeg::C(0.3771, -0.3337, 0.3933, -0.3204, 0.4050, -0.3013),
-    IconSeg::L(0.4638, -0.1988),
-    IconSeg::C(0.4754, -0.1796, 0.4788, -0.1592, 0.4738, -0.1375),
-    IconSeg::C(0.4687, -0.1158, 0.4575, -0.0979, 0.4400, -0.0838),
-    IconSeg::L(0.3738, -0.0338),
-    IconSeg::C(0.3746, -0.0279, 0.3750, -0.0223, 0.3750, -0.0169),
-    IconSeg::L(0.3750, 0.0168),
-    IconSeg::C(0.3750, 0.0223, 0.3742, 0.0279, 0.3725, 0.0337),
-    IconSeg::L(0.4387, 0.0837),
-    IconSeg::C(0.4562, 0.0979, 0.4675, 0.1158, 0.4725, 0.1375),
-    IconSeg::C(0.4775, 0.1592, 0.4742, 0.1796, 0.4625, 0.1987),
-    IconSeg::L(0.4025, 0.3012),
-    IconSeg::C(0.3908, 0.3204, 0.3746, 0.3337, 0.3537, 0.3412),
-    IconSeg::C(0.3329, 0.3487, 0.3121, 0.3479, 0.2912, 0.3387),
-    IconSeg::L(0.2162, 0.3062),
-    IconSeg::C(0.2071, 0.3129, 0.1975, 0.3192, 0.1875, 0.3250),
-    IconSeg::C(0.1775, 0.3308, 0.1675, 0.3358, 0.1575, 0.3400),
-    IconSeg::L(0.1462, 0.4225),
-    IconSeg::C(0.1429, 0.4442, 0.1331, 0.4625, 0.1169, 0.4775),
-    IconSeg::C(0.1007, 0.4925, 0.0813, 0.5000, 0.0587, 0.5000),
+    IconSeg::M(-0.1110, -0.3862),
+    IconSeg::L(-0.0988, -0.4618),
+    IconSeg::C(-0.0953, -0.4838, -0.0763, -0.5000, -0.0540, -0.5000),
+    IconSeg::L(0.0540, -0.5000),
+    IconSeg::C(0.0763, -0.5000, 0.0953, -0.4838, 0.0988, -0.4618),
+    IconSeg::L(0.1110, -0.3862),
+    IconSeg::C(0.1133, -0.3723, 0.1227, -0.3604, 0.1358, -0.3550),
+    IconSeg::L(0.1550, -0.3470),
+    IconSeg::C(0.1681, -0.3416, 0.1831, -0.3433, 0.1946, -0.3516),
+    IconSeg::L(0.2567, -0.3965),
+    IconSeg::C(0.2747, -0.4095, 0.2996, -0.4075, 0.3154, -0.3917),
+    IconSeg::L(0.3917, -0.3154),
+    IconSeg::C(0.4075, -0.2996, 0.4095, -0.2747, 0.3965, -0.2567),
+    IconSeg::L(0.3516, -0.1946),
+    IconSeg::C(0.3433, -0.1831, 0.3416, -0.1681, 0.3470, -0.1550),
+    IconSeg::L(0.3550, -0.1358),
+    IconSeg::C(0.3604, -0.1227, 0.3723, -0.1133, 0.3862, -0.1110),
+    IconSeg::L(0.4618, -0.0988),
+    IconSeg::C(0.4838, -0.0953, 0.5000, -0.0763, 0.5000, -0.0540),
+    IconSeg::L(0.5000, 0.0540),
+    IconSeg::C(0.5000, 0.0763, 0.4838, 0.0953, 0.4618, 0.0988),
+    IconSeg::L(0.3862, 0.1110),
+    IconSeg::C(0.3723, 0.1133, 0.3604, 0.1227, 0.3550, 0.1358),
+    IconSeg::L(0.3470, 0.1550),
+    IconSeg::C(0.3416, 0.1681, 0.3433, 0.1831, 0.3516, 0.1946),
+    IconSeg::L(0.3965, 0.2567),
+    IconSeg::C(0.4095, 0.2747, 0.4075, 0.2996, 0.3917, 0.3154),
+    IconSeg::L(0.3154, 0.3917),
+    IconSeg::C(0.2996, 0.4075, 0.2747, 0.4095, 0.2567, 0.3965),
+    IconSeg::L(0.1946, 0.3516),
+    IconSeg::C(0.1831, 0.3433, 0.1681, 0.3416, 0.1550, 0.3470),
+    IconSeg::L(0.1358, 0.3550),
+    IconSeg::C(0.1227, 0.3604, 0.1133, 0.3723, 0.1110, 0.3862),
+    IconSeg::L(0.0988, 0.4618),
+    IconSeg::C(0.0953, 0.4838, 0.0763, 0.5000, 0.0540, 0.5000),
+    IconSeg::L(-0.0540, 0.5000),
+    IconSeg::C(-0.0763, 0.5000, -0.0953, 0.4838, -0.0988, 0.4618),
+    IconSeg::L(-0.1110, 0.3862),
+    IconSeg::C(-0.1133, 0.3723, -0.1227, 0.3604, -0.1358, 0.3550),
+    IconSeg::L(-0.1550, 0.3470),
+    IconSeg::C(-0.1681, 0.3416, -0.1831, 0.3433, -0.1946, 0.3516),
+    IconSeg::L(-0.2567, 0.3965),
+    IconSeg::C(-0.2747, 0.4095, -0.2996, 0.4075, -0.3154, 0.3917),
+    IconSeg::L(-0.3917, 0.3154),
+    IconSeg::C(-0.4075, 0.2996, -0.4095, 0.2747, -0.3965, 0.2567),
+    IconSeg::L(-0.3516, 0.1946),
+    IconSeg::C(-0.3433, 0.1831, -0.3416, 0.1681, -0.3470, 0.1550),
+    IconSeg::L(-0.3550, 0.1358),
+    IconSeg::C(-0.3604, 0.1227, -0.3723, 0.1133, -0.3862, 0.1110),
+    IconSeg::L(-0.4618, 0.0988),
+    IconSeg::C(-0.4838, 0.0953, -0.5000, 0.0763, -0.5000, 0.0540),
+    IconSeg::L(-0.5000, -0.0540),
+    IconSeg::C(-0.5000, -0.0763, -0.4838, -0.0953, -0.4618, -0.0988),
+    IconSeg::L(-0.3862, -0.1110),
+    IconSeg::C(-0.3723, -0.1133, -0.3604, -0.1227, -0.3550, -0.1358),
+    IconSeg::L(-0.3470, -0.1550),
+    IconSeg::C(-0.3416, -0.1681, -0.3433, -0.1831, -0.3516, -0.1946),
+    IconSeg::L(-0.3965, -0.2567),
+    IconSeg::C(-0.4095, -0.2747, -0.4075, -0.2996, -0.3917, -0.3154),
+    IconSeg::L(-0.3154, -0.3917),
+    IconSeg::C(-0.2996, -0.4075, -0.2747, -0.4095, -0.2567, -0.3965),
+    IconSeg::L(-0.1946, -0.3516),
+    IconSeg::C(-0.1831, -0.3433, -0.1681, -0.3416, -0.1550, -0.3470),
+    IconSeg::L(-0.1358, -0.3550),
+    IconSeg::C(-0.1227, -0.3604, -0.1133, -0.3723, -0.1110, -0.3862),
     IconSeg::Z,
-    IconSeg::M(0.0025, 0.1750),
-    IconSeg::C(0.0508, 0.1750, 0.0921, 0.1579, 0.1262, 0.1237),
-    IconSeg::C(0.1604, 0.0896, 0.1775, 0.0483, 0.1775, 0.0000),
-    IconSeg::C(0.1775, -0.0483, 0.1604, -0.0896, 0.1262, -0.1237),
-    IconSeg::C(0.0921, -0.1579, 0.0508, -0.1750, 0.0025, -0.1750),
-    IconSeg::C(-0.0467, -0.1750, -0.0881, -0.1579, -0.1219, -0.1237),
-    IconSeg::C(-0.1557, -0.0896, -0.1725, -0.0483, -0.1725, 0.0000),
-    IconSeg::C(-0.1725, 0.0483, -0.1556, 0.0896, -0.1219, 0.1237),
-    IconSeg::C(-0.0881, 0.1579, -0.0467, 0.1750, 0.0025, 0.1750),
+    IconSeg::M(0.1544, 0.0000),
+    IconSeg::C(0.1544, -0.0853, 0.0853, -0.1544, 0.0000, -0.1544),
+    IconSeg::C(-0.0853, -0.1544, -0.1544, -0.0853, -0.1544, 0.0000),
+    IconSeg::C(-0.1544, 0.0853, -0.0853, 0.1544, 0.0000, 0.1544),
+    IconSeg::C(0.0853, 0.1544, 0.1544, 0.0853, 0.1544, 0.0000),
     IconSeg::Z,
 ];
-// Icons: Phosphor Icons (https://phosphoricons.com, MIT License, Copyright (c)
-// 2020 Phosphor Icons), "fill" weight, converted from their SVG paths (256 x 256
-// grid, arcs and quadratics turned into cubics) and scaled the same way.
-/// Phosphor `copy` (fill): clipboard row copy button.
+/// Copy: a sheet in front of an outlined one; clipboard row copy button.
 const COPY: &[IconSeg] = &[
-    IconSeg::M(0.4583, -0.5000),
-    IconSeg::L(-0.2083, -0.5000),
-    IconSeg::C(-0.2313, -0.5000, -0.2500, -0.4813, -0.2500, -0.4583),
-    IconSeg::L(-0.2500, -0.2500),
-    IconSeg::L(-0.4583, -0.2500),
-    IconSeg::C(-0.4813, -0.2500, -0.5000, -0.2313, -0.5000, -0.2083),
-    IconSeg::L(-0.5000, 0.4583),
-    IconSeg::C(-0.5000, 0.4813, -0.4813, 0.5000, -0.4583, 0.5000),
-    IconSeg::L(0.2083, 0.5000),
-    IconSeg::C(0.2313, 0.5000, 0.2500, 0.4813, 0.2500, 0.4583),
-    IconSeg::L(0.2500, 0.2500),
-    IconSeg::L(0.4583, 0.2500),
-    IconSeg::C(0.4813, 0.2500, 0.5000, 0.2313, 0.5000, 0.2083),
-    IconSeg::L(0.5000, -0.4583),
-    IconSeg::C(0.5000, -0.4813, 0.4813, -0.5000, 0.4583, -0.5000),
+    IconSeg::M(0.3274, -0.4990),
+    IconSeg::C(0.4254, -0.4889, 0.5000, -0.4063, 0.5000, -0.3077),
+    IconSeg::L(0.5000, 0.0000),
+    IconSeg::L(0.4990, 0.0197),
+    IconSeg::C(0.4897, 0.1103, 0.4180, 0.1820, 0.3274, 0.1913),
+    IconSeg::L(0.3077, 0.1923),
+    IconSeg::L(0.1923, 0.1923),
+    IconSeg::L(0.1923, 0.3077),
+    IconSeg::C(0.1923, 0.4139, 0.1062, 0.5000, 0.0000, 0.5000),
+    IconSeg::L(-0.3077, 0.5000),
+    IconSeg::C(-0.4139, 0.5000, -0.5000, 0.4139, -0.5000, 0.3077),
+    IconSeg::L(-0.5000, 0.0000),
+    IconSeg::C(-0.5000, -0.1062, -0.4139, -0.1923, -0.3077, -0.1923),
+    IconSeg::L(-0.1923, -0.1923),
+    IconSeg::L(-0.1923, -0.3077),
+    IconSeg::C(-0.1923, -0.4139, -0.1062, -0.5000, 0.0000, -0.5000),
+    IconSeg::L(0.3077, -0.5000),
     IconSeg::Z,
-    IconSeg::M(0.4167, 0.1667),
-    IconSeg::L(0.2500, 0.1667),
-    IconSeg::L(0.2500, -0.2083),
-    IconSeg::C(0.2500, -0.2313, 0.2313, -0.2500, 0.2083, -0.2500),
-    IconSeg::L(-0.1667, -0.2500),
-    IconSeg::L(-0.1667, -0.4167),
-    IconSeg::L(0.4167, -0.4167),
+    IconSeg::M(0.0000, -0.3846),
+    IconSeg::C(-0.0425, -0.3846, -0.0769, -0.3502, -0.0769, -0.3077),
+    IconSeg::L(-0.0769, -0.1923),
+    IconSeg::L(0.0000, -0.1923),
+    IconSeg::C(0.1062, -0.1923, 0.1923, -0.1062, 0.1923, 0.0000),
+    IconSeg::L(0.1923, 0.0769),
+    IconSeg::L(0.3077, 0.0769),
+    IconSeg::C(0.3502, 0.0769, 0.3846, 0.0425, 0.3846, 0.0000),
+    IconSeg::L(0.3846, -0.3077),
+    IconSeg::C(0.3846, -0.3502, 0.3502, -0.3846, 0.3077, -0.3846),
     IconSeg::Z,
 ];
-/// Phosphor `trash` (fill): clipboard row delete button.
+/// Trash: a lid over a solid bin; clipboard row delete button.
 const TRASH: &[IconSeg] = &[
-    IconSeg::M(0.4231, -0.3462),
-    IconSeg::L(0.2308, -0.3462),
-    IconSeg::L(0.2308, -0.3846),
-    IconSeg::C(0.2308, -0.4483, 0.1791, -0.5000, 0.1154, -0.5000),
-    IconSeg::L(-0.1154, -0.5000),
-    IconSeg::C(-0.1791, -0.5000, -0.2308, -0.4483, -0.2308, -0.3846),
-    IconSeg::L(-0.2308, -0.3462),
-    IconSeg::L(-0.4231, -0.3462),
-    IconSeg::C(-0.4443, -0.3462, -0.4615, -0.3289, -0.4615, -0.3077),
-    IconSeg::C(-0.4615, -0.2865, -0.4443, -0.2692, -0.4231, -0.2692),
-    IconSeg::L(-0.3846, -0.2692),
-    IconSeg::L(-0.3846, 0.4231),
-    IconSeg::C(-0.3846, 0.4656, -0.3502, 0.5000, -0.3077, 0.5000),
-    IconSeg::L(0.3077, 0.5000),
-    IconSeg::C(0.3502, 0.5000, 0.3846, 0.4656, 0.3846, 0.4231),
-    IconSeg::L(0.3846, -0.2692),
-    IconSeg::L(0.4231, -0.2692),
-    IconSeg::C(0.4443, -0.2692, 0.4615, -0.2865, 0.4615, -0.3077),
-    IconSeg::C(0.4615, -0.3289, 0.4443, -0.3462, 0.4231, -0.3462),
+    IconSeg::M(-0.3235, -0.3725),
+    IconSeg::L(0.3235, -0.3725),
+    IconSeg::C(0.3614, -0.3725, 0.3922, -0.3418, 0.3922, -0.3039),
+    IconSeg::L(0.3922, -0.3039),
+    IconSeg::C(0.3922, -0.2660, 0.3614, -0.2353, 0.3235, -0.2353),
+    IconSeg::L(-0.3235, -0.2353),
+    IconSeg::C(-0.3614, -0.2353, -0.3922, -0.2660, -0.3922, -0.3039),
+    IconSeg::L(-0.3922, -0.3039),
+    IconSeg::C(-0.3922, -0.3418, -0.3614, -0.3725, -0.3235, -0.3725),
     IconSeg::Z,
-    IconSeg::M(-0.0769, 0.2308),
-    IconSeg::C(-0.0769, 0.2520, -0.0941, 0.2692, -0.1154, 0.2692),
-    IconSeg::C(-0.1366, 0.2692, -0.1538, 0.2520, -0.1538, 0.2308),
-    IconSeg::L(-0.1538, -0.0769),
-    IconSeg::C(-0.1538, -0.0982, -0.1366, -0.1154, -0.1154, -0.1154),
-    IconSeg::C(-0.0941, -0.1154, -0.0769, -0.0982, -0.0769, -0.0769),
+    IconSeg::M(-0.0882, -0.5000),
+    IconSeg::L(0.0882, -0.5000),
+    IconSeg::C(0.1261, -0.5000, 0.1569, -0.4693, 0.1569, -0.4314),
+    IconSeg::L(0.1569, -0.3922),
+    IconSeg::C(0.1569, -0.3543, 0.1261, -0.3235, 0.0882, -0.3235),
+    IconSeg::L(-0.0882, -0.3235),
+    IconSeg::C(-0.1261, -0.3235, -0.1569, -0.3543, -0.1569, -0.3922),
+    IconSeg::L(-0.1569, -0.4314),
+    IconSeg::C(-0.1569, -0.4693, -0.1261, -0.5000, -0.0882, -0.5000),
     IconSeg::Z,
-    IconSeg::M(0.1538, 0.2308),
-    IconSeg::C(0.1538, 0.2520, 0.1366, 0.2692, 0.1154, 0.2692),
-    IconSeg::C(0.0941, 0.2692, 0.0769, 0.2520, 0.0769, 0.2308),
-    IconSeg::L(0.0769, -0.0769),
-    IconSeg::C(0.0769, -0.0982, 0.0941, -0.1154, 0.1154, -0.1154),
-    IconSeg::C(0.1366, -0.1154, 0.1538, -0.0982, 0.1538, -0.0769),
-    IconSeg::Z,
-    IconSeg::M(0.1538, -0.3462),
-    IconSeg::L(-0.1538, -0.3462),
-    IconSeg::L(-0.1538, -0.3846),
-    IconSeg::C(-0.1538, -0.4059, -0.1366, -0.4231, -0.1154, -0.4231),
-    IconSeg::L(0.1154, -0.4231),
-    IconSeg::C(0.1366, -0.4231, 0.1538, -0.4059, 0.1538, -0.3846),
+    IconSeg::M(-0.3039, -0.1373),
+    IconSeg::L(0.3039, -0.1373),
+    IconSeg::C(0.3310, -0.1373, 0.3529, -0.1153, 0.3529, -0.0882),
+    IconSeg::L(0.3529, 0.3824),
+    IconSeg::C(0.3529, 0.4473, 0.3003, 0.5000, 0.2353, 0.5000),
+    IconSeg::L(-0.2353, 0.5000),
+    IconSeg::C(-0.3003, 0.5000, -0.3529, 0.4473, -0.3529, 0.3824),
+    IconSeg::L(-0.3529, -0.0882),
+    IconSeg::C(-0.3529, -0.1153, -0.3310, -0.1373, -0.3039, -0.1373),
     IconSeg::Z,
 ];
-/// Phosphor `tray-arrow-down` (fill): the drop page glyph.
+/// Tray: an open tray with a dipped front; the drop page glyph.
 const INBOX: &[IconSeg] = &[
-    IconSeg::M(0.4167, -0.5000),
-    IconSeg::L(-0.4167, -0.5000),
-    IconSeg::C(-0.4627, -0.5000, -0.5000, -0.4627, -0.5000, -0.4167),
-    IconSeg::L(-0.5000, 0.4167),
-    IconSeg::C(-0.5000, 0.4627, -0.4627, 0.5000, -0.4167, 0.5000),
-    IconSeg::L(0.4167, 0.5000),
-    IconSeg::C(0.4627, 0.5000, 0.5000, 0.4627, 0.5000, 0.4167),
-    IconSeg::L(0.5000, -0.4167),
-    IconSeg::C(0.5000, -0.4627, 0.4627, -0.5000, 0.4167, -0.5000),
+    IconSeg::M(-0.2786, -0.3476),
+    IconSeg::L(0.2786, -0.3476),
+    IconSeg::C(0.3125, -0.3476, 0.3438, -0.3296, 0.3609, -0.3004),
+    IconSeg::L(0.4935, -0.0730),
+    IconSeg::C(0.4978, -0.0657, 0.5000, -0.0575, 0.5000, -0.0490),
+    IconSeg::L(0.5000, 0.2333),
+    IconSeg::C(0.5000, 0.2965, 0.4488, 0.3476, 0.3857, 0.3476),
+    IconSeg::L(-0.3857, 0.3476),
+    IconSeg::C(-0.4488, 0.3476, -0.5000, 0.2965, -0.5000, 0.2333),
+    IconSeg::L(-0.5000, -0.0490),
+    IconSeg::C(-0.5000, -0.0575, -0.4978, -0.0657, -0.4935, -0.0730),
+    IconSeg::L(-0.3609, -0.3004),
+    IconSeg::C(-0.3438, -0.3296, -0.3125, -0.3476, -0.2786, -0.3476),
     IconSeg::Z,
-    IconSeg::M(-0.1961, -0.0711),
-    IconSeg::C(-0.1883, -0.0790, -0.1777, -0.0834, -0.1667, -0.0834),
-    IconSeg::C(-0.1556, -0.0834, -0.1450, -0.0790, -0.1372, -0.0711),
-    IconSeg::L(-0.0417, 0.0244),
-    IconSeg::L(-0.0417, -0.2917),
-    IconSeg::C(-0.0417, -0.3147, -0.0230, -0.3333, 0.0000, -0.3333),
-    IconSeg::C(0.0230, -0.3333, 0.0417, -0.3147, 0.0417, -0.2917),
-    IconSeg::L(0.0417, 0.0244),
-    IconSeg::L(0.1372, -0.0711),
-    IconSeg::C(0.1535, -0.0874, 0.1799, -0.0874, 0.1961, -0.0711),
-    IconSeg::C(0.2124, -0.0549, 0.2124, -0.0285, 0.1961, -0.0122),
-    IconSeg::L(0.0295, 0.1545),
-    IconSeg::C(0.0217, 0.1623, 0.0111, 0.1667, 0.0000, 0.1667),
-    IconSeg::C(-0.0111, 0.1667, -0.0217, 0.1623, -0.0295, 0.1545),
-    IconSeg::L(-0.1961, -0.0122),
-    IconSeg::C(-0.2040, -0.0200, -0.2084, -0.0306, -0.2084, -0.0417),
-    IconSeg::C(-0.2084, -0.0527, -0.2040, -0.0633, -0.1961, -0.0711),
+    IconSeg::M(-0.3364, -0.0905),
+    IconSeg::L(-0.1763, -0.0905),
+    IconSeg::C(-0.1566, -0.0905, -0.1395, -0.0771, -0.1347, -0.0580),
+    IconSeg::L(-0.1260, -0.0231),
+    IconSeg::L(-0.1188, -0.0111),
+    IconSeg::L(-0.1104, 0.0002),
+    IconSeg::L(-0.1010, 0.0105),
+    IconSeg::L(-0.0906, 0.0200),
+    IconSeg::L(-0.0794, 0.0283),
+    IconSeg::L(-0.0673, 0.0355),
+    IconSeg::L(-0.0547, 0.0415),
+    IconSeg::L(-0.0415, 0.0462),
+    IconSeg::L(-0.0279, 0.0496),
+    IconSeg::L(-0.0140, 0.0517),
+    IconSeg::L(0.0000, 0.0524),
+    IconSeg::L(0.0140, 0.0517),
+    IconSeg::L(0.0279, 0.0496),
+    IconSeg::L(0.0415, 0.0462),
+    IconSeg::L(0.0547, 0.0415),
+    IconSeg::L(0.0673, 0.0355),
+    IconSeg::L(0.0794, 0.0283),
+    IconSeg::L(0.0906, 0.0200),
+    IconSeg::L(0.1010, 0.0105),
+    IconSeg::L(0.1104, 0.0002),
+    IconSeg::L(0.1188, -0.0111),
+    IconSeg::L(0.1260, -0.0231),
+    IconSeg::L(0.1347, -0.0580),
+    IconSeg::C(0.1395, -0.0771, 0.1566, -0.0905, 0.1763, -0.0905),
+    IconSeg::L(0.3364, -0.0905),
+    IconSeg::C(0.3563, -0.0905, 0.3674, -0.1135, 0.3550, -0.1291),
+    IconSeg::L(0.2672, -0.2398),
+    IconSeg::C(0.2608, -0.2477, 0.2512, -0.2524, 0.2410, -0.2524),
+    IconSeg::L(-0.2410, -0.2524),
+    IconSeg::C(-0.2512, -0.2524, -0.2608, -0.2477, -0.2672, -0.2398),
+    IconSeg::L(-0.3550, -0.1291),
+    IconSeg::C(-0.3674, -0.1135, -0.3563, -0.0905, -0.3364, -0.0905),
     IconSeg::Z,
-    IconSeg::M(0.4167, 0.4167),
-    IconSeg::L(-0.4167, 0.4167),
-    IconSeg::L(-0.4167, 0.2083),
-    IconSeg::L(-0.2672, 0.2083),
-    IconSeg::L(-0.1667, 0.3090),
-    IconSeg::C(-0.1511, 0.3246, -0.1299, 0.3334, -0.1078, 0.3333),
-    IconSeg::L(0.1078, 0.3333),
-    IconSeg::C(0.1299, 0.3334, 0.1511, 0.3246, 0.1667, 0.3089),
-    IconSeg::L(0.2672, 0.2083),
-    IconSeg::L(0.4167, 0.2083),
-    IconSeg::L(0.4167, 0.4167),
+];
+/// Done: a check cut from a disc; a drop's success.
+const DONE: &[IconSeg] = &[
+    IconSeg::M(0.5000, 0.0000),
+    IconSeg::C(0.5000, 0.2761, 0.2761, 0.5000, 0.0000, 0.5000),
+    IconSeg::C(-0.2761, 0.5000, -0.5000, 0.2761, -0.5000, 0.0000),
+    IconSeg::C(-0.5000, -0.2761, -0.2761, -0.5000, 0.0000, -0.5000),
+    IconSeg::C(0.2761, -0.5000, 0.5000, -0.2761, 0.5000, 0.0000),
+    IconSeg::Z,
+    IconSeg::M(-0.2362, 0.1186),
+    IconSeg::L(-0.0901, 0.2647),
+    IconSeg::C(-0.0773, 0.2775, -0.0563, 0.2771, -0.0441, 0.2637),
+    IconSeg::L(0.2500, -0.0580),
+    IconSeg::C(0.2733, -0.0834, 0.2715, -0.1229, 0.2460, -0.1462),
+    IconSeg::L(0.2442, -0.1479),
+    IconSeg::C(0.2187, -0.1712, 0.1792, -0.1694, 0.1559, -0.1440),
+    IconSeg::L(-0.0482, 0.0793),
+    IconSeg::C(-0.0605, 0.0927, -0.0814, 0.0932, -0.0943, 0.0803),
+    IconSeg::L(-0.1461, 0.0285),
+    IconSeg::C(-0.1705, 0.0041, -0.2100, 0.0041, -0.2344, 0.0285),
+    IconSeg::L(-0.2362, 0.0303),
+    IconSeg::C(-0.2606, 0.0547, -0.2606, 0.0942, -0.2362, 0.1186),
+    IconSeg::Z,
+];
+/// Alert: an exclamation mark cut from a disc; a drop that failed.
+const ALERT: &[IconSeg] = &[
+    IconSeg::M(0.5000, 0.0000),
+    IconSeg::C(0.5000, 0.2761, 0.2761, 0.5000, 0.0000, 0.5000),
+    IconSeg::C(-0.2761, 0.5000, -0.5000, 0.2761, -0.5000, 0.0000),
+    IconSeg::C(-0.5000, -0.2761, -0.2761, -0.5000, 0.0000, -0.5000),
+    IconSeg::C(0.2761, -0.5000, 0.5000, -0.2761, 0.5000, 0.0000),
+    IconSeg::Z,
+    IconSeg::M(0.0000, 0.0784),
+    IconSeg::L(0.0000, 0.0784),
+    IconSeg::C(0.0379, 0.0784, 0.0686, 0.0477, 0.0686, 0.0098),
+    IconSeg::L(0.0686, -0.2451),
+    IconSeg::C(0.0686, -0.2830, 0.0379, -0.3137, 0.0000, -0.3137),
+    IconSeg::L(0.0000, -0.3137),
+    IconSeg::C(-0.0379, -0.3137, -0.0686, -0.2830, -0.0686, -0.2451),
+    IconSeg::L(-0.0686, 0.0098),
+    IconSeg::C(-0.0686, 0.0477, -0.0379, 0.0784, 0.0000, 0.0784),
+    IconSeg::Z,
+    IconSeg::M(0.0784, 0.2451),
+    IconSeg::C(0.0784, 0.2018, 0.0433, 0.1667, 0.0000, 0.1667),
+    IconSeg::C(-0.0433, 0.1667, -0.0784, 0.2018, -0.0784, 0.2451),
+    IconSeg::C(-0.0784, 0.2884, -0.0433, 0.3235, 0.0000, 0.3235),
+    IconSeg::C(0.0433, 0.3235, 0.0784, 0.2884, 0.0784, 0.2451),
     IconSeg::Z,
 ];
 
@@ -7311,6 +7675,258 @@ mod tests {
             }
         }
         println!("3000 frames rendered");
+    }
+
+    /// The shadow mask exactly as it was built before the blur and shaping
+    /// were optimized (division per pixel, column-by-column vertical pass,
+    /// every weight per pixel): the reference the fast version must match.
+    mod reference_shadow {
+        use super::super::{
+            SHADOW_BLUR_RADIUS, SHADOW_EDGE_FADE, SHADOW_OFFSET_Y, SHADOW_SHOULDER_FADE,
+            SHADOW_STRENGTH,
+        };
+
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn build_shadow_mask(
+            bits: *mut u8,
+            width: usize,
+            height: usize,
+            stride: usize,
+            scale: f32,
+            shadow_opacity: f32,
+            scratch_a: &mut Vec<u8>,
+            scratch_b: &mut Vec<u8>,
+        ) -> bool {
+            if width == 0 || height == 0 || shadow_opacity <= 0.0 || bits.is_null() {
+                return false;
+            }
+
+            let total_pixels = width * height;
+            if scratch_a.len() < total_pixels {
+                scratch_a.resize(total_pixels, 0);
+            }
+            if scratch_b.len() < total_pixels {
+                scratch_b.resize(total_pixels, 0);
+            }
+
+            let alpha_at = |x: usize, y: usize| unsafe { *bits.add((y * stride + x) * 4 + 3) };
+            let first_lit = |y: usize| (0..width).find(|&x| alpha_at(x, y) > 0);
+            // Bottom of the opaque body (center column)
+            let body_bottom = (0..height)
+                .rev()
+                .find(|&y| alpha_at(width / 2, y) == 255)
+                .map_or(0, |y| y + 1);
+            // Straight side walls (at mid-height) and the row where the concave top
+            // shoulders end: only the straight-walled body casts the shadow, so none of
+            // it lands on the shoulder curves.
+            let mid = body_bottom / 2;
+            let wall_left = first_lit(mid).unwrap_or(0);
+            let wall_right = (0..width)
+                .rev()
+                .find(|&x| alpha_at(x, mid) > 0)
+                .unwrap_or(width - 1);
+            let shoulder_end = (0..mid)
+                .find(|&y| first_lit(y).is_some_and(|x| x >= wall_left))
+                .unwrap_or(0);
+
+            // 1. Extract the body alpha shifted down by `offset` rows (light from above)
+            let offset = ((SHADOW_OFFSET_Y * scale).round() as usize).min(height);
+            unsafe {
+                for y in 0..height {
+                    let target_offset = y * width;
+                    if y < offset {
+                        scratch_a[target_offset..target_offset + width].fill(0);
+                    } else {
+                        let src_row = (y - offset) * stride * 4;
+                        for x in 0..width {
+                            scratch_a[target_offset + x] = if (wall_left..=wall_right).contains(&x)
+                            {
+                                *bits.add(src_row + x * 4 + 3)
+                            } else {
+                                0
+                            };
+                        }
+                    }
+                }
+            }
+
+            // 2. 3-pass separable box blur (Gaussian approximation), radius scales with DPI
+            let radius = ((SHADOW_BLUR_RADIUS * scale).round() as usize).max(1);
+            for _ in 0..3 {
+                h(
+                    &scratch_a[..total_pixels],
+                    &mut scratch_b[..total_pixels],
+                    width,
+                    height,
+                    radius,
+                );
+                v(
+                    &scratch_b[..total_pixels],
+                    &mut scratch_a[..total_pixels],
+                    width,
+                    height,
+                    radius,
+                );
+            }
+
+            // 3. Shape: shoulder, bottom and side weighting
+            let peak = (shadow_opacity * SHADOW_STRENGTH).min(1.0);
+            let edge_fade = (SHADOW_EDGE_FADE * scale).max(1.0);
+            let smoothstep = |e0: f32, e1: f32, v: f32| {
+                let t = ((v - e0) / (e1 - e0)).clamp(0.0, 1.0);
+                t * t * (3.0 - 2.0 * t)
+            };
+
+            for y in 0..height {
+                let row = &mut scratch_a[y * width..(y + 1) * width];
+                // None on the concave shoulders; full strength right below them
+                let vertical = smoothstep(
+                    shoulder_end as f32,
+                    shoulder_end as f32 + (SHADOW_SHOULDER_FADE * scale).max(1.0),
+                    y as f32,
+                );
+                let bottom_fade = smoothstep(0.0, edge_fade, (height - 1 - y) as f32);
+                for (x, v) in row.iter_mut().enumerate() {
+                    let side = x.min(width - 1 - x) as f32;
+                    let weight = peak * vertical * bottom_fade * smoothstep(0.0, edge_fade, side);
+                    *v = (f32::from(*v) * weight).round().min(255.0) as u8;
+                }
+            }
+            true
+        }
+
+        pub(super) fn h(src: &[u8], dst: &mut [u8], width: usize, height: usize, radius: usize) {
+            let window_size = (radius * 2 + 1) as u32;
+
+            for y in 0..height {
+                let row_offset = y * width;
+                let mut sum: u32 = 0;
+
+                for x_rel in -(radius as isize)..=(radius as isize) {
+                    let clamped_x = x_rel.clamp(0, (width - 1) as isize) as usize;
+                    sum += src[row_offset + clamped_x] as u32;
+                }
+                dst[row_offset] = ((sum + window_size / 2) / window_size) as u8;
+
+                for x in 1..width {
+                    let add_x = (x + radius).min(width - 1);
+                    let sub_x = (x as isize - radius as isize - 1).max(0) as usize;
+                    sum += src[row_offset + add_x] as u32;
+                    sum -= src[row_offset + sub_x] as u32;
+                    dst[row_offset + x] = ((sum + window_size / 2) / window_size) as u8;
+                }
+            }
+        }
+
+        pub(super) fn v(src: &[u8], dst: &mut [u8], width: usize, height: usize, radius: usize) {
+            let window_size = (radius * 2 + 1) as u32;
+
+            for x in 0..width {
+                let mut sum: u32 = 0;
+
+                for y_rel in -(radius as isize)..=(radius as isize) {
+                    let clamped_y = y_rel.clamp(0, (height - 1) as isize) as usize;
+                    sum += src[clamped_y * width + x] as u32;
+                }
+                dst[x] = ((sum + window_size / 2) / window_size) as u8;
+
+                for y in 1..height {
+                    let add_y = (y + radius).min(height - 1);
+                    let sub_y = (y as isize - radius as isize - 1).max(0) as usize;
+                    sum += src[add_y * width + x] as u32;
+                    sum -= src[sub_y * width + x] as u32;
+                    dst[y * width + x] = ((sum + window_size / 2) / window_size) as u8;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_fast_shadow_matches_the_reference_exactly() {
+        // The rounded average: every reachable sum, every window width
+        for w in (1..=121u32).step_by(2) {
+            let div = RoundDiv::new(w);
+            for sum in 0..=255 * w {
+                assert_eq!(u32::from(div.apply(sum)), (sum + w / 2) / w, "{sum}/{w}");
+            }
+        }
+        // Both blur passes on noisy data, odd sizes and every radius used
+        let mut seed = 0x2545_f491_u32;
+        let mut noise = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    (seed >> 24) as u8
+                })
+                .collect()
+        };
+        for (w, h) in [(1, 1), (7, 3), (61, 40), (300, 90)] {
+            for radius in [1, 5, 8, 15, 25] {
+                let src = noise(w * h);
+                let (mut fast, mut slow) = (vec![0; w * h], vec![0; w * h]);
+                box_blur_horizontal(&src, &mut fast, w, h, radius);
+                reference_shadow::h(&src, &mut slow, w, h, radius);
+                assert_eq!(fast, slow, "horizontal {w}x{h} r{radius}");
+                box_blur_vertical(&src, &mut fast, w, h, radius);
+                reference_shadow::v(&src, &mut slow, w, h, radius);
+                assert_eq!(fast, slow, "vertical {w}x{h} r{radius}");
+            }
+        }
+        // Whole masks of real notches, settled and mid-animation, at each DPI
+        let renderer = Renderer::new().expect("renderer");
+        for dpi in ALL_DPIS {
+            let mut frames = vec![
+                NotchDimensions::from_state_and_dpi(NotchState::Collapsed, dpi),
+                NotchDimensions::from_state_and_dpi(NotchState::Expanded, dpi),
+            ];
+            let mut anim =
+                crate::config::AnimationState::new(NotchState::Collapsed, NotchState::Expanded);
+            while anim.step(96.0) {
+                frames.push(anim.current_dimensions(dpi));
+            }
+            for dims in frames {
+                // The shadow depends only on the silhouette: the filled notch
+                renderer.ensure_buffer(dims.width, dims.height).unwrap();
+                {
+                    let rt = renderer.cached_rt.borrow();
+                    let rt = rt.as_ref().unwrap();
+                    let bind = RECT {
+                        left: 0,
+                        top: 0,
+                        right: dims.width,
+                        bottom: dims.height,
+                    };
+                    unsafe {
+                        rt.BindDC(renderer.cached_mem_dc.get(), &bind).unwrap();
+                        rt.BeginDraw();
+                        rt.Clear(Some(&COLOR_TRANSPARENT));
+                        let fill = rt.CreateSolidColorBrush(&NOTCH_BG_COLOR, None).unwrap();
+                        let path = renderer.create_notch_geometry(&dims).unwrap();
+                        rt.FillGeometry(&path, &fill, None);
+                        rt.EndDraw(None, None).unwrap();
+                    }
+                }
+                // What reaches the screen: the notch with its shadow composited
+                let (px, stride) = renderer.surface(dims.height);
+                let (w, h) = (dims.width as usize, dims.height as usize);
+                let opacity = dims.shadow_opacity.max(0.28);
+                let (mut fast, mut slow) = (px.clone(), px);
+                let (mut a, mut b, mut ra, mut rb) = (vec![], vec![], vec![], vec![]);
+                let bits = fast.as_mut_ptr() as *mut u8;
+                assert!(build_shadow_mask(
+                    bits, w, h, stride, dims.scale, opacity, &mut a, &mut b
+                ));
+                composite_shadow(bits, w, h, stride, &a);
+                let bits = slow.as_mut_ptr() as *mut u8;
+                assert!(reference_shadow::build_shadow_mask(
+                    bits, w, h, stride, dims.scale, opacity, &mut ra, &mut rb,
+                ));
+                composite_shadow(bits, w, h, stride, &ra);
+                assert!(fast == slow, "{w}x{h} at {dpi}");
+            }
+        }
     }
 
     #[test]
@@ -9338,6 +9954,141 @@ mod tests {
 
     /// Frame cost of the visualizer (offscreen, release-like work per frame:
     /// bind, clear, notch body, content with the bars, end draw). Prints
+    /// Cost of every frame of a real expand animation at 100-300% scaling:
+    /// the whole `render` (draw, shadow, upload to an off-screen layered
+    /// window), and the shadow mask and the upload alone. Prints timings; run
+    /// with `cargo test --release bench_expand -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_expand_animation_frame_cost() {
+        use crate::config::AnimationState;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, SW_SHOWNOACTIVATE, ShowWindow, WS_EX_LAYERED,
+            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+        };
+        // Off screen, so the test never shows anything
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                windows::core::w!("STATIC"),
+                None,
+                WS_POPUP,
+                -30000,
+                -30000,
+                1,
+                1,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+        let clock = ClockDateState::from_pure_components(2026, 10, 6, 2, 0, 47, 0, 0, false);
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for dpi in [96u32, 120, 144, 192, 240, 288] {
+            let renderer = Renderer::new().expect("renderer");
+            let mut anim = AnimationState::new(NotchState::Collapsed, NotchState::Expanded);
+            let mut frames = Vec::new();
+            while anim.step(12.0) {
+                frames.push((anim.transition(), anim.current_dimensions(dpi)));
+            }
+            let settled = space_dimensions(NotchState::Expanded, dpi, OecaSpace::Home);
+            let (mut render_us, mut worst_us, mut shadow_us, mut upload_us) =
+                (0.0, 0.0f64, 0.0, 0.0);
+            let reps = 20;
+            for rep in 0..=reps {
+                for (transition, dims) in &frames {
+                    renderer.set_transition(Some(*transition));
+                    let t = std::time::Instant::now();
+                    renderer
+                        .render(hwnd, -30000, -30000, dims, false, &clock)
+                        .unwrap();
+                    let full = t.elapsed().as_secs_f64() * 1e6;
+                    // The shadow mask alone, as the frame rebuilt it
+                    let t = std::time::Instant::now();
+                    build_shadow_mask(
+                        renderer.cached_bits.get() as *mut u8,
+                        dims.width as usize,
+                        dims.height as usize,
+                        renderer.cached_capacity_w.get() as usize,
+                        dims.scale,
+                        dims.shadow_opacity.max(0.01),
+                        &mut a,
+                        &mut b,
+                    );
+                    let shadow = t.elapsed().as_secs_f64() * 1e6;
+                    // The upload alone
+                    let t = std::time::Instant::now();
+                    unsafe {
+                        UpdateLayeredWindow(
+                            hwnd,
+                            Some(renderer.cached_screen_dc.get()),
+                            Some(&POINT {
+                                x: -30000,
+                                y: -30000,
+                            }),
+                            Some(&SIZE {
+                                cx: dims.width,
+                                cy: dims.height,
+                            }),
+                            Some(renderer.cached_mem_dc.get()),
+                            Some(&POINT { x: 0, y: 0 }),
+                            COLORREF(0),
+                            Some(&BLENDFUNCTION {
+                                BlendOp: AC_SRC_OVER as u8,
+                                BlendFlags: 0,
+                                SourceConstantAlpha: 255,
+                                AlphaFormat: AC_SRC_ALPHA as u8,
+                            }),
+                            ULW_ALPHA,
+                        )
+                        .unwrap();
+                    }
+                    let upload = t.elapsed().as_secs_f64() * 1e6;
+                    if rep > 0 {
+                        render_us += full;
+                        worst_us = worst_us.max(full);
+                        shadow_us += shadow;
+                        upload_us += upload;
+                    }
+                }
+            }
+            let n = (reps * frames.len()) as f64;
+            // A settled notch for comparison (its shadow mask is reused)
+            renderer.set_transition(None);
+            renderer
+                .render(hwnd, -30000, -30000, &settled, false, &clock)
+                .unwrap();
+            let t = std::time::Instant::now();
+            for _ in 0..200 {
+                renderer
+                    .render(hwnd, -30000, -30000, &settled, false, &clock)
+                    .unwrap();
+            }
+            let settled_us = t.elapsed().as_secs_f64() * 1e6 / 200.0;
+            eprintln!(
+                "BENCH expand {:>3}% {}x{} px, {} frames: render {:.0} us avg / {:.0} worst \
+                 (shadow mask {:.0}, upload {:.0}); settled frame {:.0} us",
+                dpi * 100 / 96,
+                settled.width,
+                settled.height,
+                frames.len(),
+                render_us / n,
+                worst_us,
+                shadow_us / n,
+                upload_us / n,
+                settled_us
+            );
+        }
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+
     /// timings; run with `cargo test --release bench_visualizer -- --ignored
     /// --nocapture`.
     #[test]
@@ -9807,7 +10558,8 @@ mod tests {
     #[test]
     fn test_drop_page_icon_and_dashed_outline_replace_content() {
         let renderer = Renderer::new().expect("renderer");
-        assert!(renderer.set_drop_page(true) && !renderer.set_drop_page(true));
+        use crate::dragdrop::DropPage;
+        assert!(renderer.set_drop(DropPage::Ready) && !renderer.set_drop(DropPage::Ready));
         for dpi in ALL_DPIS {
             let dims = drop_page_dimensions(dpi);
             let (px, stride) = render_custom_frame(&renderer, &dims, |rt| {
@@ -9839,7 +10591,62 @@ mod tests {
                 "dashed outline at {dpi}: {runs}"
             );
         }
-        assert!(renderer.set_drop_page(false));
+        assert!(renderer.set_drop(DropPage::Off));
+    }
+
+    #[test]
+    fn test_drop_hint_and_results_draw_a_glyph_and_a_line_of_text() {
+        use crate::dragdrop::{DropOutcome, DropPage};
+        let renderer = Renderer::new().expect("renderer");
+        // Lit pixels in a band of rows (above / below the page's middle)
+        let lit_rows = |px: &[u32], stride: usize, w: usize, rows: std::ops::Range<usize>| {
+            rows.flat_map(|y| (w / 4..3 * w / 4).map(move |x| (x, y)))
+                .filter(|&(x, y)| (px[y * stride + x] & 0xFF) > 120)
+                .count()
+        };
+        for dpi in ALL_DPIS {
+            let dims = drop_page_dimensions(dpi);
+            let (w, body) = (
+                dims.width as usize,
+                (dims.height as f32 - dims.shadow_margin_bottom) as usize,
+            );
+            let mid = body / 2;
+            let mut frames = Vec::new();
+            renderer.set_drop(DropPage::Unsupported);
+            frames.push(render_custom_frame(&renderer, &dims, |rt| {
+                renderer.draw_drop_page(rt, &dims).unwrap()
+            }));
+            for outcome in [DropOutcome::Copied, DropOutcome::TooLarge] {
+                assert!(renderer.set_drop_result(outcome));
+                assert_eq!(renderer.drop_state(), DropPage::Result);
+                frames.push(render_custom_frame(&renderer, &dims, |rt| {
+                    renderer.draw_drop_result(rt, &dims).unwrap()
+                }));
+            }
+            for (i, (px, stride)) in frames.iter().enumerate() {
+                // A glyph above the middle, a line of text below it
+                let glyph = lit_rows(
+                    px,
+                    *stride,
+                    w,
+                    (mid as f32 - 20.0 * dims.scale) as usize..mid,
+                );
+                let text = lit_rows(
+                    px,
+                    *stride,
+                    w,
+                    mid + (6.0 * dims.scale) as usize..mid + (24.0 * dims.scale) as usize,
+                );
+                assert!(
+                    glyph > 20 && text > 20,
+                    "frame {i} at {dpi}: {glyph} {text}"
+                );
+            }
+            // The success and failure pages differ (different glyph and text)
+            assert_ne!(frames[1].0, frames[2].0, "{dpi}");
+        }
+        assert!(renderer.set_drop(DropPage::Off));
+        assert!(!renderer.drop_page());
     }
 
     #[test]
@@ -10090,17 +10897,92 @@ mod tests {
             Some(1)
         );
         assert_eq!(first_installed(dw, &[w!("No Such Font 7f3a")]), None);
-        // The chosen face is a candidate that exists here, or the named
+        // Without bundled fonts: a candidate that exists here, or the named
         // fallback; Bahnschrift ships with Windows, so it is never needed
-        let (name, family) = ui_font(dw);
+        let installed = resolve_ui_font(dw, &[]);
         let candidates: Vec<&str> = UI_FONT_CANDIDATES.iter().map(|(n, _)| *n).collect();
-        assert!(candidates.contains(&name), "{name}");
+        assert!(candidates.contains(&installed.name), "{}", installed.name);
+        assert_eq!(installed.collection, None, "the installed fonts");
         assert_eq!(
-            first_installed(dw, &[family]),
+            first_installed(dw, &[installed.family]),
             Some(0),
-            "{name} is installed"
+            "{} is installed",
+            installed.name
         );
-        assert_eq!(ui_font(dw), (name, family), "resolved once, stable");
+        // Unusable font data never fails: the installed choice is used
+        let broken: &[&[u8]] = &[b"not a font", &[0; 64]];
+        assert_eq!(resolve_ui_font(dw, broken), installed);
+        assert_eq!(ui_font(dw), ui_font(dw), "resolved once, stable");
+    }
+
+    /// Family name of a text format, as DirectWrite will look it up.
+    fn format_family(format: &IDWriteTextFormat) -> String {
+        let len = unsafe { format.GetFontFamilyNameLength() } as usize;
+        let mut buf = vec![0u16; len + 1];
+        unsafe { format.GetFontFamilyName(&mut buf) }.expect("family name");
+        String::from_utf16_lossy(&buf[..len])
+    }
+
+    #[test]
+    fn test_bundled_general_sans_loads_privately_with_every_weight() {
+        use windows::Win32::Graphics::DirectWrite::DWRITE_FONT_SIMULATIONS_NONE;
+        let renderer = Renderer::new().expect("renderer");
+        let dw = &renderer.dwrite_factory;
+        let font = ui_font(dw);
+        if BUNDLED_FONTS.is_empty() {
+            // A build without the font files: the installed fonts are used
+            assert_eq!(font.collection, None);
+            return;
+        }
+        // Official, unmodified OpenType (CFF) files: Regular, Medium, Semibold
+        assert_eq!(BUNDLED_FONTS.len(), 3);
+        assert!(BUNDLED_FONTS.iter().all(|f| f.starts_with(b"OTTO")));
+        assert_eq!(font.name, "General Sans");
+        let collection = font.collection.clone().expect("bundled collection");
+        let (mut index, mut exists) = (0u32, windows::core::BOOL(0));
+        unsafe { collection.FindFamilyName(font.family, &mut index, &mut exists) }.unwrap();
+        assert!(exists.as_bool());
+        let family = unsafe { collection.GetFontFamily(index) }.unwrap();
+        // Every weight a role uses is a real face, not a synthesized one
+        for role in TextRole::ALL {
+            let weight = DWRITE_FONT_WEIGHT(role.style().weight);
+            let face = unsafe {
+                family.GetFirstMatchingFont(
+                    weight,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    DWRITE_FONT_STYLE_NORMAL,
+                )
+            }
+            .unwrap();
+            assert_eq!(unsafe { face.GetWeight() }, weight, "{role:?}");
+            assert_eq!(
+                unsafe { face.GetSimulations() },
+                DWRITE_FONT_SIMULATIONS_NONE,
+                "{role:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_every_notch_text_role_uses_the_ui_font() {
+        let renderer = Renderer::new().expect("renderer");
+        let font = ui_font(&renderer.dwrite_factory);
+        for role in TextRole::ALL {
+            for scale in [1.0, 1.5, 2.0] {
+                let format = renderer
+                    .role_format(role, scale, DWRITE_TEXT_ALIGNMENT_LEADING)
+                    .unwrap();
+                assert_eq!(format_family(&format), font.name, "{role:?}");
+                if let Some(c) = &font.collection {
+                    assert_eq!(&unsafe { format.GetFontCollection() }.unwrap(), c);
+                }
+            }
+        }
+        // The clock's own format (sized by the notch) too
+        let format = renderer
+            .create_text_format(12.0, DWRITE_FONT_WEIGHT(600), DWRITE_FONT_STYLE_NORMAL)
+            .unwrap();
+        assert_eq!(format_family(&format), font.name);
     }
 
     #[test]

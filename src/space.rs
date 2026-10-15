@@ -14,7 +14,7 @@ pub enum OecaSpace {
     Clipboard,
 }
 
-/// What the expanded notch shows: a space, or the drop page while an image is
+/// What the expanded notch shows: a space, or the drop page while files are
 /// dragged over it. Animations blend between two scenes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scene {
@@ -22,6 +22,9 @@ pub enum Scene {
     /// The Settings page, over the active space (which stays selected).
     Settings,
     Drop,
+    /// A drop's result ("Item copied to clipboard", or why not), on the drop
+    /// page's surface.
+    Dropped,
 }
 
 /// The one panel size: the drop page and Settings always take the Clipboard
@@ -56,7 +59,7 @@ pub struct OecaSettings {
     /// default; the collapsed notch keeps its own.
     pub show_visualizer: bool,
     /// How long after an outside click the expanded notch collapses
-    /// (Settings > General). 5 s by default.
+    /// (Settings > General). At once (0 s) by default.
     pub collapse_delay: crate::config::CollapseDelay,
     /// Oeca starts when the user signs in (a per-user Run entry; Settings >
     /// General). Off by default; always mirrors the actual registration.
@@ -74,7 +77,7 @@ impl Default for OecaSettings {
             clipboard_capacity: crate::config::ClipboardCapacity::Twenty,
             show_source_app: true,
             show_visualizer: true,
-            collapse_delay: crate::config::CollapseDelay::Five,
+            collapse_delay: crate::config::CollapseDelay::Zero,
             start_on_launch: false,
         }
     }
@@ -86,15 +89,18 @@ impl Scene {
     pub fn size_space(self) -> OecaSpace {
         match self {
             Self::Space(space) => space,
-            Self::Settings | Self::Drop => PANEL_SPACE,
+            Self::Settings | Self::Drop | Self::Dropped => PANEL_SPACE,
         }
     }
 
-    /// What the expanded notch shows: an image drag's drop page first, then
-    /// an open Settings page, otherwise the active space.
-    pub fn current(drop_page: bool, settings_open: bool, space: OecaSpace) -> Self {
-        if drop_page {
+    /// What the expanded notch shows: a drag's drop page (or its result)
+    /// first, then an open Settings page, otherwise the active space.
+    pub fn current(drop: crate::dragdrop::DropPage, settings_open: bool, space: OecaSpace) -> Self {
+        use crate::dragdrop::DropPage;
+        if matches!(drop, DropPage::Ready | DropPage::Unsupported) {
             Self::Drop
+        } else if drop == DropPage::Result {
+            Self::Dropped
         } else if settings_open {
             Self::Settings
         } else {
@@ -166,14 +172,17 @@ mod tests {
     fn test_settings_and_drop_take_the_clipboard_size_from_any_space() {
         for space in OecaSpace::ALL {
             assert_eq!(
-                Scene::current(false, true, space).size_space(),
+                Scene::current(crate::dragdrop::DropPage::Off, true, space).size_space(),
                 OecaSpace::Clipboard
             );
             assert_eq!(
-                Scene::current(true, false, space).size_space(),
+                Scene::current(crate::dragdrop::DropPage::Ready, false, space).size_space(),
                 OecaSpace::Clipboard
             );
-            assert_eq!(Scene::current(false, false, space).size_space(), space);
+            assert_eq!(
+                Scene::current(crate::dragdrop::DropPage::Off, false, space).size_space(),
+                space
+            );
         }
         let s = OecaSettings::default();
         assert!(s.always_on_top && !s.reduced_motion);
@@ -183,11 +192,24 @@ mod tests {
     #[test]
     fn test_scene_priority_and_settings_keep_the_space() {
         for space in OecaSpace::ALL {
-            assert_eq!(Scene::current(false, false, space), Scene::Space(space));
-            assert_eq!(Scene::current(false, true, space), Scene::Settings);
-            assert_eq!(Scene::current(true, true, space), Scene::Drop, "drag wins");
+            assert_eq!(
+                Scene::current(crate::dragdrop::DropPage::Off, false, space),
+                Scene::Space(space)
+            );
+            assert_eq!(
+                Scene::current(crate::dragdrop::DropPage::Off, true, space),
+                Scene::Settings
+            );
+            assert_eq!(
+                Scene::current(crate::dragdrop::DropPage::Ready, true, space),
+                Scene::Drop,
+                "drag wins"
+            );
             // Closing Settings returns to the space that was active
-            assert_eq!(Scene::current(false, false, space), Scene::Space(space));
+            assert_eq!(
+                Scene::current(crate::dragdrop::DropPage::Off, false, space),
+                Scene::Space(space)
+            );
         }
     }
 

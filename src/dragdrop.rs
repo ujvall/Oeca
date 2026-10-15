@@ -5,9 +5,11 @@
 //! from the message loop.
 //!
 //! Nothing is read while a drag passes over Oeca: during the drag only the file
-//! *names* are inspected (extension check). Files are opened and decoded only on
-//! Drop, through WIC, into the same owned `Artwork` the clipboard history uses.
-//! Dropped files are never modified, moved or deleted.
+//! *names* are inspected (extension check). Files are opened and decoded only
+//! after the drop, through WIC, on a short-lived worker thread (`decode_async`),
+//! into the same owned `Artwork` the clipboard history uses: OLE's `Drop` call
+//! (which holds up the dragging app) returns at once. Dropped files are never
+//! modified, moved or deleted.
 
 use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -70,8 +72,60 @@ pub enum DropError {
     Unreadable,
     /// Not a decodable image (e.g. a renamed non-image file).
     Malformed,
-    /// Over the clipboard image budget (checked before decoding pixels).
+    /// Over the clipboard image budget (checked from the file size and the
+    /// frame size, before decoding pixels).
     TooLarge,
+}
+
+/// What the drop page shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DropPage {
+    #[default]
+    Off,
+    /// Supported images over the notch: drop to add them.
+    Ready,
+    /// Files over the notch that are not images Oeca can add.
+    Unsupported,
+    /// After a drop: its outcome (`DropOutcome`), shown for a moment.
+    Result,
+}
+
+/// How a drop ended (shown on the drop page's result).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropOutcome {
+    /// Added to the history and placed on the system clipboard.
+    Copied,
+    /// No dropped file could be read as an image.
+    Unreadable,
+    /// The image is over the clipboard's size budget.
+    TooLarge,
+    /// Added to the history, but the system clipboard was unavailable.
+    ClipboardBusy,
+}
+
+impl DropOutcome {
+    /// From how many images decoded and the first decoding error, before the
+    /// clipboard is written.
+    pub fn of(decoded: usize, error: Option<DropError>) -> Self {
+        match (decoded, error) {
+            (n, _) if n > 0 => Self::Copied,
+            (_, Some(DropError::TooLarge)) => Self::TooLarge,
+            _ => Self::Unreadable,
+        }
+    }
+
+    pub fn succeeded(self) -> bool {
+        self == Self::Copied
+    }
+
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Copied => "Item copied to clipboard",
+            Self::Unreadable => "This image could not be read",
+            Self::TooLarge => "This image is too large",
+            Self::ClipboardBusy => "Added, but the clipboard was busy",
+        }
+    }
 }
 
 /// Decodes an image file into owned premultiplied BGRA (`Artwork`) via WIC.
@@ -81,8 +135,15 @@ pub fn decode_image_file(path: &Path) -> std::result::Result<Artwork, DropError>
     if !is_supported_image(path) {
         return Err(DropError::Unsupported);
     }
-    if !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+    let Ok(meta) = std::fs::metadata(path) else {
         return Err(DropError::Unreadable);
+    };
+    if !meta.is_file() {
+        return Err(DropError::Unreadable);
+    }
+    // A compressed file bigger than the whole decoded budget is never opened
+    if meta.len() > CLIPBOARD_MAX_IMAGE_BYTES as u64 {
+        return Err(DropError::TooLarge);
     }
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
     let bad = |_| DropError::Malformed;
@@ -117,6 +178,56 @@ pub fn decode_image_file(path: &Path) -> std::result::Result<Artwork, DropError>
     }
 }
 
+/// A decoded drop: the images that decoded, in drop order, and the first
+/// failure among the others.
+#[derive(Debug, Default)]
+pub struct Decoded {
+    pub images: Vec<Artwork>,
+    pub error: Option<DropError>,
+}
+
+/// Decodes `paths` (needs COM on the calling thread).
+pub fn decode_all(paths: &[PathBuf]) -> Decoded {
+    let mut out = Decoded::default();
+    for path in paths {
+        match decode_image_file(path) {
+            Ok(image) => out.images.push(image),
+            Err(e) => {
+                out.error.get_or_insert(e);
+            }
+        }
+    }
+    out
+}
+
+/// Decodes `paths` on a short-lived worker thread and posts the result to
+/// `hwnd` as `msg` (lParam: a `Box<Decoded>`, taken back with
+/// `Box::from_raw`). False if no thread could be started: the caller then
+/// decodes in place. If the window is gone, the result is simply freed.
+pub fn decode_async(hwnd: HWND, msg: u32, paths: Vec<PathBuf>) -> bool {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
+    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+    let target = hwnd.0 as isize;
+    std::thread::Builder::new()
+        .name("oeca-drop".into())
+        .spawn(move || {
+            let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+            let decoded = Box::into_raw(Box::new(decode_all(&paths)));
+            if com {
+                unsafe { CoUninitialize() };
+            }
+            let hwnd = HWND(target as *mut _);
+            if unsafe { PostMessageW(Some(hwnd), msg, WPARAM(0), LPARAM(decoded as isize)) }
+                .is_err()
+            {
+                // SAFETY: never posted, so still owned here
+                drop(unsafe { Box::from_raw(decoded) });
+            }
+        })
+        .is_ok()
+}
+
 /// Adds dropped images to the history (all its limits and the consecutive
 /// duplicate rule apply). True when the newest dropped image is now the
 /// history's front entry and should also go on the system clipboard.
@@ -147,7 +258,11 @@ pub struct DragSession {
 /// What a drag-over position means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DragOver {
-    /// Report the copy effect (a drop here would be accepted).
+    /// Show the drop page: anything dragged over the notch (unsupported
+    /// files get its "only images" hint).
+    pub show: bool,
+    /// Report the copy effect (a drop here would be accepted): supported
+    /// images only.
     pub accept: bool,
     /// Expand the notch (it is neither expanded nor expanding yet).
     pub expand: bool,
@@ -155,23 +270,31 @@ pub struct DragOver {
 
 impl DragSession {
     /// A drag entered the window; any previous session is replaced.
-    pub fn enter(&mut self, images: bool) {
+    /// `opened`: the notch is still open from an earlier drag (its drop
+    /// result was showing), so ending this one closes it again.
+    pub fn enter(&mut self, images: bool, opened: bool) {
         *self = Self {
             active: true,
             images,
-            expanded_by_drag: false,
+            expanded_by_drag: opened,
         };
     }
 
-    /// The pointer moved. Supported images over the notch body are accepted;
-    /// the first such moment expands a collapsed notch (once per drag).
+    /// The pointer moved. Anything over the notch body shows the drop page;
+    /// supported images are accepted. The first such moment expands a
+    /// collapsed notch (once per drag).
     pub fn over(&mut self, over_notch: bool, notch_expanded: bool) -> DragOver {
-        let accept = self.active && self.images && over_notch;
-        let expand = accept && !notch_expanded;
+        let show = self.active && over_notch;
+        let accept = show && self.images;
+        let expand = show && !notch_expanded;
         if expand {
             self.expanded_by_drag = true;
         }
-        DragOver { accept, expand }
+        DragOver {
+            show,
+            accept,
+            expand,
+        }
     }
 
     /// Leave, cancel or drop: ends the session. True if the notch should
@@ -182,7 +305,6 @@ impl DragSession {
         collapse
     }
 
-    #[cfg(test)]
     pub fn is_active(&self) -> bool {
         self.active
     }
@@ -451,6 +573,112 @@ mod tests {
         assert_eq!(decode_image_file(&big.0), Err(DropError::TooLarge));
     }
 
+    /// A real 3 x 2 RGBA PNG: opaque red, half-transparent green, a fully
+    /// transparent pixel, then white, black and a faint one.
+    const PNG_3X2: [u8; 84] = [
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x02, 0x08, 0x06, 0x00, 0x00, 0x00, 0x9d,
+        0x74, 0x66, 0x1a, 0x00, 0x00, 0x00, 0x1b, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xf8,
+        0xcf, 0xc0, 0xf0, 0x1f, 0x08, 0x1b, 0x40, 0x14, 0xc3, 0x7f, 0x20, 0x60, 0x00, 0x52, 0x5c,
+        0x22, 0x72, 0x0e, 0x00, 0x8a, 0x79, 0x09, 0xf4, 0x76, 0x15, 0xe5, 0x35, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    #[test]
+    fn test_png_decodes_premultiplied_and_bad_pngs_are_refused() {
+        com();
+        let ok = TempFile::new("ok.png", &PNG_3X2);
+        let art = decode_image_file(&ok.0).expect("a valid PNG decodes");
+        assert_eq!((art.width, art.height), (3, 2));
+        let px = |i: usize| &art.pixels[i * 4..i * 4 + 4];
+        assert_eq!(px(0), [0, 0, 255, 255], "opaque red, BGRA");
+        assert_eq!(
+            px(1),
+            [0, 128, 0, 128],
+            "half-transparent green, premultiplied"
+        );
+        assert_eq!(px(2), [0, 0, 0, 0], "transparent");
+        assert_eq!(px(3), [255, 255, 255, 255]);
+        // Upper-case extension: still a PNG
+        let upper = TempFile::new("SHOT.PNG", &PNG_3X2);
+        assert!(decode_image_file(&upper.0).is_ok());
+        // Cut short, or with a broken header: refused, never a panic
+        let truncated = TempFile::new("cut.png", &PNG_3X2[..40]);
+        assert_eq!(decode_image_file(&truncated.0), Err(DropError::Malformed));
+        let mut broken = PNG_3X2;
+        broken[1] = b'X';
+        let broken = TempFile::new("broken.png", &broken);
+        assert_eq!(decode_image_file(&broken.0), Err(DropError::Malformed));
+        let empty = TempFile::new("empty.png", &[]);
+        assert_eq!(decode_image_file(&empty.0), Err(DropError::Malformed));
+        // A file bigger than the whole decoded budget is refused unopened
+        let huge = TempFile::new("huge.png", &vec![0u8; CLIPBOARD_MAX_IMAGE_BYTES + 1]);
+        assert_eq!(decode_image_file(&huge.0), Err(DropError::TooLarge));
+    }
+
+    #[test]
+    fn test_decode_all_keeps_the_good_images_and_the_first_failure() {
+        com();
+        let a = TempFile::new("a.png", &PNG_3X2);
+        let bad = TempFile::new("bad.png", b"not an image");
+        let b = TempFile::new("b.bmp", &bmp(2, 2, [1, 2, 3, 255]));
+        let d = decode_all(&[a.0.clone(), bad.0.clone(), b.0.clone()]);
+        assert_eq!(d.images.len(), 2, "in drop order");
+        assert_eq!((d.images[0].width, d.images[1].width), (3, 2));
+        assert_eq!(d.error, Some(DropError::Malformed));
+        assert_eq!(
+            DropOutcome::of(d.images.len(), d.error),
+            DropOutcome::Copied
+        );
+        let none = decode_all(std::slice::from_ref(&bad.0));
+        assert!(none.images.is_empty());
+        assert_eq!(DropOutcome::of(0, none.error), DropOutcome::Unreadable);
+    }
+
+    #[test]
+    fn test_decoding_runs_off_the_ui_thread_and_reports_back() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, GetMessageW, HWND_MESSAGE, MSG, WINDOW_EX_STYLE,
+            WINDOW_STYLE,
+        };
+        const MSG_DECODED: u32 = 0x8000 + 99;
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                windows::core::w!("STATIC"),
+                None,
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        let png = TempFile::new("async.png", &PNG_3X2);
+        assert!(decode_async(hwnd, MSG_DECODED, vec![png.0.clone()]));
+        let mut msg = MSG::default();
+        while unsafe { GetMessageW(&mut msg, Some(hwnd), 0, 0) }.as_bool() {
+            if msg.message == MSG_DECODED {
+                break;
+            }
+        }
+        // The receiver owns the result
+        let decoded = unsafe { Box::from_raw(msg.lParam.0 as *mut Decoded) };
+        assert_eq!(decoded.images.len(), 1);
+        assert_eq!(decoded.error, None);
+        // A window gone meanwhile: the worker frees the result itself
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+        assert!(decode_async(hwnd, MSG_DECODED, vec![png.0.clone()]));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+
     // ---- Ingestion into the existing history -------------------------------
 
     fn art(w: u32, h: u32, shade: u8) -> Artwork {
@@ -494,68 +722,60 @@ mod tests {
 
     // ---- Drag session -----------------------------------------------------
 
+    fn over(show: bool, accept: bool, expand: bool) -> DragOver {
+        DragOver {
+            show,
+            accept,
+            expand,
+        }
+    }
+
     #[test]
     fn test_drag_expands_once_and_collapses_only_what_it_opened() {
         let mut s = DragSession::default();
-        s.enter(true);
+        s.enter(true, false);
         assert_eq!(
             s.over(false, false),
-            DragOver {
-                accept: false,
-                expand: false
-            },
+            over(false, false, false),
             "outside the notch"
         );
-        assert_eq!(
-            s.over(true, false),
-            DragOver {
-                accept: true,
-                expand: true
-            }
-        );
+        assert_eq!(s.over(true, false), over(true, true, true));
         // Now expanding/expanded: keep accepting, never restart the expansion
-        assert_eq!(
-            s.over(true, true),
-            DragOver {
-                accept: true,
-                expand: false
-            }
-        );
+        assert_eq!(s.over(true, true), over(true, true, false));
         assert!(s.end(), "leaving collapses what the drag opened");
         assert!(!s.is_active());
 
         // Already expanded before the drag: dropping leaves it expanded
-        s.enter(true);
-        assert_eq!(
-            s.over(true, true),
-            DragOver {
-                accept: true,
-                expand: false
-            }
-        );
+        s.enter(true, false);
+        assert_eq!(s.over(true, true), over(true, true, false));
         assert!(!s.end());
     }
 
     #[test]
-    fn test_unsupported_drag_is_never_accepted() {
+    fn test_unsupported_drag_shows_the_hint_but_is_never_accepted() {
         let mut s = DragSession::default();
-        s.enter(false);
-        assert_eq!(
-            s.over(true, false),
-            DragOver {
-                accept: false,
-                expand: false
-            }
-        );
-        assert!(!s.end(), "nothing to collapse");
+        s.enter(false, false);
+        // Shown (and opened, to show its hint), never accepted
+        assert_eq!(s.over(true, false), over(true, false, true));
+        assert_eq!(s.over(true, true), over(true, false, false));
+        assert_eq!(s.over(false, true), over(false, false, false), "moved off");
+        assert!(s.end(), "closes what it opened");
         // Over/end without an enter (e.g. after destruction) are inert
-        assert_eq!(
-            s.over(true, false),
-            DragOver {
-                accept: false,
-                expand: false
-            }
-        );
+        assert_eq!(s.over(true, false), over(false, false, false));
+        assert!(!s.end());
+    }
+
+    #[test]
+    fn test_a_drag_during_a_drop_result_closes_the_notch_it_finds_open() {
+        // The notch a first drag opened still shows that drop's result: a
+        // second drag takes over closing it
+        let mut s = DragSession::default();
+        s.enter(true, true);
+        assert_eq!(s.over(true, true), over(true, true, false));
+        assert!(s.end());
+        // Otherwise an open notch stays open
+        s.enter(true, false);
+        s.over(true, true);
         assert!(!s.end());
     }
 
@@ -563,18 +783,51 @@ mod tests {
     fn test_repeated_enter_leave_cycles_stay_balanced() {
         let mut s = DragSession::default();
         for i in 0..50 {
-            s.enter(i % 3 != 0);
+            s.enter(i % 3 != 0, false);
             s.over(i % 2 == 0, false);
             s.end();
             assert_eq!(s, DragSession::default(), "clean after cycle {i}");
         }
         // A new enter after an expansion that was never ended starts fresh
-        s.enter(true);
+        s.enter(true, false);
         s.over(true, false);
-        s.enter(true);
+        s.enter(true, false);
         assert!(
             !s.end(),
             "stale expansion flag does not leak into the next drag"
         );
+    }
+
+    #[test]
+    fn test_drop_outcomes_and_messages() {
+        assert_eq!(DropOutcome::of(1, None), DropOutcome::Copied);
+        assert_eq!(
+            DropOutcome::of(2, Some(DropError::Malformed)),
+            DropOutcome::Copied,
+            "some decoded"
+        );
+        assert_eq!(
+            DropOutcome::of(0, Some(DropError::TooLarge)),
+            DropOutcome::TooLarge
+        );
+        assert_eq!(
+            DropOutcome::of(0, Some(DropError::Malformed)),
+            DropOutcome::Unreadable
+        );
+        assert_eq!(
+            DropOutcome::of(0, Some(DropError::Unreadable)),
+            DropOutcome::Unreadable
+        );
+        assert_eq!(DropOutcome::of(0, None), DropOutcome::Unreadable);
+        assert_eq!(DropOutcome::Copied.message(), "Item copied to clipboard");
+        // Only a real copy is a success
+        for o in [
+            DropOutcome::Unreadable,
+            DropOutcome::TooLarge,
+            DropOutcome::ClipboardBusy,
+        ] {
+            assert!(!o.succeeded());
+            assert_ne!(o.message(), DropOutcome::Copied.message());
+        }
     }
 }

@@ -47,7 +47,7 @@ export function Glance() {
             it as a ring, so you can watch it count down without opening anything.
           </p>
           <p className="t-body mt-4 max-w-md">
-            Click to open. It closes again 5, 10 or 15 seconds after you click elsewhere.
+            Click to open. It closes as soon as you click elsewhere, or after a delay you choose.
           </p>
         </div>
 

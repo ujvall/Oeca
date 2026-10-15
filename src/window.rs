@@ -43,6 +43,7 @@ use crate::config::{
     MEDIA_LIVE_FRAME_MS, MEDIA_LIVE_TIMER_ID, NotchDimensions, NotchState, WINDOW_CLASS_NAME,
     WINDOW_TITLE, calculate_notch_x,
 };
+use crate::config::{DROP_RESULT_MS, DROP_RESULT_TIMER_ID};
 use crate::dragdrop::{self, DragEvent, DragSession, DropTarget};
 use crate::layout::{MediaLayout, PanelHit, resolve_clipboard_layout};
 use crate::layout::{SpaceSelectorLayout, resolve_settings_layout};
@@ -67,6 +68,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HWND_NOTOPMOST, SET_WINDOW_POS_FLAGS, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
 };
 use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, WM_MOUSEWHEEL, WS_EX_TRANSPARENT};
+use windows::Win32::{
+    Foundation::{CloseHandle, HANDLE},
+    Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo},
+    System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
+    System::Threading::{
+        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CancelWaitableTimer, CloseThreadpoolWait,
+        CreateThreadpoolWait, CreateWaitableTimerExW, PTP_CALLBACK_INSTANCE, PTP_WAIT,
+        SetThreadpoolWait, SetWaitableTimer, TIMER_ALL_ACCESS, WaitForThreadpoolWaitCallbacks,
+    },
+};
 
 /// Owns the process's 1 ms timer-resolution request (`timeBeginPeriod`), held
 /// only while the notch animation runs. Requests never stack (reversing an
@@ -107,9 +118,214 @@ impl Drop for HighResTimer {
     }
 }
 
+/// Posted by `FrameClock` for each animation frame.
+const WM_APP_ANIM_FRAME: u32 = WM_APP + 42;
+/// Ticks after which an unanswered frame message is posted again.
+const FRAME_RESEND_TICKS: u32 = 8;
+
+/// What the thread-pool callback needs: where to post, how many ticks ago a
+/// frame message was posted and not yet received (0 = none queued), and the
+/// timer to wait on again.
+struct FrameTarget {
+    hwnd: std::sync::atomic::AtomicIsize,
+    pending: std::sync::atomic::AtomicU32,
+    running: std::sync::atomic::AtomicBool,
+    timer: HANDLE,
+}
+
+/// Animation frames at the display's refresh rate, only while the notch
+/// animates. A high-resolution waitable timer, waited on by the thread pool
+/// (no thread of Oeca's own), posts `WM_APP_ANIM_FRAME`: `SetTimer` and
+/// thread-pool timers follow the system timer resolution, which Windows 11
+/// may keep at 15.6 ms however a process asks (`timeBeginPeriod`), and even
+/// at best `SetTimer` cannot tick faster than 10 ms; a 144 Hz refresh is
+/// 6.9 ms. At most one frame message is queued at a time, so a frame that
+/// takes longer than a refresh never builds a backlog: frames then simply
+/// come less often, each still timed for its own refresh.
+struct FrameClock {
+    wait: PTP_WAIT,
+    /// Stable address handed to the callback; outlives the wait
+    target: Box<FrameTarget>,
+    /// Current period (0 = stopped)
+    period_ms: u32,
+}
+
+impl Default for FrameClock {
+    fn default() -> Self {
+        Self {
+            wait: PTP_WAIT::default(),
+            target: Box::new(FrameTarget {
+                hwnd: std::sync::atomic::AtomicIsize::new(0),
+                pending: std::sync::atomic::AtomicU32::new(0),
+                running: std::sync::atomic::AtomicBool::new(false),
+                timer: HANDLE::default(),
+            }),
+            period_ms: 0,
+        }
+    }
+}
+
+unsafe extern "system" fn post_animation_frame(
+    _: PTP_CALLBACK_INSTANCE,
+    context: *mut core::ffi::c_void,
+    wait: PTP_WAIT,
+    _: u32,
+) {
+    use std::sync::atomic::Ordering;
+    let target = unsafe { &*(context as *const FrameTarget) };
+    if !target.running.load(Ordering::Acquire) {
+        return;
+    }
+    // One frame message at a time; one that has gone unanswered for a while
+    // (lost somehow) is replaced, so the animation can never stall
+    let ticks = target.pending.fetch_add(1, Ordering::AcqRel);
+    if ticks == 0 || ticks >= FRAME_RESEND_TICKS {
+        target.pending.store(1, Ordering::Release);
+        let hwnd = HWND(target.hwnd.load(Ordering::Acquire) as *mut _);
+        if unsafe { PostMessageW(Some(hwnd), WM_APP_ANIM_FRAME, WPARAM(0), LPARAM(0)) }.is_err() {
+            target.pending.store(0, Ordering::Release);
+        }
+    }
+    // A wait fires once: wait for the timer's next period
+    unsafe { SetThreadpoolWait(wait, Some(target.timer), None) };
+}
+
+impl FrameClock {
+    /// Frames to `hwnd` every `period_ms`; keeps an already running clock at
+    /// the same period untouched (a reversal keeps its rhythm). False if the
+    /// timer could not be created (the caller falls back to `SetTimer`).
+    fn start(&mut self, hwnd: HWND, period_ms: u32) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.wait.is_invalid() {
+            let Ok(timer) = (unsafe {
+                CreateWaitableTimerExW(
+                    None,
+                    windows::core::PCWSTR::null(),
+                    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                    TIMER_ALL_ACCESS.0,
+                )
+            }) else {
+                return false;
+            };
+            self.target.timer = timer;
+            let context = &*self.target as *const FrameTarget as *mut core::ffi::c_void;
+            match unsafe { CreateThreadpoolWait(Some(post_animation_frame), Some(context), None) } {
+                Ok(wait) => self.wait = wait,
+                Err(_) => {
+                    unsafe {
+                        let _ = CloseHandle(timer);
+                    }
+                    self.target.timer = HANDLE::default();
+                    return false;
+                }
+            }
+        }
+        if self.period_ms == period_ms {
+            return true;
+        }
+        self.stop();
+        self.target.hwnd.store(hwnd.0 as isize, Ordering::Release);
+        // First frame one period from now (relative due time, 100 ns units)
+        let due = -(i64::from(period_ms) * 10_000);
+        if unsafe { SetWaitableTimer(self.target.timer, &due, period_ms as i32, None, None, false) }
+            .is_err()
+        {
+            return false;
+        }
+        self.target.running.store(true, Ordering::Release);
+        unsafe { SetThreadpoolWait(self.wait, Some(self.target.timer), None) };
+        self.period_ms = period_ms;
+        true
+    }
+
+    /// No more frames: stops the timer and waits for a callback in progress.
+    /// A frame message already queued is ignored by its handler.
+    fn stop(&mut self) {
+        if self.wait.is_invalid() || self.period_ms == 0 {
+            return;
+        }
+        self.target
+            .running
+            .store(false, std::sync::atomic::Ordering::Release);
+        unsafe {
+            let _ = CancelWaitableTimer(self.target.timer);
+            SetThreadpoolWait(self.wait, None, None);
+            WaitForThreadpoolWaitCallbacks(self.wait, true);
+            // A callback that was running may have waited again
+            SetThreadpoolWait(self.wait, None, None);
+        }
+        self.period_ms = 0;
+    }
+
+    /// The queued frame message arrived: the next one may be posted.
+    fn frame_received(&self) {
+        self.target
+            .pending
+            .store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Drop for FrameClock {
+    fn drop(&mut self) {
+        self.stop();
+        unsafe {
+            if !self.wait.is_invalid() {
+                CloseThreadpoolWait(self.wait);
+            }
+            if !self.target.timer.is_invalid() {
+                let _ = CloseHandle(self.target.timer);
+            }
+        }
+    }
+}
+
+/// The next display refresh at or after `now`, from DWM's last vblank and
+/// refresh period (all in performance-counter ticks).
+fn next_vblank(now: i64, vblank: i64, period: i64) -> i64 {
+    vblank + ((now - vblank).div_euclid(period) + 1) * period
+}
+
+/// Frame-clock period for a display refresh period: one frame per refresh,
+/// rounded down so frames never fall behind the display, within 4..=16 ms.
+fn frame_period_ms(refresh_ms: f64) -> u32 {
+    (refresh_ms.floor() as u32).clamp(4, 16)
+}
+
+/// The animation clock, in ms of the performance counter: the time of the
+/// first display refresh after `lead_ms` from now (when a frame that takes
+/// that long to draw will be seen), or now if DWM's timing is unavailable;
+/// and the refresh period, if known.
+fn frame_time(lead_ms: f64) -> (f64, Option<f64>) {
+    let (mut now, mut freq) = (0i64, 0i64);
+    unsafe {
+        let _ = QueryPerformanceCounter(&mut now);
+        let _ = QueryPerformanceFrequency(&mut freq);
+    }
+    let to_ms = |ticks: i64| ticks as f64 * 1000.0 / freq.max(1) as f64;
+    let mut info = DWM_TIMING_INFO {
+        cbSize: std::mem::size_of::<DWM_TIMING_INFO>() as u32,
+        ..Default::default()
+    };
+    let timing = unsafe { DwmGetCompositionTimingInfo(HWND::default(), &mut info) }
+        .ok()
+        .map(|()| (info.qpcVBlank as i64, info.qpcRefreshPeriod as i64))
+        .filter(|&(vblank, period)| vblank > 0 && period > 0);
+    match timing {
+        Some((vblank, period)) => {
+            let lead = (lead_ms * freq as f64 / 1000.0) as i64;
+            (
+                to_ms(next_vblank(now + lead, vblank, period)),
+                Some(to_ms(period)),
+            )
+        }
+        None => (to_ms(now), None),
+    }
+}
+
 struct WindowState {
     renderer: Renderer,
-    /// 1 ms timer resolution, held only during the notch animation.
+    /// 1 ms timer resolution, held only during a notch animation that runs on
+    /// the `SetTimer` fallback (no `FrameClock`).
     high_res_timer: HighResTimer,
     state: NotchState,
     hovered: bool,
@@ -117,7 +333,13 @@ struct WindowState {
     pos_x: i32,
     pos_y: i32,
     animation: Option<AnimationState>,
-    last_frame_time: Option<std::time::Instant>,
+    /// Display time (`frame_time`, ms) of the last animation frame drawn.
+    last_frame_time: Option<f64>,
+    /// Posts the animation frames (`FrameClock`).
+    frame_clock: FrameClock,
+    /// How long recent animation frames took to draw (ms, a decaying
+    /// maximum): frames are timed for the refresh they can make.
+    frame_lead_ms: f64,
     clock: ClockEngine,
     media: MediaEngine,
     /// Display model derived from `media` (None = no session).
@@ -140,6 +362,9 @@ struct WindowState {
     settings_store: crate::settings_store::SettingsStore,
     /// Active OLE drag over the notch (image-file drops into the history).
     drag: DragSession,
+    /// The drop being shown (or still decoding) was opened by its drag, so
+    /// the notch closes once its result has been seen.
+    drop_closes: bool,
     /// User settings: restored from `settings.ini` at launch (defaults for a
     /// new user) and saved through `settings_store` on every change.
     settings: OecaSettings,
@@ -386,7 +611,7 @@ impl WindowState {
     /// What the expanded notch shows: the drop page during an image drag,
     /// otherwise the active space.
     fn scene(&self) -> Scene {
-        Scene::current(self.renderer.drop_page(), self.settings_open, self.space)
+        Scene::current(self.renderer.drop_state(), self.settings_open, self.space)
     }
 
     /// The Settings page's accessible state (Some(settings) while open).
@@ -523,7 +748,11 @@ impl WindowState {
     /// (re)start or stop the one-shot timer, or collapse through the normal
     /// (Phase 6.1) path.
     fn grace(&mut self, hwnd: HWND, event: GraceEvent) {
-        match self.grace.handle(event, self.expanded_or_expanding()) {
+        let at_once = self.settings.collapse_delay.ms() == 0;
+        match self
+            .grace
+            .handle(event, self.expanded_or_expanding(), at_once)
+        {
             GraceAction::None => {}
             GraceAction::Arm => unsafe {
                 // Same id: re-arming restarts the countdown, for the
@@ -700,16 +929,37 @@ impl WindowState {
         let mut anim = AnimationState::space(from, to, before, scene);
         anim.scale = self.dimensions.scale;
         self.animation = Some(anim);
-        self.last_frame_time = Some(std::time::Instant::now());
-        self.high_res_timer.set(true);
-        unsafe {
-            SetTimer(
-                Some(hwnd),
-                ANIMATION_TIMER_ID,
-                ANIMATION_FRAME_INTERVAL_MS,
-                None,
-            );
+        self.start_frames(hwnd);
+    }
+
+    /// Starts (or keeps running) the animation frames, timed from now: frames
+    /// at the display's refresh rate (`FrameClock`), or, if no frame clock is
+    /// available, the 12 ms timer with 1 ms timer resolution.
+    fn start_frames(&mut self, hwnd: HWND) {
+        let (now, refresh) = frame_time(self.frame_lead_ms);
+        self.last_frame_time = Some(now);
+        let period = refresh.map_or(ANIMATION_FRAME_INTERVAL_MS, frame_period_ms);
+        if !self.frame_clock.start(hwnd, period) {
+            self.high_res_timer.set(true);
+            unsafe {
+                SetTimer(
+                    Some(hwnd),
+                    ANIMATION_TIMER_ID,
+                    ANIMATION_FRAME_INTERVAL_MS,
+                    None,
+                );
+            }
         }
+    }
+
+    /// Stops the animation frames and releases the timer resolution.
+    fn stop_frames(&mut self, hwnd: HWND) {
+        self.frame_clock.stop();
+        unsafe {
+            let _ = KillTimer(Some(hwnd), ANIMATION_TIMER_ID);
+        }
+        self.high_res_timer.set(false);
+        self.last_frame_time = None;
     }
 
     /// Places history entry `index` back on the system clipboard and makes it
@@ -749,21 +999,27 @@ impl WindowState {
         zone.contains_point((at.x - left) as f32, (at.y - self.pos_y) as f32)
     }
 
-    /// One OLE drag event (UI thread). Supported image files over the notch are
-    /// accepted; the first such moment expands a collapsed notch through the
-    /// existing animation, and leave/cancel/drop collapse it again only if the
-    /// drag opened it. Files are decoded only on drop, into the existing
-    /// clipboard history; the newest is then placed on the system clipboard
-    /// through the restore path (its own update is skipped by the owner check).
+    /// One OLE drag event (UI thread). Anything dragged over the notch shows
+    /// the drop page (files that are not images, with its hint); supported
+    /// images are accepted. The first such moment expands a collapsed notch
+    /// through the existing animation; leave/cancel close it again only if
+    /// the drag opened it. A drop keeps the page up while its files decode
+    /// off the UI thread (`finish_drop` then shows the result).
     fn on_drag(&mut self, hwnd: HWND, event: DragEvent) -> bool {
+        use dragdrop::DropPage;
         let over = |state: &mut Self, at: POINT| {
             let in_notch = state.screen_point_in_drop_zone(at);
             let expanded = state.expanded_or_expanding();
             let before = state.scene();
             let action = state.drag.over(in_notch, expanded);
-            // Drop page while an accepted image is over the notch, at its own
-            // universal size (an expansion it starts opens straight at it)
-            if state.renderer.set_drop_page(action.accept) && !action.expand {
+            let page = match (action.show, action.accept) {
+                (true, true) => DropPage::Ready,
+                (true, false) => DropPage::Unsupported,
+                _ => DropPage::Off,
+            };
+            // The drop page at its own universal size (an expansion it
+            // starts opens straight at it)
+            if state.renderer.set_drop(page) && !action.expand {
                 state.resize_to_target(hwnd, before);
             }
             if action.expand {
@@ -775,7 +1031,7 @@ impl WindowState {
         let end = |state: &mut Self| {
             let collapse = state.drag.end() && state.expanded_or_expanding();
             let before = state.scene();
-            let changed = state.renderer.set_drop_page(false);
+            let changed = state.renderer.set_drop(DropPage::Off);
             if collapse {
                 state.reset_feedback(hwnd);
                 let _ = start_or_reverse_animation(hwnd, state);
@@ -787,7 +1043,10 @@ impl WindowState {
         match event {
             DragEvent::Enter { images, at } => {
                 self.grace(hwnd, GraceEvent::OecaInteraction);
-                self.drag.enter(images);
+                // A drop result still on show gives way to the new drag,
+                // which then closes the notch the earlier drag opened
+                let opened = self.stop_drop_result(hwnd);
+                self.drag.enter(images, opened);
                 over(self, at)
             }
             DragEvent::Over { at } => over(self, at),
@@ -796,32 +1055,82 @@ impl WindowState {
                 false
             }
             DragEvent::Drop { images, at } => {
-                let accept = over(self, at) && !images.is_empty();
-                let mut stored = false;
-                if accept {
-                    // Unsupported / unreadable / malformed / too large: skipped
-                    let decoded: Vec<_> = images
-                        .iter()
-                        .filter_map(|p| dragdrop::decode_image_file(p).ok())
-                        .collect();
-                    if dragdrop::ingest(&mut self.clipboard, decoded) {
-                        stored = true;
-                        // Clipboard busy: the history keeps it; no retry
-                        let _ = self.restore_clipboard(hwnd, 0);
-                        self.clipboard_changed(hwnd);
-                    }
-                    #[cfg(debug_assertions)]
-                    eprintln!(
-                        "[dragdrop] {} image file(s) dropped, stored: {}, {} entries",
-                        images.len(),
-                        stored,
-                        self.clipboard.len()
-                    );
+                if !(over(self, at) && !images.is_empty()) {
+                    end(self);
+                    return false;
                 }
-                end(self);
-                stored
+                // The page stays up until the result replaces it; the
+                // expansion this drag made is closed after the result
+                self.drop_closes = self.drag.end() && self.expanded_or_expanding();
+                if !dragdrop::decode_async(hwnd, WM_APP_DROP_DECODED, images.clone()) {
+                    // No worker thread: decode here (this thread has COM)
+                    self.finish_drop(hwnd, dragdrop::decode_all(&images));
+                }
+                true
             }
         }
+    }
+
+    /// A drop's files are decoded: adds the images to the history (all its
+    /// limits apply), places the newest on the system clipboard (its own
+    /// update is then skipped by the owner check), and shows the outcome on
+    /// the drop page: "Item copied to clipboard" only if both worked.
+    fn finish_drop(&mut self, hwnd: HWND, decoded: dragdrop::Decoded) {
+        use dragdrop::DropOutcome;
+        let mut outcome = DropOutcome::of(decoded.images.len(), decoded.error);
+        if dragdrop::ingest(&mut self.clipboard, decoded.images) {
+            if self.restore_clipboard(hwnd, 0).is_err() {
+                outcome = DropOutcome::ClipboardBusy;
+            }
+            self.clipboard_changed(hwnd);
+        } else if outcome.succeeded() {
+            // Decoded, but over the history's image budget
+            outcome = DropOutcome::TooLarge;
+        }
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[dragdrop] drop finished: {outcome:?}, {} entries",
+            self.clipboard.len()
+        );
+        // A new drag took over, or the notch closed meanwhile: the history
+        // has the images, there is nothing left to show them on
+        if self.drag.is_active() || !self.expanded_or_expanding() {
+            self.drop_closes = false;
+            return;
+        }
+        let before = self.scene();
+        if self.renderer.set_drop_result(outcome) {
+            self.resize_to_target(hwnd, before);
+        }
+        unsafe {
+            let _ = SetTimer(Some(hwnd), DROP_RESULT_TIMER_ID, DROP_RESULT_MS, None);
+        }
+    }
+
+    /// The drop result has been on show long enough: back to the active
+    /// space, or closed if its drag opened the notch.
+    fn end_drop_result(&mut self, hwnd: HWND) {
+        let close = self.stop_drop_result(hwnd);
+        if self.renderer.drop_state() != dragdrop::DropPage::Result {
+            return;
+        }
+        let before = self.scene();
+        self.renderer.set_drop(dragdrop::DropPage::Off);
+        if close && self.expanded_or_expanding() {
+            self.reset_feedback(hwnd);
+            let _ = start_or_reverse_animation(hwnd, self);
+        } else {
+            self.resize_to_target(hwnd, before);
+        }
+    }
+
+    /// Stops a drop result's countdown; true if the notch was to close after
+    /// it (the caller takes that over). The result itself stays on show.
+    fn stop_drop_result(&mut self, hwnd: HWND) -> bool {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), DROP_RESULT_TIMER_ID);
+        }
+        std::mem::take(&mut self.drop_closes)
     }
 
     /// Panel control under a client-area point on the settled expanded notch:
@@ -1324,9 +1633,14 @@ pub enum GraceAction {
 }
 
 impl GracePeriod {
-    /// `expanded`: the notch is expanded or expanding.
-    pub fn handle(&mut self, event: GraceEvent, expanded: bool) -> GraceAction {
+    /// `expanded`: the notch is expanded or expanding. `at_once`: the closing
+    /// delay is 0 s, so an outside click collapses without a countdown.
+    pub fn handle(&mut self, event: GraceEvent, expanded: bool, at_once: bool) -> GraceAction {
         match event {
+            GraceEvent::OutsideClick if expanded && at_once => {
+                self.pending = false;
+                GraceAction::Collapse
+            }
             GraceEvent::OutsideClick if expanded => {
                 self.pending = true;
                 GraceAction::Arm
@@ -1339,7 +1653,16 @@ impl GracePeriod {
                     GraceAction::None
                 }
             }
-            // A new duration restarts a pending countdown with it
+            // A new duration restarts a pending countdown with it (0 s:
+            // its time is up)
+            GraceEvent::DelayChanged if self.pending && at_once => {
+                self.pending = false;
+                if expanded {
+                    GraceAction::Collapse
+                } else {
+                    GraceAction::Disarm
+                }
+            }
             GraceEvent::DelayChanged if self.pending => GraceAction::Arm,
             GraceEvent::DelayChanged => GraceAction::None,
             // A fire with nothing pending is stale (cancelled meanwhile)
@@ -1375,6 +1698,12 @@ pub const WM_APP_GRACE: u32 = WM_APP + 40;
 
 /// Posted when the countdown's wake-up fires (see `TIMER_TICK_TIMER_ID`).
 const WM_APP_TIMER_TICK: u32 = WM_APP + 41;
+
+/// Posted by a drop's decoding worker (lParam: its `Box<dragdrop::Decoded>`).
+const WM_APP_DROP_DECODED: u32 = WM_APP + 43;
+
+/// Posted when a drop result has been on show long enough.
+const WM_APP_DROP_RESULT_DONE: u32 = WM_APP + 44;
 
 /// Whose a click is, by the top-level window under it: the notch itself
 /// (handled by its own mouse messages), Oeca's Settings window (Oeca in use),
@@ -1423,13 +1752,15 @@ fn watch_outside_clicks(hwnd: HWND, on: bool) -> bool {
     }
 }
 
-/// Whether a `WM_INPUT` is a mouse button going down (moves are ignored).
-fn raw_button_down(lparam: LPARAM) -> bool {
+/// Whether a `WM_INPUT` is a mouse button being released (moves and
+/// presses are ignored). Outside clicks count on release: a drag that starts
+/// elsewhere (a file from Explorer) and ends on the notch is no outside click.
+fn raw_button_released(lparam: LPARAM) -> bool {
     use windows::Win32::UI::Input::{
         GetRawInputData, HRAWINPUT, RAWINPUT, RAWINPUTHEADER, RID_INPUT, RIM_TYPEMOUSE,
     };
-    // Left, right, middle, X1, X2 down
-    const DOWNS: u16 = 0x0001 | 0x0004 | 0x0010 | 0x0040 | 0x0100;
+    // Left, right, middle, X1, X2 up
+    const UPS: u16 = 0x0002 | 0x0008 | 0x0020 | 0x0080 | 0x0200;
     let mut raw = RAWINPUT::default();
     let mut size = std::mem::size_of::<RAWINPUT>() as u32;
     let read = unsafe {
@@ -1443,7 +1774,7 @@ fn raw_button_down(lparam: LPARAM) -> bool {
     };
     read != u32::MAX
         && raw.header.dwType == RIM_TYPEMOUSE.0
-        && unsafe { raw.data.mouse.Anonymous.Anonymous.usButtonFlags } & DOWNS != 0
+        && unsafe { raw.data.mouse.Anonymous.Anonymous.usButtonFlags } & UPS != 0
 }
 
 /// The playback live timer's period: visualizer frames whenever bars can be on
@@ -1669,6 +2000,12 @@ fn start_or_reverse_animation(hwnd: HWND, state: &mut WindowState) -> Result<()>
             NotchState::Expanded => NotchState::Collapsed,
         }
     };
+    // Closing takes a drop page that outlived its drag with it (a result on
+    // show, or a drop still decoding: its images still reach the history)
+    if target_state == NotchState::Collapsed && !state.drag.is_active() {
+        state.stop_drop_result(hwnd);
+        state.renderer.set_drop(crate::dragdrop::DropPage::Off);
+    }
     // A scrub in progress ends without seeking
     state.end_scrub(hwnd, false);
     // Collapsing closes the Settings page; the next expansion shows the space
@@ -1688,13 +2025,9 @@ fn start_or_reverse_animation(hwnd: HWND, state: &mut WindowState) -> Result<()>
 
     if !state.motion_enabled() {
         // Reduced motion requested: snap immediately to target state without timer
-        unsafe {
-            let _ = KillTimer(Some(hwnd), ANIMATION_TIMER_ID);
-        }
-        state.high_res_timer.set(false);
+        state.stop_frames(hwnd);
         state.animation = None;
         state.renderer.set_transition(None);
-        state.last_frame_time = None;
         state.state = target_state;
         let new_dims = space_dimensions(target_state, state.dimensions.dpi, state.size_space());
         state.dimensions = new_dims;
@@ -1786,19 +2119,8 @@ fn start_or_reverse_animation(hwnd: HWND, state: &mut WindowState) -> Result<()>
     };
 
     state.animation = Some(new_anim);
-    state.last_frame_time = Some(std::time::Instant::now());
-
-    // Arm the temporary high-precision timer for ~60 FPS animation steps. A
-    // reversal re-arms the same timer ID; the resolution request is not stacked.
-    state.high_res_timer.set(true);
-    unsafe {
-        SetTimer(
-            Some(hwnd),
-            ANIMATION_TIMER_ID,
-            ANIMATION_FRAME_INTERVAL_MS,
-            None,
-        );
-    }
+    // A reversal keeps the running frames; the resolution request is not stacked
+    state.start_frames(hwnd);
     // Expanding: the bubble / slot leave at once; collapsing: they follow
     // once the collapsed content fades in (re-aimed on every frame)
     state.refresh_timer_presence(hwnd);
@@ -1881,6 +2203,143 @@ fn set_notch_state(hwnd: HWND, state: &mut WindowState, new_state: NotchState) -
 /// Private: a `WM_DPICHANGED` that arrived re-entrantly, replayed later (the real
 /// message cannot be posted). wParam carries the original DPI pair.
 const WM_APP_DEFERRED_DPICHANGED: u32 = WM_APP + 16;
+
+/// One frame of the notch animation (expand, collapse, space switch): steps
+/// the springs to this frame's display time, draws, and on settling draws the
+/// exact end state and stops the frames.
+fn animation_frame(hwnd: HWND, state: &mut WindowState) {
+    // Motion is sampled at the refresh this frame will be shown on, so every
+    // frame advances by whole refresh periods whenever the tick happens to
+    // run; a second tick for an already drawn refresh draws nothing
+    let now = frame_time(state.frame_lead_ms).0;
+    let delta_ms = match state.last_frame_time {
+        Some(last) if now <= last => return,
+        Some(last) => (now - last) as f32,
+        None => ANIMATION_FRAME_INTERVAL_MS as f32,
+    };
+    state.last_frame_time = Some(now);
+
+    let still_active = if let Some(anim) = &mut state.animation {
+        anim.step(delta_ms)
+    } else {
+        false
+    };
+
+    let current_dims = if let Some(anim) = &state.animation {
+        state.renderer.set_transition(Some(anim.transition()));
+        anim.current_dimensions(state.dimensions.dpi)
+    } else {
+        state.dimensions
+    };
+
+    state.dimensions = current_dims;
+    let screen_width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    let new_x = calculate_notch_x(screen_width, current_dims.width);
+    let new_y = 0;
+    state.pos_x = new_x;
+    state.pos_y = new_y;
+
+    let drawing = std::time::Instant::now();
+    let _ = state.renderer.render(
+        hwnd,
+        new_x,
+        new_y,
+        &state.dimensions,
+        state.hovered,
+        state.clock.state(),
+    );
+    // A decaying maximum: one slow frame aims the next few a refresh later
+    // rather than letting them miss it
+    let cost = drawing.elapsed().as_secs_f64() * 1000.0;
+    state.frame_lead_ms = cost.max(state.frame_lead_ms * 0.9);
+    // The bubble rides the notch's edge; collapsed
+    // presentations follow the collapsed content's fade
+    state.refresh_timer_presence(hwnd);
+
+    if !still_active {
+        // Animation complete: snap cleanly to target state and deactivate timer
+        if let Some(anim) = state.animation.take() {
+            state.state = anim.target_state;
+            state.dimensions =
+                space_dimensions(anim.target_state, state.dimensions.dpi, state.size_space());
+            // The last frame was already at the target; draw the
+            // settled state once (exact pixels, no transition)
+            state.renderer.set_transition(None);
+            let _ = state.renderer.render(
+                hwnd,
+                new_x,
+                new_y,
+                &state.dimensions,
+                state.hovered,
+                state.clock.state(),
+            );
+            notify_accessibility_state_changed(
+                hwnd,
+                state.state,
+                state.clock.state(),
+                state.media_content.as_ref(),
+                state.space,
+                &state.clipboard,
+                state.clear_pending,
+                state.settings_title(),
+                state.timer_title().as_deref(),
+            );
+        }
+        state.stop_frames(hwnd);
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                z_order(state.settings.always_on_top).0,
+                new_x,
+                new_y,
+                state.dimensions.width,
+                state.dimensions.height,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW | z_order(state.settings.always_on_top).1,
+            );
+        }
+
+        // Re-evaluate cursor in notch after transition completes
+        let mut cursor_pt = POINT::default();
+        let cursor_in_notch = unsafe {
+            if GetCursorPos(&mut cursor_pt).is_ok() {
+                let mut client_pt = cursor_pt;
+                let _ = ScreenToClient(hwnd, &mut client_pt);
+                state
+                    .dimensions
+                    .contains_point(client_pt.x as f32, client_pt.y as f32)
+            } else {
+                false
+            }
+        };
+        if state.hovered != cursor_in_notch {
+            state.hovered = cursor_in_notch;
+            if cursor_in_notch {
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                unsafe {
+                    let _ = TrackMouseEvent(&mut tme);
+                }
+            }
+        }
+
+        // Final static render at exact target dimensions
+        let _ = state.renderer.render(
+            hwnd,
+            state.pos_x,
+            state.pos_y,
+            &state.dimensions,
+            state.hovered,
+            state.clock.state(),
+        );
+        // Settled somewhere showing a visualizer/scrubber again
+        state.kick_live(hwnd);
+        state.refresh_timer_presence(hwnd);
+    }
+}
 
 /// What to do with a message that arrives while `WindowState` is already in use
 /// by an outer handler (synchronous re-entry, e.g. `ReleaseCapture` sending
@@ -2069,11 +2528,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
         WM_INPUT => {
             // Read now: the raw handle is only valid while this message is
-            // handled. Only button presses outside the notch matter.
+            // handled. Only button releases outside the notch matter.
             // While the notch holds the mouse capture (a scrub or a drag on
             // the timer's scale), every button belongs to that gesture: none
             // is an outside click
-            if !gesture_owns_buttons(unsafe { GetCapture() }, hwnd) && raw_button_down(lparam) {
+            if !gesture_owns_buttons(unsafe { GetCapture() }, hwnd) && raw_button_released(lparam) {
                 let mut pt = POINT::default();
                 let event = unsafe { GetCursorPos(&mut pt) }.ok().and_then(|()| {
                     let under = unsafe { WindowFromPoint(pt) };
@@ -2101,6 +2560,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if let Some(d) = crate::config::CollapseDelay::from_index(wparam.0) {
                     state.set_collapse_delay(hwnd, d);
                 }
+            });
+            LRESULT(0)
+        }
+
+        WM_APP_DROP_DECODED => {
+            // lParam owns a `Box<dragdrop::Decoded>` from `decode_async`: it
+            // is taken back exactly once, when applied or when the window
+            // is gone; a busy state gets the same message again later
+            let ptr = lparam.0 as *mut dragdrop::Decoded;
+            let take = || unsafe { *Box::from_raw(ptr) };
+            match with_state(hwnd, |state| state.finish_drop(hwnd, take())) {
+                Access::Ran(()) => {}
+                Access::Busy => unsafe {
+                    if PostMessageW(Some(hwnd), msg, wparam, lparam).is_err() {
+                        drop(take());
+                    }
+                },
+                Access::Missing => drop(take()),
+            }
+            LRESULT(0)
+        }
+
+        WM_APP_DROP_RESULT_DONE => {
+            with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                state.end_drop_result(hwnd);
             });
             LRESULT(0)
         }
@@ -2144,6 +2628,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
 
+        WM_APP_ANIM_FRAME => {
+            with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                state.frame_clock.frame_received();
+                // A frame queued just before the animation ended draws nothing
+                if state.animation.is_some() {
+                    animation_frame(hwnd, state);
+                }
+            });
+            LRESULT(0)
+        }
+
         WM_TIMER => {
             if wparam.0 == AUTO_COLLAPSE_TIMER_ID {
                 // One-shot; applied as a message so a busy state replays it
@@ -2159,6 +2654,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 return LRESULT(0);
             }
+            if wparam.0 == DROP_RESULT_TIMER_ID {
+                // One-shot, applied as a message so a busy state replays it
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), DROP_RESULT_TIMER_ID);
+                    let _ = PostMessageW(Some(hwnd), WM_APP_DROP_RESULT_DONE, WPARAM(0), LPARAM(0));
+                }
+                return LRESULT(0);
+            }
             if wparam.0 == TIMER_TICK_TIMER_ID {
                 // Applied as a message so a busy state replays it (timer
                 // messages would be dropped); re-armed by its handler
@@ -2169,137 +2672,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 return LRESULT(0);
             }
             if wparam.0 == ANIMATION_TIMER_ID {
+                // Fallback frames (no thread-pool timer, see `FrameClock`)
                 with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
-                    let now = std::time::Instant::now();
-                    let delta_ms = if let Some(last) = state.last_frame_time {
-                        now.duration_since(last).as_secs_f32() * 1000.0
-                    } else {
-                        ANIMATION_FRAME_INTERVAL_MS as f32
-                    };
-                    state.last_frame_time = Some(now);
-
-                    let still_active = if let Some(anim) = &mut state.animation {
-                        anim.step(delta_ms)
-                    } else {
-                        false
-                    };
-
-                    let current_dims = if let Some(anim) = &state.animation {
-                        state.renderer.set_transition(Some(anim.transition()));
-                        anim.current_dimensions(state.dimensions.dpi)
-                    } else {
-                        state.dimensions
-                    };
-
-                    state.dimensions = current_dims;
-                    let screen_width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-                    let new_x = calculate_notch_x(screen_width, current_dims.width);
-                    let new_y = 0;
-                    state.pos_x = new_x;
-                    state.pos_y = new_y;
-
-                    let _ = state.renderer.render(
-                        hwnd,
-                        new_x,
-                        new_y,
-                        &state.dimensions,
-                        state.hovered,
-                        state.clock.state(),
-                    );
-                    // The bubble rides the notch's edge; collapsed
-                    // presentations follow the collapsed content's fade
-                    state.refresh_timer_presence(hwnd);
-
-                    if !still_active {
-                        // Animation complete: snap cleanly to target state and deactivate timer
-                        if let Some(anim) = state.animation.take() {
-                            state.state = anim.target_state;
-                            state.dimensions = space_dimensions(
-                                anim.target_state,
-                                state.dimensions.dpi,
-                                state.size_space(),
-                            );
-                            // The last frame was already at the target; draw the
-                            // settled state once (exact pixels, no transition)
-                            state.renderer.set_transition(None);
-                            let _ = state.renderer.render(
-                                hwnd,
-                                new_x,
-                                new_y,
-                                &state.dimensions,
-                                state.hovered,
-                                state.clock.state(),
-                            );
-                            notify_accessibility_state_changed(
-                                hwnd,
-                                state.state,
-                                state.clock.state(),
-                                state.media_content.as_ref(),
-                                state.space,
-                                &state.clipboard,
-                                state.clear_pending,
-                                state.settings_title(),
-                                state.timer_title().as_deref(),
-                            );
-                        }
-                        state.last_frame_time = None;
-                        state.high_res_timer.set(false);
-                        unsafe {
-                            let _ = KillTimer(Some(hwnd), ANIMATION_TIMER_ID);
-                            let _ = SetWindowPos(
-                                hwnd,
-                                z_order(state.settings.always_on_top).0,
-                                new_x,
-                                new_y,
-                                state.dimensions.width,
-                                state.dimensions.height,
-                                SWP_NOACTIVATE
-                                    | SWP_SHOWWINDOW
-                                    | z_order(state.settings.always_on_top).1,
-                            );
-                        }
-
-                        // Re-evaluate cursor in notch after transition completes
-                        let mut cursor_pt = POINT::default();
-                        let cursor_in_notch = unsafe {
-                            if GetCursorPos(&mut cursor_pt).is_ok() {
-                                let mut client_pt = cursor_pt;
-                                let _ = ScreenToClient(hwnd, &mut client_pt);
-                                state
-                                    .dimensions
-                                    .contains_point(client_pt.x as f32, client_pt.y as f32)
-                            } else {
-                                false
-                            }
-                        };
-                        if state.hovered != cursor_in_notch {
-                            state.hovered = cursor_in_notch;
-                            if cursor_in_notch {
-                                let mut tme = TRACKMOUSEEVENT {
-                                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                                    dwFlags: TME_LEAVE,
-                                    hwndTrack: hwnd,
-                                    dwHoverTime: 0,
-                                };
-                                unsafe {
-                                    let _ = TrackMouseEvent(&mut tme);
-                                }
-                            }
-                        }
-
-                        // Final static render at exact target dimensions
-                        let _ = state.renderer.render(
-                            hwnd,
-                            state.pos_x,
-                            state.pos_y,
-                            &state.dimensions,
-                            state.hovered,
-                            state.clock.state(),
-                        );
-                        // Settled somewhere showing a visualizer/scrubber again
-                        state.kick_live(hwnd);
-                        state.refresh_timer_presence(hwnd);
-                    }
+                    animation_frame(hwnd, state);
                 });
             } else if wparam.0 == MEDIA_FEEDBACK_TIMER_ID {
                 with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
@@ -2999,6 +3374,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = KillTimer(Some(hwnd), CLIPBOARD_TIMER_ID);
                 let _ = KillTimer(Some(hwnd), AUTO_COLLAPSE_TIMER_ID);
                 let _ = KillTimer(Some(hwnd), TIMER_TICK_TIMER_ID);
+                let _ = KillTimer(Some(hwnd), DROP_RESULT_TIMER_ID);
                 PostQuitMessage(0);
             }
             // Stop reporting outside clicks (no-op if never registered)
@@ -3013,7 +3389,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // The countdown bubble goes too (owned by the notch, it would be
             // destroyed with it anyway)
             let _ = with_state(hwnd, |state| {
-                state.high_res_timer.set(false);
+                state.stop_frames(hwnd);
                 state.tray.remove();
                 if let Some(bubble) = state.bubble.take() {
                     unsafe {
@@ -3339,6 +3715,8 @@ fn run_window(ole: bool) -> Result<()> {
         let state = Box::new(WindowState {
             renderer,
             high_res_timer: HighResTimer::default(),
+            frame_clock: FrameClock::default(),
+            frame_lead_ms: 0.0,
             state: NotchState::Collapsed,
             hovered: false,
             dimensions,
@@ -3356,6 +3734,7 @@ fn run_window(ole: bool) -> Result<()> {
             clipboard,
             clip_store,
             drag: DragSession::default(),
+            drop_closes: false,
             settings,
             settings_store,
             settings_open: false,
@@ -3515,6 +3894,252 @@ mod tests {
             g.exit();
             ok
         }));
+    }
+
+    /// Frame pacing of a real expand animation (renderer, off-screen layered
+    /// window) with the old 12 ms timer sampled at tick time, and with the
+    /// frame clock sampled at the next refresh. Per frame: the time the motion
+    /// was sampled for, and the refresh it was actually shown on. Run with
+    /// `cargo test --release bench_frame_pacing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_frame_pacing() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, PM_REMOVE, PeekMessageW, SW_SHOWNOACTIVATE, ShowWindow,
+            WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+        };
+        let Some(refresh) = frame_time(0.0).1 else {
+            eprintln!("BENCH pacing: DWM reports no refresh timing here");
+            return;
+        };
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                windows::core::w!("STATIC"),
+                None,
+                WS_POPUP,
+                -30000,
+                -30000,
+                1,
+                1,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+        let now_ms = || {
+            let (mut t, mut f) = (0i64, 0i64);
+            unsafe {
+                let _ = QueryPerformanceCounter(&mut t);
+                let _ = QueryPerformanceFrequency(&mut f);
+            }
+            t as f64 * 1000.0 / f as f64
+        };
+        let clock =
+            crate::clock::ClockDateState::from_pure_components(2026, 10, 6, 2, 0, 47, 0, 0, false);
+        let mut res = HighResTimer::default();
+        res.set(true);
+        eprintln!(
+            "BENCH pacing: display refresh {:.2} ms ({:.0} Hz)",
+            refresh,
+            1000.0 / refresh
+        );
+        for dpi in [96u32, 192] {
+            for paced in [false, true] {
+                let renderer = Renderer::new().unwrap();
+                let mut fc = FrameClock::default();
+                if paced {
+                    assert!(fc.start(hwnd, frame_period_ms(refresh)));
+                } else {
+                    unsafe { SetTimer(Some(hwnd), 7, ANIMATION_FRAME_INTERVAL_MS, None) };
+                }
+                // (sampled for, shown at) per frame, over 10 animations
+                let mut frames: Vec<(f64, f64)> = Vec::new();
+                let mut holes = 0.0;
+                let mut render_ms = 0.0;
+                let mut lead = 0.0;
+                for _ in 0..10 {
+                    let mut anim = AnimationState::new(NotchState::Collapsed, NotchState::Expanded);
+                    let start = if paced { frame_time(lead).0 } else { now_ms() };
+                    let mut last = start;
+                    let mut shown = Vec::new();
+                    let mut active = true;
+                    while active {
+                        let mut msg = MSG::default();
+                        let _ = unsafe { GetMessageW(&mut msg, Some(hwnd), 0, 0) };
+                        let tick = (paced && msg.message == WM_APP_ANIM_FRAME)
+                            || (!paced && msg.message == WM_TIMER);
+                        if !tick {
+                            continue;
+                        }
+                        fc.frame_received();
+                        let sample = if paced { frame_time(lead).0 } else { now_ms() };
+                        if sample <= last {
+                            continue;
+                        }
+                        active = anim.step((sample - last) as f32);
+                        last = sample;
+                        renderer.set_transition(Some(anim.transition()));
+                        let dims = anim.current_dimensions(dpi);
+                        let t = now_ms();
+                        renderer
+                            .render(hwnd, -30000, -30000, &dims, false, &clock)
+                            .unwrap();
+                        let cost = now_ms() - t;
+                        render_ms += cost;
+                        lead = cost.max(lead * 0.9);
+                        // Shown on the first refresh after the upload
+                        let at = frame_time(0.0).0;
+                        frames.push((sample, at));
+                        shown.push(at);
+                    }
+                    // Refreshes during the animation that showed no new frame
+                    shown.dedup_by(|a, b| (*a - *b).abs() < refresh / 2.0);
+                    let span = ((shown.last().unwrap() - shown[0]) / refresh).round() + 1.0;
+                    holes += span - shown.len() as f64;
+                    while unsafe { PeekMessageW(&mut MSG::default(), Some(hwnd), 0, 0, PM_REMOVE) }
+                        .as_bool()
+                    {}
+                    fc.frame_received();
+                }
+                fc.stop();
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), 7);
+                }
+                // Judder: how far each frame's shown time is from the time its
+                // motion was sampled for (spread = uneven motion)
+                let errs: Vec<f64> = frames.iter().map(|(s, a)| a - s).collect();
+                let mean = errs.iter().sum::<f64>() / errs.len() as f64;
+                let sd = (errs.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / errs.len() as f64)
+                    .sqrt();
+                eprintln!(
+                    "BENCH pacing {:>3}% {}: {} frames, {:.0}% of refreshes without a new frame,                      shown-vs-sampled offset {:.2} ms +/- {:.2} ms, render {:.2} ms avg",
+                    dpi * 100 / 96,
+                    if paced {
+                        "new (frame clock, next refresh)"
+                    } else {
+                        "old (12 ms timer, tick time)  "
+                    },
+                    frames.len(),
+                    100.0 * holes / (holes + frames.len() as f64),
+                    mean,
+                    sd,
+                    render_ms / frames.len() as f64
+                );
+            }
+        }
+        res.set(false);
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn test_frames_are_timed_to_the_next_refresh() {
+        // 144 Hz in ticks of 1 us: a vblank every 6944
+        let (vblank, period) = (1_000_000, 6_944);
+        assert_eq!(
+            next_vblank(1_000_000, vblank, period),
+            1_006_944,
+            "on a vblank: the next"
+        );
+        assert_eq!(next_vblank(1_003_000, vblank, period), 1_006_944);
+        assert_eq!(next_vblank(1_006_944, vblank, period), 1_013_888);
+        // A stale vblank still gives a refresh in the near future
+        let t = next_vblank(9_000_000, vblank, period);
+        assert!(t > 9_000_000 && t <= 9_000_000 + period && (t - vblank) % period == 0);
+        assert!(
+            next_vblank(990_000, vblank, period) > 990_000,
+            "now before the vblank"
+        );
+        // One frame per refresh, rounded down; bounded at both ends
+        assert_eq!(frame_period_ms(1000.0 / 60.0), 16);
+        assert_eq!(frame_period_ms(1000.0 / 120.0), 8);
+        assert_eq!(frame_period_ms(1000.0 / 144.0), 6);
+        assert_eq!(frame_period_ms(1000.0 / 240.0), 4);
+        assert_eq!(frame_period_ms(1000.0 / 360.0), 4);
+        assert_eq!(frame_period_ms(1000.0 / 30.0), 16);
+        // The live clock moves forward, a refresh at a time when DWM reports one
+        let (a, refresh) = frame_time(0.0);
+        let (b, _) = frame_time(0.0);
+        assert!(b >= a);
+        if let Some(r) = refresh {
+            assert!((2.0..=50.0).contains(&r), "{r} ms");
+        }
+    }
+
+    #[test]
+    fn test_frame_clock_paces_coalesces_and_stops() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, HWND_MESSAGE, PM_REMOVE, PeekMessageW, WINDOW_EX_STYLE,
+            WINDOW_STYLE,
+        };
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                windows::core::w!("STATIC"),
+                None,
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        // Frames received over `ms`, acknowledging each one if `ack`
+        let pump = |clock: &FrameClock, ms: u64, ack: bool| {
+            let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+            let mut frames = 0;
+            while std::time::Instant::now() < end {
+                let mut msg = MSG::default();
+                while unsafe { PeekMessageW(&mut msg, Some(hwnd), 0, 0, PM_REMOVE) }.as_bool() {
+                    if msg.message == WM_APP_ANIM_FRAME {
+                        frames += 1;
+                        if ack {
+                            clock.frame_received();
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            frames
+        };
+        let mut res = HighResTimer::default();
+        res.set(true);
+        let mut clock = FrameClock::default();
+        assert!(clock.start(hwnd, 8));
+        // ~25 frames in 200 ms at 8 ms (generous bounds for a loaded machine)
+        let paced = pump(&clock, 200, true);
+        assert!((8..=40).contains(&paced), "{paced} frames");
+        // Unacknowledged: one frame queued, no backlog; one left unanswered
+        // for 8 ticks is sent again (a lost message never stalls the frames)
+        clock.stop();
+        let _ = pump(&clock, 20, true);
+        assert!(clock.start(hwnd, 8));
+        assert_eq!(pump(&clock, 40, false), 1, "no backlog");
+        let resent = pump(&clock, 150, false);
+        assert!((1..=3).contains(&resent), "{resent} resent");
+        // Restarting at the same period keeps it running; stopping ends it
+        assert!(clock.start(hwnd, 8));
+        clock.frame_received();
+        clock.stop();
+        let _ = pump(&clock, 20, true);
+        assert_eq!(pump(&clock, 100, true), 0, "stopped");
+        res.set(false);
+        drop(clock);
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
     }
 
     #[test]
@@ -3713,14 +4338,14 @@ mod tests {
         for dpi in [96, 120, 144, 192] {
             let clipboard = expanded_size_dip(OecaSpace::Clipboard, dpi);
             for space in OecaSpace::ALL {
-                let open = Scene::current(false, true, space);
+                let open = Scene::current(crate::dragdrop::DropPage::Off, true, space);
                 assert_eq!(
                     expanded_size_dip(open.size_space(), dpi),
                     clipboard,
                     "{space:?}"
                 );
                 // Back from Settings: the originating space's own size
-                let closed = Scene::current(false, false, space);
+                let closed = Scene::current(crate::dragdrop::DropPage::Off, false, space);
                 assert_eq!(closed, Scene::Space(space));
                 assert_eq!(
                     expanded_size_dip(closed.size_space(), dpi),
@@ -3893,33 +4518,49 @@ mod tests {
         // Expanded and untouched: nothing ever collapses it
         assert!(!g.pending());
         assert_eq!(
-            g.handle(TimerFired, true),
+            g.handle(TimerFired, true, false),
             Disarm,
             "no fire without a click"
         );
         // An outside click starts the countdown; another restarts it
-        assert_eq!(g.handle(OutsideClick, true), Arm);
+        assert_eq!(g.handle(OutsideClick, true, false), Arm);
         assert_eq!(
-            g.handle(OutsideClick, true),
+            g.handle(OutsideClick, true, false),
             Arm,
             "restart from the latest click"
         );
         assert!(g.pending());
         // Running out collapses, once
-        assert_eq!(g.handle(TimerFired, true), Collapse);
-        assert_eq!(g.handle(TimerFired, true), Disarm, "a second fire is stale");
+        assert_eq!(g.handle(TimerFired, true, false), Collapse);
+        assert_eq!(
+            g.handle(TimerFired, true, false),
+            Disarm,
+            "a second fire is stale"
+        );
         // A click in the notch (or the Settings window) cancels it first
-        g.handle(OutsideClick, true);
-        assert_eq!(g.handle(OecaInteraction, true), Disarm);
-        assert_eq!(g.handle(TimerFired, true), Disarm, "cancelled: no collapse");
+        g.handle(OutsideClick, true, false);
+        assert_eq!(g.handle(OecaInteraction, true, false), Disarm);
+        assert_eq!(
+            g.handle(TimerFired, true, false),
+            Disarm,
+            "cancelled: no collapse"
+        );
         // An explicit collapse cancels; a stale fire after re-expanding is
         // ignored
-        g.handle(OutsideClick, true);
-        assert_eq!(g.handle(StateChanged, false), Disarm, "explicit collapse");
-        assert_eq!(g.handle(StateChanged, true), None, "re-expanded");
-        assert_eq!(g.handle(TimerFired, true), Disarm, "stale fire ignored");
+        g.handle(OutsideClick, true, false);
+        assert_eq!(
+            g.handle(StateChanged, false, false),
+            Disarm,
+            "explicit collapse"
+        );
+        assert_eq!(g.handle(StateChanged, true, false), None, "re-expanded");
+        assert_eq!(
+            g.handle(TimerFired, true, false),
+            Disarm,
+            "stale fire ignored"
+        );
         // Collapsed: outside clicks start nothing
-        assert_eq!(g.handle(OutsideClick, false), None);
+        assert_eq!(g.handle(OutsideClick, false, false), None);
         assert!(!g.pending());
         // Indices round-trip for the posted message
         for (i, e) in GraceEvent::ALL.into_iter().enumerate() {
@@ -3996,38 +4637,68 @@ mod tests {
     }
 
     #[test]
+    fn test_zero_delay_collapses_on_the_outside_click_itself() {
+        use GraceAction::*;
+        use GraceEvent::*;
+        let mut g = GracePeriod::default();
+        // Expanded: an outside click collapses now, through the normal path
+        // (the window animates it); nothing is left pending or armed
+        assert_eq!(g.handle(OutsideClick, true, true), Collapse);
+        assert!(!g.pending());
+        assert_eq!(g.handle(TimerFired, true, true), Disarm, "no stale timer");
+        // Collapsed: nothing to close
+        assert_eq!(g.handle(OutsideClick, false, true), None);
+        // Inside clicks and the Settings window never close it
+        assert_eq!(g.handle(OecaInteraction, true, true), None);
+        // Switching to 0 s while a countdown runs: its time is up
+        g.handle(OutsideClick, true, false);
+        assert_eq!(g.handle(DelayChanged, true, true), Collapse);
+        assert!(!g.pending());
+        // ...but only if the notch is still open
+        g.handle(OutsideClick, true, false);
+        assert_eq!(g.handle(DelayChanged, false, true), Disarm);
+        // Positive delays keep their countdown
+        assert_eq!(g.handle(OutsideClick, true, false), Arm);
+        assert!(g.pending());
+    }
+
+    #[test]
     fn test_collapse_delay_durations_and_restart_on_change() {
         use crate::config::CollapseDelay;
         use GraceAction::*;
         use GraceEvent::*;
-        assert_eq!(OecaSettings::default().collapse_delay, CollapseDelay::Five);
+        assert_eq!(OecaSettings::default().collapse_delay, CollapseDelay::Zero);
         assert_eq!(
             CollapseDelay::ALL.map(CollapseDelay::ms),
-            [5_000, 10_000, 15_000]
+            [0, 5_000, 10_000, 15_000]
         );
         for (i, d) in CollapseDelay::ALL.into_iter().enumerate() {
             assert_eq!(CollapseDelay::from_index(i), Some(d));
         }
-        assert_eq!(CollapseDelay::from_index(3), Option::None);
+        assert_eq!(CollapseDelay::from_index(4), Option::None);
         let mut g = GracePeriod::default();
         // Changing the delay with nothing pending starts nothing
-        assert_eq!(g.handle(DelayChanged, true), None);
+        assert_eq!(g.handle(DelayChanged, true, false), None);
         // Pending: the countdown restarts (the window arms it with the new ms)
-        g.handle(OutsideClick, true);
-        assert_eq!(g.handle(DelayChanged, true), Arm);
+        g.handle(OutsideClick, true, false);
+        assert_eq!(g.handle(DelayChanged, true, false), Arm);
         assert!(g.pending());
         // Later outside clicks restart it; inside clicks / Settings cancel it
-        assert_eq!(g.handle(OutsideClick, true), Arm);
-        assert_eq!(g.handle(OecaInteraction, true), Disarm);
+        assert_eq!(g.handle(OutsideClick, true, false), Arm);
+        assert_eq!(g.handle(OecaInteraction, true, false), Disarm);
         assert_eq!(
-            g.handle(DelayChanged, true),
+            g.handle(DelayChanged, true, false),
             None,
             "cancelled stays cancelled"
         );
         // Explicit collapse cancels at once
-        g.handle(OutsideClick, true);
-        assert_eq!(g.handle(StateChanged, false), Disarm);
-        assert_eq!(g.handle(TimerFired, false), Disarm, "no late collapse");
+        g.handle(OutsideClick, true, false);
+        assert_eq!(g.handle(StateChanged, false, false), Disarm);
+        assert_eq!(
+            g.handle(TimerFired, false, false),
+            Disarm,
+            "no late collapse"
+        );
     }
 
     #[test]
@@ -4159,7 +4830,7 @@ mod tests {
         let mut g = GracePeriod::default();
         let event = classify_click(other, notch, None).unwrap();
         assert_eq!(event, GraceEvent::OutsideClick);
-        assert_eq!(g.handle(event, true), GraceAction::Arm);
+        assert_eq!(g.handle(event, true, false), GraceAction::Arm);
         // A press on the notch itself (where a scrub starts) is not outside
         assert_eq!(classify_click(notch, notch, None), None);
         unsafe {

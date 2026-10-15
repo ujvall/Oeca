@@ -180,7 +180,7 @@ impl Category {
         }
     }
 
-    /// Sidebar icon: Material Symbols glyphs (Apache-2.0; see renderer.rs).
+    /// Sidebar icon: Oeca's own glyphs (see renderer.rs).
     fn icon(self) -> &'static [IconSeg] {
         match self {
             Self::General => GEAR,
@@ -502,18 +502,20 @@ pub struct WindowLayout {
     pub closing_title: RectF,
     pub closing_description: RectF,
     pub closing_row: RectF,
-    pub closing: [RectF; 3],
+    pub closing: [RectF; 4],
 }
 
-/// A three-segment selector at the right end of a row starting at `top`,
-/// and where the row's text must end.
-fn segments(right: f32, top: f32) -> ([RectF; 3], f32) {
-    const SEGMENT: (f32, f32) = (52.0, 28.0);
+/// An `N`-segment selector at the right end of a row starting at `top`, and
+/// where the row's text must end. Every selector is as wide as three 52 DIP
+/// segments, so a row's text has the same room whatever the count.
+fn segments<const N: usize>(right: f32, top: f32) -> ([RectF; N], f32) {
+    const TRACK: (f32, f32) = (156.0, 28.0);
+    let width = TRACK.0 / N as f32;
     let segs = std::array::from_fn(|i| {
-        let x = right - (3 - i) as f32 * SEGMENT.0;
-        RectF::new(x, top + 18.0, x + SEGMENT.0, top + 18.0 + SEGMENT.1)
+        let x = right - (N - i) as f32 * width;
+        RectF::new(x, top + 18.0, x + width, top + 18.0 + TRACK.1)
     });
-    (segs, right - 3.0 * SEGMENT.0 - 16.0)
+    (segs, right - TRACK.0 - 16.0)
 }
 
 /// Lays the window out for a client size (DIP). The sidebar keeps its width;
@@ -999,15 +1001,15 @@ fn outer_size(client: (f32, f32), dpi: u32) -> (i32, i32) {
 
 fn text_format(
     dwrite: &IDWriteFactory,
-    family: PCWSTR,
+    font: &crate::renderer::UiFont,
     size: f32,
     weight: DWRITE_FONT_WEIGHT,
 ) -> Result<IDWriteTextFormat> {
     let locale = w!("en-us");
-    let make = |family| unsafe {
+    let make = || unsafe {
         dwrite.CreateTextFormat(
-            family,
-            None,
+            font.family,
+            font.collection.as_ref(),
             weight,
             DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL,
@@ -1016,7 +1018,7 @@ fn text_format(
         )
     };
     // A missing family never fails here; `ui_font` resolved it beforehand
-    let format = make(family)?;
+    let format = make()?;
     unsafe { format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)? };
     Ok(format)
 }
@@ -1027,7 +1029,7 @@ fn role_format(dwrite: &IDWriteFactory, role: TextRole) -> Result<IDWriteTextFor
     let style = role.style();
     text_format(
         dwrite,
-        crate::renderer::ui_font(dwrite).1,
+        &crate::renderer::ui_font(dwrite),
         style.size,
         DWRITE_FONT_WEIGHT(style.weight),
     )
@@ -1509,14 +1511,11 @@ fn paint(v: &mut View) -> Result<()> {
         );
         // Segmented selector: a quiet track; the chosen segment is a filled
         // pill with a bold label (not color alone)
-        let segmented = |rects: [RectF; 3],
-                         labels: [&str; 3],
-                         chosen: usize,
-                         targets: [Target; 3]| {
-            let (first, last) = (rects[0], rects[2]);
+        let segmented = |rects: &[RectF], labels: &[&str], chosen: usize, targets: &[Target]| {
+            let (first, last) = (rects[0], rects[rects.len() - 1]);
             let track = RectF::new(first.left, first.top, last.right, last.bottom);
             rt.FillRoundedRectangle(&rounded(track, track.height() / 2.0), &hover_fill);
-            for i in 0..3 {
+            for i in 0..rects.len() {
                 let (r, target) = (rects[i], targets[i]);
                 let pill = RectF::new(r.left + 2.0, r.top + 2.0, r.right - 2.0, r.bottom - 2.0);
                 if i == chosen {
@@ -1547,10 +1546,10 @@ fn paint(v: &mut View) -> Result<()> {
                 &tertiary,
             );
             segmented(
-                l.closing,
-                CollapseDelay::ALL.map(CollapseDelay::label),
+                &l.closing,
+                &CollapseDelay::ALL.map(CollapseDelay::label),
                 v.settings.collapse_delay.index(),
-                CollapseDelay::ALL.map(Target::Delay),
+                &CollapseDelay::ALL.map(Target::Delay),
             );
             let r = l.closing_row;
             let line = RectF::new(r.left, r.bottom - 1.0, r.right, r.bottom);
@@ -1574,10 +1573,10 @@ fn paint(v: &mut View) -> Result<()> {
                 &tertiary,
             );
             segmented(
-                l.capacity,
-                ["5", "10", "20"],
+                &l.capacity,
+                &["5", "10", "20"],
                 v.settings.clipboard_capacity.index(),
-                ClipboardCapacity::ALL.map(Target::Capacity),
+                &ClipboardCapacity::ALL.map(Target::Capacity),
             );
             let separator_line = RectF::new(
                 l.rows[0].row.left,
@@ -2438,7 +2437,7 @@ mod tests {
         nav.select(Category::About);
         assert_eq!(nav.focus_order().len(), 5, "About: sidebar only");
         nav.select(Category::General);
-        assert_eq!(nav.focus_order().len(), 13, "5 switches + 3 closing delays");
+        assert_eq!(nav.focus_order().len(), 14, "5 switches + 4 closing delays");
         nav.focus = Target::Category(Category::About);
         assert_eq!(nav.tab(false), Target::Control(Control::AlwaysOnTop));
         assert_eq!(nav.tab(false), Target::Control(Control::ReducedMotion));
@@ -2604,6 +2603,7 @@ mod tests {
                         Element::Section(0),
                         Element::Control(Control::AlwaysOnTop),
                         Element::Control(Control::ReducedMotion),
+                        Element::Delay(CollapseDelay::Zero),
                         Element::Delay(CollapseDelay::Five),
                         Element::Delay(CollapseDelay::Ten),
                         Element::Delay(CollapseDelay::Fifteen),
@@ -2622,6 +2622,7 @@ mod tests {
                         "Notch",
                         "Always on top",
                         "Reduced motion",
+                        "0 seconds",
                         "5 seconds",
                         "10 seconds",
                         "15 seconds",
@@ -2796,6 +2797,27 @@ mod tests {
             let _ = DestroyWindow(reopened);
         }
         assert!(!is_open());
+    }
+
+    #[test]
+    fn test_settings_text_uses_the_same_font_as_the_notch() {
+        let dwrite: IDWriteFactory =
+            unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }.unwrap();
+        let font = crate::renderer::ui_font(&dwrite);
+        for role in TextRole::ALL {
+            let f = role_format(&dwrite, role).unwrap();
+            let len = unsafe { f.GetFontFamilyNameLength() } as usize;
+            let mut name = vec![0u16; len + 1];
+            unsafe { f.GetFontFamilyName(&mut name) }.unwrap();
+            assert_eq!(
+                String::from_utf16_lossy(&name[..len]),
+                font.name,
+                "{role:?}"
+            );
+            if let Some(c) = &font.collection {
+                assert_eq!(&unsafe { f.GetFontCollection() }.unwrap(), c, "{role:?}");
+            }
+        }
     }
 
     #[test]
@@ -3466,7 +3488,7 @@ mod tests {
 
     #[test]
     fn test_closing_delay_row_layout_hits_and_selection() {
-        assert_eq!(OecaSettings::default().collapse_delay, CollapseDelay::Five);
+        assert_eq!(OecaSettings::default().collapse_delay, CollapseDelay::Zero);
         for (w, h) in [MIN_CLIENT_SIZE, CLIENT_SIZE] {
             let l = layout(w, h);
             // Third row of "Notch", between the switches and "Window behavior"
@@ -3556,11 +3578,12 @@ mod tests {
         key(hwnd, VK_TAB.0);
         assert_eq!(
             with_view(|v| v.nav.focus),
-            Some(Target::Delay(CollapseDelay::Five))
+            Some(Target::Delay(CollapseDelay::Zero)),
+            "the selected delay (0 s by default)"
         );
-        key(hwnd, VK_RIGHT.0);
-        key(hwnd, VK_RIGHT.0);
-        key(hwnd, VK_RIGHT.0);
+        for _ in 0..4 {
+            key(hwnd, VK_RIGHT.0);
+        }
         assert_eq!(
             with_view(|v| v.nav.focus),
             Some(Target::Delay(CollapseDelay::Fifteen)),

@@ -212,7 +212,7 @@ pub fn blended_selector(
         let highlight = match scene {
             Scene::Settings => sel.settings,
             Scene::Space(s) => sel.bounds(s),
-            Scene::Drop => sel.bounds(space),
+            Scene::Drop | Scene::Dropped => sel.bounds(space),
         };
         Some((sel, highlight))
     };

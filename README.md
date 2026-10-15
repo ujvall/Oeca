@@ -10,7 +10,7 @@
   <a href="https://github.com/ujvall/Oeca/releases/latest/download/Oeca-Setup.exe"><img src="assets/readme/button-download.png" alt="Download for Windows" height="44"></a>
   <a href="https://github.com/ujvall/Oeca/releases"><img src="assets/readme/button-releases.png" alt="All releases" height="44"></a>
   <img src="assets/readme/chip-windows.png" alt="Windows 10 or later, 64-bit" height="44">
-  <img src="assets/readme/chip-version.png" alt="Version 0.1.0" height="44">
+  <img src="assets/readme/chip-version.png" alt="Version 0.2.0" height="44">
 </p>
 
 <br>
@@ -119,7 +119,7 @@ Oeca makes no network requests: it has no telemetry, analytics, crash reporting 
 
 ## Code signing policy
 
-**Status: pending.** Oeca is applying for free code signing from [SignPath Foundation](https://signpath.org). Current releases, including v0.1.0, are not signed. Once the application is accepted, releases will be built by the GitHub Actions workflow in this repository, signed through SignPath and published here, with this notice: Free code signing provided by SignPath.io, certificate by SignPath Foundation.
+**Status: pending.** Oeca is applying for free code signing from [SignPath Foundation](https://signpath.org). Current releases, including v0.2.0, are not signed. Once the application is accepted, releases will be built by the GitHub Actions workflow in this repository, signed through SignPath and published here, with this notice: Free code signing provided by SignPath.io, certificate by SignPath Foundation.
 
 - Authors, Reviewers and Approvers: [Ujval Sai (@ujvall)](https://github.com/ujvall), currently the only maintainer.
 - Every signing request is approved manually by the maintainer, for releases built from this repository only.
@@ -137,8 +137,8 @@ Oeca is free and open-source software, released under the [MIT License](LICENSE)
 
 Oeca was first published under the MIT License, including the v0.1.0 release. For a short time one commit (`c627fd2`) replaced it with a proprietary source-available licence; that change has been reversed, and it never revoked any rights granted under the MIT License.
 
-Third-party components keep their own licences. Those shipped with Oeca, Microsoft's `windows` crates (MIT), the icons it draws (Material Symbols, Apache-2.0; Phosphor Icons, MIT) and Inno Setup, are listed with their notices in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt), which the installer places beside `Oeca.exe`.
+Third-party components keep their own licences. Those shipped with Oeca, Microsoft's `windows` crates (MIT), the General Sans typeface embedded in official builds (ITF Free Font License, not open source) and Inno Setup, are listed with their notices in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt), which the installer places beside `Oeca.exe`.
 
-- Icons in the app: [Material Symbols](https://fonts.google.com/icons) by Google (Apache License 2.0) and, for Copy, Trash and the drop page, [Phosphor Icons](https://phosphoricons.com) (MIT License), converted to vector outlines.
+- Icons in the app: Oeca's own, drawn from simple shapes by [assets/icons/generate.py](assets/icons/generate.py) and covered by the MIT License like the rest of the code.
 - Screenshots of Oeca 0.1.0 in this README and on the website show its earlier icons, [designed by UIcons from Flaticon](https://www.flaticon.com/uicons), used under Flaticon's free licence with attribution.
-- The Oeca wordmark is set in General Sans by the Indian Type Foundry ([Fontshare](https://www.fontshare.com)); the font itself is not included in this repository.
+- Oeca's text and wordmark are set in General Sans, © Indian Type Foundry ([Fontshare](https://www.fontshare.com/fonts/general-sans)). General Sans is not open source: it is used under the [ITF Free Font License](https://www.fontshare.com/licenses/itf-ffl), which lets official builds embed it in `Oeca.exe` but does not allow publishing the font files here, so they are not in this repository. To build with it, see [assets/fonts/README.md](assets/fonts/README.md); without it, Oeca uses the fonts installed on the PC.
