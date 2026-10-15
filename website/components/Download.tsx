@@ -44,9 +44,9 @@ export function Download() {
           Get Oeca for Windows.
         </h2>
         <p className="t-lead mx-auto mt-5 max-w-lg">
-          Version {VERSION}. Free and open source under the{" "}
+          Version {VERSION}. Free to download, with source code you can read under its{" "}
           <a className="link" href={LICENSE_URL}>
-            MIT License
+            license
           </a>
           .
         </p>

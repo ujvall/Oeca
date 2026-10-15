@@ -1,0 +1,86 @@
+Oeca: third-party notices
+==============================================================================
+
+Oeca's own code and materials are licensed under the Oeca Source-Available
+License (the LICENSE file, installed as LICENSE.txt). The components below are
+not owned by Oeca's author and are not covered by that license. Each is used
+under its own terms; the notices and attributions those terms require are
+below.
+
+Contents
+  1. Rust crates compiled into Oeca.exe (Microsoft windows-rs)
+  2. Icons drawn by Oeca.exe
+  3. Inno Setup (the installer and uninstaller)
+
+
+==============================================================================
+1. Rust crates compiled into Oeca.exe
+==============================================================================
+
+These crates from Microsoft's windows-rs project
+(https://github.com/microsoft/windows-rs) are compiled into Oeca.exe:
+
+  windows 0.62.2
+  windows-collections 0.3.2
+  windows-core 0.62.2
+  windows-future 0.3.2
+  windows-link 0.2.1
+  windows-numerics 0.3.1
+  windows-result 0.4.1
+  windows-strings 0.5.1
+  windows-threading 0.2.1
+
+Each crate is licensed under "MIT OR Apache-2.0", so either license may be
+chosen. Oeca uses them under the MIT License, whose text, as shipped with each
+crate, is reproduced here:
+
+  MIT License
+
+  Copyright (c) Microsoft Corporation.
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE
+
+
+==============================================================================
+2. Icons drawn by Oeca.exe
+==============================================================================
+
+Oeca draws these icons from vector outlines built into Oeca.exe, converted
+from the original icon artwork.
+
+Clipboard, House blank, Music-alt, Palette, Info, Settings and Trash icons:
+  designed by UIcons from Flaticon, https://www.flaticon.com/uicons
+  Used under Flaticon's free license (free for commercial use with
+  attribution), which allows altering them.
+
+Drop page icon:
+  "Inbox" (Noun Project icon 1052548), https://thenounproject.com/icon/1052548/
+  Created by Jivan from the Noun Project
+  Used under the Noun Project free license, with attribution.
+
+
+==============================================================================
+3. Inno Setup
+==============================================================================
+
+Oeca's installer (Oeca-Setup.exe) and uninstaller (unins000.exe) are built
+with Inno Setup, https://jrsoftware.org/
+
+  Copyright (C) 1997-2026 Jordan Russell. All rights reserved.
+  Portions Copyright (C) 2000-2026 Martijn Laan. All rights reserved.

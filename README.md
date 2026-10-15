@@ -66,6 +66,8 @@ Uninstall from **Settings → Apps → Installed apps**. This removes the app, i
 
 ## Build from source
 
+You may build and run an unmodified copy to evaluate, test or review Oeca; redistributing builds needs permission (see [LICENSE](LICENSE)).
+
 Requires Windows 10 or later (x64), Rust with the MSVC toolchain (edition 2024), and the Windows 10/11 SDK, which comes with the Visual Studio C++ build tools. `build.rs` embeds the icon and version information with the SDK's `rc.exe` (set `RC` to use a specific one).
 
 ```powershell
@@ -113,11 +115,19 @@ Oeca/
 └── build.rs                   Embeds the icon and version information
 ```
 
+## Contributing
+
+Contributions (pull requests or other code) are not being accepted at the moment, and there is no contributor agreement. Bug reports and feature requests in [Issues](https://github.com/ujvall/Oeca/issues) are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License and credits
 
-Oeca's source code is released under the [MIT License](LICENSE). It does not cover the third-party icons credited below, which remain under their own licences, or the Oeca icon and branding assets, which remain the property of the author: `assets/branding/` and the images rendered from the Oeca icon, including the installer's `installer/images/` and this README's `assets/readme/`.
+Oeca is source-available and proprietary. It is not open source. The repository is public so that you can read and inspect how Oeca works, but public visibility does not by itself give you permission to copy, modify, redistribute or reuse the code. You may view the code, use and fork it through GitHub as GitHub's Terms of Service allow (forks stay on GitHub; that is not permission to publish or distribute the code elsewhere), and install and use the official releases yourself, including for work or study. Anything else, such as redistributing the code, publishing modified versions, commercial reuse, sublicensing or deploying Oeca for other people, needs the author's prior written permission, except where applicable law allows it. Referring to Oeca by name, for example in reviews or discussion, is fine. The full terms are in [LICENSE](LICENSE).
 
-- Clipboard, House blank, Music-alt, Palette, Info, Settings and Trash icons: [Uicons by Flaticon](https://www.flaticon.com/uicons), used under the Flaticon free licence (with attribution).
-- Drop page icon: "Inbox" by Jivan from [Noun Project](https://thenounproject.com/icon/1052548/), used under the Noun Project free licence (with attribution).
+Earlier versions were published under the MIT License, including the v0.1.0 release and the commits that contained the MIT text. The new licence applies to versions published with it, and within those, to what is new or changed. It does not take back the rights anyone already received under the MIT License: those earlier versions, and the code as it appeared in them, stay available under the MIT License.
+
+The Oeca name, icon and branding assets remain the property of the author: `assets/branding/` and the images rendered from the Oeca icon, including the installer's `installer/images/` and this README's `assets/readme/`. Third-party materials are not the author's and stay under their own licences: the Rust dependencies (each under the licence in its own package metadata, such as MIT OR Apache-2.0 for Microsoft's `windows` crates) and the items credited below. The notices for the third-party components that ship with Oeca (the `windows` crates compiled into `Oeca.exe`, the icons it draws, and Inno Setup) are in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt), which the installer places beside `Oeca.exe`.
+
+- Clipboard, House blank, Music-alt, Palette, Info, Settings and Trash icons: [designed by UIcons from Flaticon](https://www.flaticon.com/uicons), used under Flaticon's free licence (free for commercial use with attribution).
+- Drop page icon: "Inbox", created by Jivan from the [Noun Project](https://thenounproject.com/icon/1052548/), used under the Noun Project free licence (with attribution).
 - The Oeca wordmark is set in General Sans by the Indian Type Foundry ([Fontshare](https://www.fontshare.com)); the font itself is not included in this repository.
-- The screenshot's background is a desktop wallpaper from [wallhaven](https://wallhaven.cc); it remains its creator's and is not covered by the MIT License.
+- The screenshot's background is a desktop wallpaper from [wallhaven](https://wallhaven.cc); it remains its creator's and is not covered by Oeca's licence.

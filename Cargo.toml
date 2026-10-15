@@ -2,7 +2,10 @@
 name = "Oeca"
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+# Custom source-available license (no SPDX identifier exists for it). Versions
+# published earlier under the MIT License stay MIT; see LICENSE, section 2.
+license-file = "LICENSE"
+publish = false
 
 [dependencies]
 # Already a dependency of `windows` (same version); named directly because the

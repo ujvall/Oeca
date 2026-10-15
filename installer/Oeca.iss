@@ -22,6 +22,10 @@
 ;   starts this installation (or an executable that no longer exists).
 ;   User data in %LOCALAPPDATA%\Oeca is kept.
 ;
+; Licensing: LICENSE (as LICENSE.txt) and THIRD-PARTY-NOTICES.txt are installed
+; beside Oeca.exe and removed on uninstall. Keep THIRD-PARTY-NOTICES.txt in step
+; with the crates compiled in (`cargo tree -e normal`) and the bundled icons.
+;
 ; Appearance: Inno Setup 6.7's built-in dark style (also used by Uninstall),
 ; Oeca's near-black surfaces, and wizard images rendered from the Oeca icon
 ; by installer\make-wizard-images.ps1 (several sizes, one per DPI step).
@@ -144,6 +148,9 @@ Name: "desktopicon"; Description: "Desktop shortcut"; Flags: unchecked
 [Files]
 Source: "{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
+; Notices and attributions for the third-party code and icons in Oeca.exe and
+; for Inno Setup itself; installed beside LICENSE.txt
+Source: "..\THIRD-PARTY-NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: startmenuicon
