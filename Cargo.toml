@@ -1,6 +1,6 @@
 [package]
 name = "Oeca"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 
@@ -48,4 +48,11 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Threading",
     # The animation clock: QueryPerformanceCounter, DWM's vblank timebase
     "Win32_System_Performance",
+    # Volume HUD: the master volume (hud.rs)
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    # Battery / Energy Saver state and notifications (window.rs)
+    "Win32_System_Power",
+    # Update availability: one HTTPS request to GitHub's releases API (update.rs)
+    "Win32_Networking_WinHttp",
 ] }

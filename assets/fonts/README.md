@@ -17,3 +17,11 @@ To build with the font, download General Sans from
 the three files above, unmodified, from `Fonts/OTF/` into this folder. Without
 them Oeca still builds and runs: it uses General Sans if it is installed on
 the PC, otherwise Satoshi, Bahnschrift or Segoe UI Variable.
+
+# Sunghyun Sans (included)
+
+`SunghyunSans-Bold.otf` (700), unmodified, from
+[anaclumos/sunghyun-sans](https://github.com/anaclumos/sunghyun-sans), is
+embedded for the timer's rounded text (numerals, scale and Focus / Break). It is licensed under the SIL Open
+Font License 1.1 (`SunghyunSans-OFL.txt`), which allows bundling and
+redistribution, so it is part of the repository.

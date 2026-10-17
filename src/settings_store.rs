@@ -38,7 +38,10 @@ pub fn encode(s: &OecaSettings) -> String {
          clipboard_capacity={}\n\
          show_source_app={}\n\
          show_visualizer={}\n\
-         start_on_launch={}\n",
+         start_on_launch={}\n\
+         focus_seconds={}\n\
+         break_seconds={}\n\
+         check_for_updates={}\n",
         b(s.always_on_top),
         b(s.reduced_motion),
         b(s.close_settings_on_escape),
@@ -49,6 +52,9 @@ pub fn encode(s: &OecaSettings) -> String {
         b(s.show_source_app),
         b(s.show_visualizer),
         b(s.start_on_launch),
+        s.focus_secs,
+        s.break_secs,
+        b(s.check_for_updates),
     )
 }
 
@@ -108,6 +114,9 @@ pub fn decode(text: &str) -> Result<OecaSettings, LoadError> {
             "show_source_app" => set(&mut s.show_source_app, flag(value)),
             "show_visualizer" => set(&mut s.show_visualizer, flag(value)),
             "start_on_launch" => set(&mut s.start_on_launch, flag(value)),
+            "focus_seconds" => set(&mut s.focus_secs, timer_secs(value)),
+            "break_seconds" => set(&mut s.break_secs, timer_secs(value)),
+            "check_for_updates" => set(&mut s.check_for_updates, flag(value)),
             _ => {}
         }
     }
@@ -116,6 +125,13 @@ pub fn decode(text: &str) -> Result<OecaSettings, LoadError> {
         Some(v) if v > VERSION => Err(LoadError::FutureVersion(v)),
         _ => Err(LoadError::Unreadable),
     }
+}
+
+/// A timer duration (seconds): one of the timer scale's stops.
+fn timer_secs(v: &str) -> Option<u32> {
+    v.parse::<u32>()
+        .ok()
+        .filter(|s| crate::timer::stop_of(*s).is_some())
 }
 
 /// A valid value replaces the default; anything else keeps it.
@@ -244,6 +260,9 @@ mod tests {
             show_visualizer: false,
             collapse_delay: CollapseDelay::Fifteen,
             start_on_launch: true,
+            focus_secs: 50 * 60,
+            break_secs: 30,
+            check_for_updates: true,
         }
     }
 
@@ -349,7 +368,7 @@ mod tests {
         let flags = text
             .lines()
             .filter(|l| l.ends_with("=true") || l.ends_with("=false"));
-        assert_eq!(flags.count(), 7);
+        assert_eq!(flags.count(), 8);
         assert!(!text.contains("clipboard-history"), "no clipboard data");
     }
 
@@ -408,6 +427,8 @@ mod tests {
                     show_visualizer=false\n\
                     show_source_app=TRUE\n\
                     start_on_launch=1\n\
+                    focus_seconds=0\n\
+                    break_seconds=20\n\
                     unknown_future_key=whatever\n\
                     no equals sign here\n\
                     =\n";
@@ -422,6 +443,9 @@ mod tests {
         // Whitespace, CRLF line endings and comments are fine
         let s = decode("# note\r\n version = 1 \r\n accent = blue \r\n").unwrap();
         assert_eq!(s.accent, AccentChoice::Blue);
+        // Timer durations at the ends of their range are kept
+        let s = decode("version=1\nfocus_seconds=7200\nbreak_seconds=30\n").unwrap();
+        assert_eq!((s.focus_secs, s.break_secs), (7200, 30));
     }
 
     #[test]

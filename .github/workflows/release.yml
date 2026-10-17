@@ -1,5 +1,7 @@
 # Builds, tests and packages Oeca on a GitHub-hosted Windows runner, and keeps
-# the unsigned Oeca.exe and Oeca-Setup.exe as a workflow artifact.
+# the unsigned Oeca.exe and Oeca-Setup-<version>.exe as a workflow artifact.
+# It never publishes: a release is created by hand on GitHub, with the
+# installer uploaded under that exact name.
 #
 # Code signing (SignPath Foundation) is not active yet: the application is
 # pending. Once it is accepted, add the signing step at the end (template
@@ -33,6 +35,18 @@ jobs:
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
 
+      # A release tag must name the version being built: Oeca compares it
+      # with its own (Cargo.toml) to offer updates, and the installer takes
+      # its version from the executable
+      - name: Check tag matches version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json).packages[0].version
+          if ($env:GITHUB_REF_NAME -cne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME does not match Cargo.toml version $version (expected v$version)"
+          }
+
       - name: Check formatting
         run: cargo fmt --check
 
@@ -51,6 +65,14 @@ jobs:
       - name: Build installer
         run: '& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer\Oeca.iss'
 
+      # The release asset name Oeca's update check looks for
+      # (src/update.rs `installer_name`): Oeca-Setup-<version>.exe
+      - name: Name the installer for its version
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json).packages[0].version
+          Move-Item target\installer\Oeca-Setup.exe "target\installer\Oeca-Setup-$version.exe"
+
       - name: Upload unsigned build
         id: upload-unsigned
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -58,7 +80,7 @@ jobs:
           name: Oeca-unsigned-${{ github.sha }}
           path: |
             target/release/Oeca.exe
-            target/installer/Oeca-Setup.exe
+            target/installer/Oeca-Setup-*.exe
             LICENSE
             THIRD-PARTY-NOTICES.txt
           if-no-files-found: error

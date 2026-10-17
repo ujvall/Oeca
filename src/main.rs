@@ -5,6 +5,7 @@ mod clipboard_store;
 mod clock;
 mod config;
 mod dragdrop;
+mod hud;
 mod layout;
 mod media;
 mod renderer;
@@ -14,6 +15,7 @@ mod space;
 mod startup;
 mod timer;
 mod tray;
+mod update;
 mod window;
 
 fn main() {

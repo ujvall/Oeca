@@ -250,6 +250,20 @@ pub struct Renderer {
     /// The countdown timer as shown (mirrors `WindowState`, which sets it on
     /// every change; the numerals are read from it at draw time).
     timer: Cell<TimerView>,
+    /// The volume HUD as shown (mirrors `WindowState`'s).
+    hud: Cell<crate::hud::HudView>,
+    /// The HUD number's digit glyphs (see `digit_glyphs`), and the power
+    /// notice's text (`notice_text`).
+    digit_glyphs: RefCell<Option<DigitGlyphs>>,
+    notice_text: RefCell<Option<NoticeText>>,
+    /// The update notice's text, laid out once per label and DPI.
+    update_text: RefCell<Option<UpdateText>>,
+    /// The collapsed notch's update icon's presence (0: the artwork).
+    update_icon: Cell<f32>,
+    /// The last frame's endpoint stretch (its deformed shape, for hit
+    /// testing), and where the content is drawn from this frame.
+    stretch: Cell<Option<crate::hud::Stretch>>,
+    content_base: Cell<(f32, f32)>,
     /// Tabular figures: the timer's digits keep their width as they count.
     tabular: IDWriteTypography,
 }
@@ -720,15 +734,26 @@ pub struct TimerView {
     pub slot: f32,
     /// Opacity of finished numerals (the gentle done pulse; 1 otherwise).
     pub pulse: f32,
+    /// The selector's highlight, 0 on Focus .. 1 on Break (gliding), and
+    /// the setup scale's value (minutes, gliding to a new duration).
+    pub mode: f32,
+    pub scale: f32,
+    /// Running or paused: the scale's lag behind what is left (stops,
+    /// gliding to 0 after the time is set).
+    pub lag: f32,
 }
 
 impl Default for TimerView {
     fn default() -> Self {
+        let countdown = Countdown::default();
         Self {
-            countdown: Countdown::default(),
-            collapsed: Countdown::default(),
+            countdown,
+            collapsed: countdown,
             slot: 0.0,
             pulse: 1.0,
+            mode: 0.0,
+            scale: countdown.stop() as f32,
+            lag: 0.0,
         }
     }
 }
@@ -773,6 +798,38 @@ struct MediaText {
     source: Vec<u16>,
 }
 
+/// The power notice's battery width for a glyph size u (with its nub).
+fn battery_width(u: f32) -> f32 {
+    u * 1.28
+}
+
+/// The HUD number's digits 0..9 (one layout each, ready to draw) for one
+/// DPI and row height (`key`), and the width of a digit cell.
+struct DigitGlyphs {
+    key: (u32, u32),
+    layouts: [windows::Win32::Graphics::DirectWrite::IDWriteTextLayout; 10],
+    cell: f32,
+}
+
+/// The power-saving notice's sentences (Off, On) for one DPI and row size.
+struct NoticeText {
+    key: (u32, u32, u32),
+    layouts: [windows::Win32::Graphics::DirectWrite::IDWriteTextLayout; 2],
+}
+
+/// The update notice's laid-out label (keyed by DPI and text) and its size.
+struct UpdateText {
+    key: (u32, String),
+    layout: windows::Win32::Graphics::DirectWrite::IDWriteTextLayout,
+    size: (f32, f32),
+}
+
+/// Update notice (DIP at 96 DPI): its gap below the notch, the text's
+/// padding inside the pill.
+const BASE_UPDATE_GAP: f32 = 6.0;
+const BASE_UPDATE_PAD_X: f32 = 12.0;
+const BASE_UPDATE_PAD_Y: f32 = 5.0;
+
 struct MediaFormats {
     title: IDWriteTextFormat,
     artist: IDWriteTextFormat,
@@ -790,8 +847,11 @@ struct MediaFormats {
     date_line: IDWriteTextFormat,
     /// Countdown: Home numerals and status line (leading), and the collapsed
     /// slot (trailing, to the visualizer's edge).
+    /// The timer: its numerals (a rounded face when installed, right-
+    /// aligned), the scale's minute labels, the mode pills.
     timer_display: IDWriteTextFormat,
-    timer_status: IDWriteTextFormat,
+    timer_label: IDWriteTextFormat,
+    timer_pill: IDWriteTextFormat,
     timer_slot: IDWriteTextFormat,
     /// A clipboard tile's text preview: wrapped, top-aligned, the last line
     /// that fits ends in an ellipsis.
@@ -913,6 +973,44 @@ fn resolve_ui_font(dwrite: &IDWriteFactory, bundled: &[&'static [u8]]) -> UiFont
         name,
         family,
         collection: None,
+    }
+}
+
+/// Sunghyun Sans Bold (SIL OFL 1.1, `assets/fonts/SunghyunSans-OFL.txt`):
+/// the timer's rounded face (numerals, scale labels, pills), all Bold.
+const TIMER_BUNDLED_FONT: &[u8] = include_bytes!("../assets/fonts/SunghyunSans-Bold.otf");
+const TIMER_BUNDLED_FAMILY: (&str, windows::core::PCWSTR) =
+    ("Sunghyun Sans", windows::core::w!("Sunghyun Sans"));
+
+/// The timer numerals' face: the bundled Sunghyun Sans, else the first
+/// `TIMER_FONT_CANDIDATES` (rounded) installed, else Oeca's own typeface
+/// (`ui_font`). Resolved once per thread.
+pub(crate) fn timer_font(dwrite: &IDWriteFactory) -> UiFont {
+    thread_local! {
+        static FONT: std::cell::OnceCell<UiFont> = const { std::cell::OnceCell::new() };
+    }
+    FONT.with(|f| f.get_or_init(|| resolve_timer_font(dwrite)).clone())
+}
+
+fn resolve_timer_font(dwrite: &IDWriteFactory) -> UiFont {
+    let (name, family) = TIMER_BUNDLED_FAMILY;
+    if let Some(collection) =
+        bundled_collection(dwrite, &[TIMER_BUNDLED_FONT]).filter(|c| has_family(c, family))
+    {
+        return UiFont {
+            name,
+            family,
+            collection: Some(collection),
+        };
+    }
+    let families = crate::config::TIMER_FONT_CANDIDATES.map(|(_, f)| f);
+    match first_installed(dwrite, &families) {
+        Some(i) => UiFont {
+            name: crate::config::TIMER_FONT_CANDIDATES[i].0,
+            family: crate::config::TIMER_FONT_CANDIDATES[i].1,
+            collection: None,
+        },
+        None => ui_font(dwrite),
     }
 }
 
@@ -1204,16 +1302,42 @@ fn timer_numerals(countdown: &Countdown, out: &mut [u16; 12]) -> usize {
     format_clock((secs * 1000) as i64, false, out)
 }
 
+/// `n` (0..=999) as decimal digits into `out`, no leading zeros, no
+/// allocation; returns the length.
+fn number_utf16(n: u32, out: &mut [u16; 3]) -> usize {
+    let n = n.min(999);
+    let digits = [n / 100, n / 10 % 10, n % 10];
+    let skip = usize::from(n < 100) + usize::from(n < 10);
+    for (o, d) in out.iter_mut().zip(&digits[skip..]) {
+        *o = u16::from(b'0') + *d as u16;
+    }
+    3 - skip
+}
+
+/// The scale's label at stop `i`, if it has one: ".5" (half a minute), then the minutes
+/// at 1 and every 5 (written into `out`; its length).
+fn stop_label(i: usize, out: &mut [u16; 3]) -> Option<usize> {
+    let secs = crate::timer::stop_secs(i);
+    if secs == 30 {
+        out[..2].copy_from_slice(&[u16::from(b'.'), u16::from(b'5')]);
+        return Some(2);
+    }
+    let m = secs / 60;
+    (secs.is_multiple_of(60) && (m == 1 || m.is_multiple_of(5))).then(|| number_utf16(m, out))
+}
+
 /// Settled drop page dimensions at a DPI (the panel size).
 fn drop_page_dimensions(dpi: u32) -> NotchDimensions {
     crate::layout::space_dimensions(crate::config::NotchState::Expanded, dpi, PANEL_SPACE)
 }
 
 /// Clipboard thumbnail: the centre of `src` cropped to the `w` x `h` aspect
-/// (cover crop, never stretched), area-resampled to `w` x `h`, with corners
-/// rounded to `radius` pixels by scaling the premultiplied pixels with their
-/// coverage. Built from the entry's existing pixels: nothing is decoded.
-fn thumbnail(src: &Artwork, w: u32, h: u32, radius: f32) -> Artwork {
+/// (cover crop, never stretched), area-resampled to `w` x `h`, and clipped to
+/// a rounded rectangle whose corners follow `corner` (the same curve the
+/// frame around it is drawn with): the premultiplied pixels are scaled by
+/// their coverage, 4 x 4 supersampled where a corner passes. The image
+/// itself is never reshaped. Built from the entry's existing pixels.
+fn thumbnail(src: &Artwork, w: u32, h: u32, corner: CornerProfile) -> Artwork {
     let (w, h) = (w.max(1), h.max(1));
     let crop = cover_source_rect(src.width, src.height, w as f32, h as f32);
     let (x0, y0) = (crop.left.round() as usize, crop.top.round() as usize);
@@ -1229,21 +1353,10 @@ fn thumbnail(src: &Artwork, w: u32, h: u32, radius: f32) -> Artwork {
         return src.clone();
     };
     let thumb = resample_area_rect(&cropped, w, h);
-    let (tw, th) = (thumb.width as f32, thumb.height as f32);
-    let r = radius.clamp(0.0, tw.min(th) / 2.0);
     let mut pixels = thumb.pixels.to_vec();
+    let coverage = CornerCoverage::new(thumb.width, thumb.height, corner);
     for (i, pixel) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-        let (x, y) = (
-            (i as u32 % thumb.width) as f32 + 0.5,
-            (i as u32 / thumb.width) as f32 + 0.5,
-        );
-        let (cx, cy) = (x.clamp(r, tw - r), y.clamp(r, th - r));
-        let dist = (x - cx).hypot(y - cy);
-        let cover = if dist == 0.0 {
-            1.0
-        } else {
-            (r - dist + 0.5).clamp(0.0, 1.0)
-        };
+        let cover = coverage.at(i as u32 % thumb.width, i as u32 / thumb.width);
         if cover < 1.0 {
             for c in pixel.iter_mut() {
                 *c = (f32::from(*c) * cover).round() as u8;
@@ -1251,6 +1364,70 @@ fn thumbnail(src: &Artwork, w: u32, h: u32, radius: f32) -> Artwork {
         }
     }
     Artwork::new(thumb.width, thumb.height, pixels).unwrap_or(thumb)
+}
+
+/// How much of each pixel of a `w` x `h` rectangle lies inside its corners
+/// (`CornerProfile`, the same curve the frames are drawn with): 1 away from
+/// the corners, else 4 x 4 samples against the curve.
+struct CornerCoverage {
+    w: f32,
+    h: f32,
+    span: f32,
+    /// The curve's inset from its side wall, per sample row of depth below
+    /// where the corner starts (computed once, not per pixel).
+    insets: Vec<f32>,
+}
+
+impl CornerCoverage {
+    const SAMPLES: usize = 4;
+
+    fn new(w: u32, h: u32, corner: CornerProfile) -> Self {
+        let (w, h) = (w as f32, h as f32);
+        let span = corner.span.clamp(0.0, w.min(h) / 2.0);
+        let profile = CornerProfile {
+            span,
+            handle: corner.handle,
+        };
+        let n = Self::SAMPLES as f32;
+        let rows = (span * n).ceil() as usize;
+        let insets = (0..rows)
+            .map(|j| profile.inset_at((j as f32 + 0.5) / n))
+            .collect();
+        Self { w, h, span, insets }
+    }
+
+    /// Coverage of pixel (x, y), 0..1.
+    fn at(&self, x: u32, y: u32) -> f32 {
+        let s = self.span;
+        let (px, py) = (x as f32, y as f32);
+        let near_x = px < s || px + 1.0 > self.w - s;
+        let near_y = py < s || py + 1.0 > self.h - s;
+        if s <= 0.0 || !(near_x && near_y) {
+            return 1.0;
+        }
+        let n = Self::SAMPLES;
+        let mut inside = 0;
+        for a in 0..n {
+            for b in 0..n {
+                let sx = px + (a as f32 + 0.5) / n as f32;
+                let sy = py + (b as f32 + 0.5) / n as f32;
+                // Distances to the nearest side and the nearest top / bottom
+                // edge: every corner as the bottom-left one
+                let lx = sx.min(self.w - sx);
+                let ly = sy.min(self.h - sy);
+                let ok = if ly >= s || lx >= s {
+                    true
+                } else {
+                    let depth = s - ly;
+                    let row =
+                        ((depth * n as f32) as usize).min(self.insets.len().saturating_sub(1));
+                    lx >= self.insets.get(row).copied().unwrap_or(0.0)
+                };
+                inside += usize::from(ok);
+            }
+        }
+        inside as f32 / (n * n) as f32
+    }
 }
 
 /// Skip glyph height (fraction of the icon size).
@@ -1609,6 +1786,32 @@ impl Renderer {
         self.timer.set(view);
     }
 
+    /// The collapsed notch's update icon's presence, 0..1: it takes the
+    /// artwork's place, crossfading (caller redraws).
+    pub fn set_update_icon(&self, level: f32) {
+        self.update_icon.set(level);
+    }
+
+    /// Mirrors the volume HUD (caller redraws).
+    pub fn set_hud(&self, view: crate::hud::HudView) {
+        self.hud.set(view);
+    }
+
+    /// Where the content was drawn from (px, window coordinates) in the
+    /// last frame: (0, 0) unless the notch is stretched. Subtract it from a
+    /// client point to get the content's coordinates.
+    pub fn content_offset(&self) -> (f32, f32) {
+        self.stretch.get().map_or((0.0, 0.0), |s| s.content)
+    }
+
+    /// Whether a client point is on the notch as last drawn (stretched or
+    /// not); None before the first frame.
+    pub fn hits(&self, x: f32, y: f32) -> Option<bool> {
+        self.stretch
+            .get()
+            .map(|s| s.shape.contains_point(x - s.shape_dx, y))
+    }
+
     /// Shows / hides the Clipboard space's clear confirmation (caller redraws).
     pub fn set_clear_pending(&self, pending: bool) {
         self.clear_pending.set(pending);
@@ -1788,6 +1991,13 @@ impl Renderer {
             drop_stroke,
             text_params,
             timer: Cell::new(TimerView::default()),
+            hud: Cell::new(crate::hud::HudView::default()),
+            digit_glyphs: RefCell::new(None),
+            notice_text: RefCell::new(None),
+            update_text: RefCell::new(None),
+            update_icon: Cell::new(0.0),
+            stretch: Cell::new(None),
+            content_base: Cell::new((0.0, 0.0)),
             tabular,
         })
     }
@@ -2591,7 +2801,30 @@ impl Renderer {
         unsafe {
             rt.PushAxisAlignedClip(&clip_rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         }
+        // The volume HUD takes the row's place while it shows
+        let hud = self.hud.get().presence;
+        if hud < 1.0 {
+            self.with_layer(rt, None, 1.0 - hud, || {
+                self.draw_collapsed_items(rt, layout, dimensions, formatted_time)
+            })?;
+        }
+        if hud > 0.0 {
+            let row = crate::layout::collapsed_hud_layout(layout, dimensions.scale);
+            self.draw_hud(rt, &row, dimensions, hud)?;
+        }
+        unsafe { rt.PopAxisAlignedClip() };
 
+        Ok(())
+    }
+
+    /// The collapsed row itself: clock, countdown slot or visualizer, artwork.
+    fn draw_collapsed_items(
+        &self,
+        rt: &ID2D1RenderTarget,
+        layout: &CollapsedLayout,
+        dimensions: &NotchDimensions,
+        formatted_time: &str,
+    ) -> Result<()> {
         let key = dimensions.font_size_clock.to_bits();
         if self
             .clock_format
@@ -2650,10 +2883,394 @@ impl Renderer {
             dimensions.scale,
             1.0 - slot,
         )?;
-        self.draw_collapsed_art(rt, layout.artwork_bounds, dimensions.scale)?;
-        unsafe { rt.PopAxisAlignedClip() };
-
+        // The artwork, or (a newer Oeca is available) the update icon in its
+        // place: the two crossfade, the icon settling from a touch smaller
+        let icon = self.update_icon.get().clamp(0.0, 1.0);
+        if icon < 1.0 {
+            self.draw_collapsed_art(rt, layout.artwork_bounds, dimensions.scale, 1.0 - icon)?;
+        }
+        if icon > 0.0 {
+            let r = layout.artwork_bounds;
+            let ink = unsafe { rt.CreateSolidColorBrush(&COLOR_TEXT_PRIMARY, None)? };
+            unsafe { ink.SetOpacity(icon) };
+            self.draw_glyph(
+                rt,
+                UPDATE_ARROW,
+                (r.left + r.right) / 2.0,
+                (r.top + r.bottom) / 2.0,
+                r.height() * (0.9 + 0.1 * icon),
+                &ink,
+            )?;
+        }
         Ok(())
+    }
+
+    /// The HUD in `row` at `alpha`: the volume, or the power-saving notice
+    /// (crossfading when one replaces the other).
+    fn draw_hud(
+        &self,
+        rt: &ID2D1RenderTarget,
+        row: &crate::layout::HudLayout,
+        dimensions: &NotchDimensions,
+        alpha: f32,
+    ) -> Result<()> {
+        let notice = self.hud.get().notice;
+        if notice < 1.0 {
+            self.draw_volume_hud(rt, row, dimensions, alpha * (1.0 - notice))?;
+        }
+        if notice > 0.0 {
+            self.draw_power_notice(rt, row, dimensions, alpha * notice)?;
+        }
+        Ok(())
+    }
+
+    /// The power-saving notice in `row` at `alpha`: a battery (yellow fill
+    /// while power saving is on, green once off; the two crossfade) and
+    /// "Energy Saver: On" / "Off", right-aligned (crossfading too). It arrives growing
+    /// from 94% with two faint copies trailing sideways (a restrained
+    /// motion blur), and leaves the same way, all following the HUD's own
+    /// presence: under no motion it is simply there. Cached text.
+    fn draw_power_notice(
+        &self,
+        rt: &ID2D1RenderTarget,
+        row: &crate::layout::HudLayout,
+        dimensions: &NotchDimensions,
+        alpha: f32,
+    ) -> Result<()> {
+        let hud = self.hud.get();
+        let enter = (hud.presence * hud.notice).clamp(0.0, 1.0);
+        let on = hud.power_saving;
+        let u = row.glyph;
+        // The battery starts at the row's left edge (it is wider than the
+        // icon's square: centred there it would pass the notch's content edge)
+        let (cx, cy) = (
+            row.icon.left + battery_width(u) / 2.0,
+            (row.icon.top + row.icon.bottom) / 2.0,
+        );
+        // Grows into place about the row's middle
+        let mid = ((row.icon.left + row.text.right) / 2.0, cy);
+        let s = 0.94 + 0.06 * enter;
+        let mut base = D2D1_LAYER_PARAMETERS::default().maskTransform;
+        unsafe { rt.GetTransform(&mut base) };
+        let mut scaled = base;
+        let (tx, ty) = (mid.0 * (1.0 - s), mid.1 * (1.0 - s));
+        scaled.M11 = s * base.M11;
+        scaled.M12 = s * base.M12;
+        scaled.M21 = s * base.M21;
+        scaled.M22 = s * base.M22;
+        scaled.M31 = tx * base.M11 + ty * base.M21 + base.M31;
+        scaled.M32 = tx * base.M12 + ty * base.M22 + base.M32;
+        unsafe { rt.SetTransform(&scaled) };
+
+        // The text right-aligned to the row's end (where the volume's
+        // number ends), across the space after the battery
+        let text_left = row.bar.left;
+        let texts = self.notice_text(dimensions, row.text.height(), row.text.right - text_left)?;
+        let blur = 1.0 - enter;
+        let drawn = (|| -> Result<()> {
+            // The main pass, then (while moving) two faint copies either side
+            for (dx, weight) in [
+                (0.0, 1.0 - 0.4 * blur),
+                (-1.0, 0.22 * blur),
+                (1.0, 0.22 * blur),
+            ] {
+                if weight <= 0.01 {
+                    continue;
+                }
+                let shift = dx * 0.4 * u * blur;
+                self.draw_battery(rt, cx + shift, cy, u, on, alpha * weight)?;
+                let white = unsafe { rt.CreateSolidColorBrush(&COLOR_TEXT_PRIMARY, None)? };
+                for (layout, w) in [(&texts.layouts[0], 1.0 - on), (&texts.layouts[1], on)] {
+                    if w <= 0.0 {
+                        continue;
+                    }
+                    unsafe {
+                        white.SetOpacity(alpha * weight * w);
+                        let mut origin =
+                            windows::Win32::Graphics::Direct2D::D2D1_POINT_DESCRIPTION::default()
+                                .point;
+                        origin.X = text_left + shift;
+                        origin.Y = row.text.top;
+                        rt.DrawTextLayout(origin, layout, &white, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                    }
+                }
+            }
+            Ok(())
+        })();
+        unsafe { rt.SetTransform(&base) };
+        drawn
+    }
+
+    /// A battery about `u` tall-ish, centred on (cx, cy): a white outline with
+    /// its terminal nub, filled part-way in the power-saving colour (`on` 0
+    /// green .. 1 yellow).
+    fn draw_battery(
+        &self,
+        rt: &ID2D1RenderTarget,
+        cx: f32,
+        cy: f32,
+        u: f32,
+        on: f32,
+        alpha: f32,
+    ) -> Result<()> {
+        let (w, h) = (battery_width(u), u * 0.64);
+        let stroke = (u * 0.085).max(1.0);
+        let nub = u * 0.1;
+        let body = RectF::new(cx - w / 2.0, cy - h / 2.0, cx + w / 2.0 - nub, cy + h / 2.0);
+        let rounded = |r: RectF, radius: f32| D2D1_ROUNDED_RECT {
+            rect: r.to_d2d_rect(),
+            radiusX: radius,
+            radiusY: radius,
+        };
+        let [g0, g1, g2] = crate::hud::power_notice_fill(false);
+        let [y0, y1, y2] = crate::hud::power_notice_fill(true);
+        let mix = |a: f32, b: f32| a + (b - a) * on;
+        let fill_color = D2D1_COLOR_F {
+            r: mix(g0, y0),
+            g: mix(g1, y1),
+            b: mix(g2, y2),
+            a: 1.0,
+        };
+        unsafe {
+            let outline = rt.CreateSolidColorBrush(&COLOR_TEXT_PRIMARY, None)?;
+            outline.SetOpacity(alpha * 0.9);
+            let inset =
+                |r: RectF, d: f32| RectF::new(r.left + d, r.top + d, r.right - d, r.bottom - d);
+            rt.DrawRoundedRectangle(
+                &rounded(inset(body, stroke / 2.0), h * 0.26),
+                &outline,
+                stroke,
+                None,
+            );
+            let tip = RectF::new(
+                body.right + stroke * 0.5,
+                cy - h * 0.2,
+                body.right + nub,
+                cy + h * 0.2,
+            );
+            rt.FillRoundedRectangle(&rounded(tip, nub * 0.4), &outline);
+            let inner = inset(body, stroke * 1.7);
+            let level = RectF::new(
+                inner.left,
+                inner.top,
+                inner.left + inner.width() * 0.62,
+                inner.bottom,
+            );
+            let fill = rt.CreateSolidColorBrush(&fill_color, None)?;
+            fill.SetOpacity(alpha);
+            rt.FillRoundedRectangle(&rounded(level, h * 0.12), &fill);
+        }
+        Ok(())
+    }
+
+    /// The notice's two sentences (Off, On), laid out once per DPI and row
+    /// size in the HUD's number face, right-aligned in width, centred in
+    /// the row's height.
+    fn notice_text(
+        &self,
+        dimensions: &NotchDimensions,
+        height: f32,
+        width: f32,
+    ) -> Result<std::cell::Ref<'_, NoticeText>> {
+        let key = (dimensions.dpi, height.to_bits(), width.to_bits());
+        let stale = self
+            .notice_text
+            .borrow()
+            .as_ref()
+            .is_none_or(|t| t.key != key);
+        if stale {
+            let formats = self.media_formats(dimensions)?;
+            let layout =
+                |on: bool| -> Result<windows::Win32::Graphics::DirectWrite::IDWriteTextLayout> {
+                    let text: Vec<u16> = crate::hud::power_notice_text(on).encode_utf16().collect();
+                    unsafe {
+                        let l = self.dwrite_factory.CreateTextLayout(
+                            &text,
+                            &formats.timer_slot,
+                            width.max(1.0),
+                            height.max(1.0),
+                        )?;
+                        l.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
+                        // A sentence, not a figure: regular weight
+                        l.SetFontWeight(
+                            windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT_NORMAL,
+                            DWRITE_TEXT_RANGE {
+                                startPosition: 0,
+                                length: text.len() as u32,
+                            },
+                        )?;
+                        l.SetWordWrapping(
+                            windows::Win32::Graphics::DirectWrite::DWRITE_WORD_WRAPPING_NO_WRAP,
+                        )?;
+                        Ok(l)
+                    }
+                };
+            let layouts = [layout(false)?, layout(true)?];
+            *self.notice_text.borrow_mut() = Some(NoticeText { key, layouts });
+        }
+        Ok(std::cell::Ref::map(self.notice_text.borrow(), |t| {
+            t.as_ref().expect("notice text just ensured")
+        }))
+    }
+
+    /// The volume HUD in `row` at `alpha`: icon, level bar (track, then the
+    /// level; dimmed while muted), the level as a number.
+    fn draw_volume_hud(
+        &self,
+        rt: &ID2D1RenderTarget,
+        row: &crate::layout::HudLayout,
+        dimensions: &NotchDimensions,
+        alpha: f32,
+    ) -> Result<()> {
+        let hud = self.hud.get();
+        // Muting dims the level
+        let level_alpha = 1.0 - (1.0 - crate::config::HUD_MUTED_OPACITY) * hud.muted;
+        let white = unsafe { rt.CreateSolidColorBrush(&COLOR_TEXT_PRIMARY, None)? };
+        let (cx, cy) = (
+            (row.icon.left + row.icon.right) / 2.0,
+            (row.icon.top + row.icon.bottom) / 2.0,
+        );
+        // The speaker, its sound waves for the level (each fades in / out on
+        // its own as the count glides), and the cross while muted
+        unsafe { white.SetOpacity(alpha) };
+        self.draw_glyph(rt, SPEAKER_BODY, cx, cy, row.glyph, &white)?;
+        for (i, wave) in [SPEAKER_WAVE_1, SPEAKER_WAVE_2, SPEAKER_WAVE_3]
+            .into_iter()
+            .enumerate()
+        {
+            let w = (hud.waves - i as f32).clamp(0.0, 1.0);
+            if w > 0.0 {
+                unsafe { white.SetOpacity(alpha * w) };
+                self.draw_glyph(rt, wave, cx, cy, row.glyph, &white)?;
+            }
+        }
+        if hud.muted > 0.0 {
+            unsafe { white.SetOpacity(alpha * hud.muted) };
+            self.draw_glyph(rt, SPEAKER_CROSS, cx, cy, row.glyph, &white)?;
+        }
+
+        let bar = row.bar;
+        let r = bar.height() / 2.0;
+        let pill = |rect: RectF| D2D1_ROUNDED_RECT {
+            rect: rect.to_d2d_rect(),
+            radiusX: r.min(rect.width() / 2.0),
+            radiusY: r,
+        };
+        unsafe {
+            let track = rt.CreateSolidColorBrush(&crate::config::COLOR_HUD_TRACK, None)?;
+            track.SetOpacity(alpha);
+            rt.FillRoundedRectangle(&pill(bar), &track);
+            let w = bar.width() * hud.level;
+            if w > 0.5 {
+                white.SetOpacity(alpha * level_alpha);
+                rt.FillRoundedRectangle(
+                    &pill(RectF::new(bar.left, bar.top, bar.left + w, bar.bottom)),
+                    &white,
+                );
+            }
+        }
+
+        self.draw_rolling_number(rt, dimensions, row.text, &hud, &white, alpha * level_alpha)
+    }
+
+    /// The number as three digit wheels, right-aligned in fixed cells (it
+    /// never shifts as digits come and go): each wheel's digit rolls up /
+    /// down to the next as it turns (the outgoing one fading as the incoming
+    /// one arrives), leading zeros blank, and while a wheel turns fast two
+    /// faint copies trail along its path (a restrained motion blur). At rest
+    /// exactly the number, drawn once. Cached glyphs, no allocation.
+    fn draw_rolling_number(
+        &self,
+        rt: &ID2D1RenderTarget,
+        dimensions: &NotchDimensions,
+        rect: RectF,
+        hud: &crate::hud::HudView,
+        brush: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
+        alpha: f32,
+    ) -> Result<()> {
+        let glyphs = self.digit_glyphs(dimensions, rect.height())?;
+        let travel = rect.height();
+        unsafe {
+            rt.PushAxisAlignedClip(&rect.to_d2d_rect(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        }
+        let draw = |layout: &windows::Win32::Graphics::DirectWrite::IDWriteTextLayout,
+                    x: f32,
+                    y: f32,
+                    opacity: f32| unsafe {
+            brush.SetOpacity(alpha * opacity);
+            let mut origin =
+                windows::Win32::Graphics::Direct2D::D2D1_POINT_DESCRIPTION::default().point;
+            origin.X = x;
+            origin.Y = y;
+            rt.DrawTextLayout(origin, layout, brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+        };
+        for (k, cell) in crate::layout::hud_digit_cells(rect, glyphs.cell)
+            .into_iter()
+            .enumerate()
+        {
+            let p = hud.digits[k];
+            let base = p.floor();
+            let frac = p - base;
+            let blur = (hud.digit_speed[k] / crate::config::HUD_DIGIT_BLUR_SPEED).min(1.0);
+            for (n, offset, weight) in [(base, -frac, 1.0 - frac), (base + 1.0, 1.0 - frac, frac)] {
+                let n = n as i32;
+                // Leading zeros (and anything below 0) are blank
+                if weight <= 0.0 || n < 0 || (n == 0 && k < 2) {
+                    continue;
+                }
+                let layout = &glyphs.layouts[(n % 10) as usize];
+                let y = rect.top + offset * travel;
+                draw(layout, cell.left, y, weight * (1.0 - 0.35 * blur));
+                if blur > 0.02 {
+                    for side in [-1.0, 1.0] {
+                        let ghost = y + side * 0.2 * travel * blur;
+                        draw(layout, cell.left, ghost, weight * 0.22 * blur);
+                    }
+                }
+            }
+        }
+        unsafe { rt.PopAxisAlignedClip() };
+        Ok(())
+    }
+
+    /// The digit glyphs 0..9 for the HUD's number (tabular figures in its
+    /// format, centred in one cell `cell` wide and `height` tall), laid out
+    /// once per DPI and row height.
+    fn digit_glyphs(
+        &self,
+        dimensions: &NotchDimensions,
+        height: f32,
+    ) -> Result<std::cell::Ref<'_, DigitGlyphs>> {
+        let key = (dimensions.dpi, height.to_bits());
+        let stale = self
+            .digit_glyphs
+            .borrow()
+            .as_ref()
+            .is_none_or(|g| g.key != key);
+        if stale {
+            let formats = self.media_formats(dimensions)?;
+            let mut cell = 0.0f32;
+            let mut layouts = Vec::with_capacity(10);
+            for d in 0..10u8 {
+                let (layout, width) =
+                    self.tabular_layout(&[u16::from(b'0' + d)], &formats.timer_slot)?;
+                cell = cell.max(width);
+                layouts.push(layout);
+            }
+            for layout in &layouts {
+                unsafe {
+                    layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+                    layout.SetMaxWidth(cell.max(1.0))?;
+                    layout.SetMaxHeight(height.max(1.0))?;
+                }
+            }
+            let layouts: [windows::Win32::Graphics::DirectWrite::IDWriteTextLayout; 10] =
+                layouts.try_into().map_err(|_| Error::from_thread())?;
+            *self.digit_glyphs.borrow_mut() = Some(DigitGlyphs { key, layouts, cell });
+        }
+        Ok(std::cell::Ref::map(self.digit_glyphs.borrow(), |g| {
+            g.as_ref().expect("digit glyphs just ensured")
+        }))
     }
 
     /// Space selector: two capsules above the expanded content. The active space
@@ -2687,7 +3304,16 @@ impl Renderer {
         let Some((selector, highlight)) = blended else {
             return Ok(());
         };
-        self.paint_selector(rt, dimensions, &selector, highlight, alpha)
+        // The volume HUD takes the header's place while it shows
+        let hud = self.hud.get().presence;
+        if hud < 1.0 {
+            self.paint_selector(rt, dimensions, &selector, highlight, alpha * (1.0 - hud))?;
+        }
+        if hud > 0.0 {
+            let row = crate::layout::header_hud_layout(&selector, dimensions.scale);
+            self.draw_hud(rt, &row, dimensions, alpha * hud)?;
+        }
+        Ok(())
     }
 
     /// Pills (white solid icons) with the highlight capsule behind one place.
@@ -2981,11 +3607,20 @@ impl Renderer {
         drawn
     }
 
-    /// Draws everything after this shifted right by `dx` (0 resets).
-    fn set_offset(rt: &ID2D1RenderTarget, dx: f32) {
+    /// Draws everything after this shifted right by `dx` (0 resets) from
+    /// the content's place this frame (`content_base`: moved only while the
+    /// notch is stretched).
+    fn set_offset(&self, rt: &ID2D1RenderTarget, dx: f32) {
+        let (bx, by) = self.content_base.get();
+        self.set_offset_xy(rt, bx + dx, by);
+    }
+
+    /// Draws everything after this shifted by (dx, dy), absolutely.
+    fn set_offset_xy(&self, rt: &ID2D1RenderTarget, dx: f32, dy: f32) {
         let mut m = D2D1_LAYER_PARAMETERS::default().maskTransform;
         m.M11 = 1.0;
         m.M22 = 1.0;
+        m.M32 = dy;
         m.M31 = dx;
         unsafe { rt.SetTransform(&m) };
     }
@@ -3075,7 +3710,7 @@ impl Renderer {
         };
         let dx = ((dims.width - settled.width) as f32 / 2.0).round();
         if dx != 0.0 {
-            Self::set_offset(rt, dx);
+            self.set_offset(rt, dx);
         }
         let drawn = if settings {
             self.draw_settings(rt, &settled)
@@ -3111,7 +3746,7 @@ impl Renderer {
             }
         };
         if dx != 0.0 {
-            Self::set_offset(rt, 0.0);
+            self.set_offset(rt, 0.0);
         }
         drawn
     }
@@ -3363,8 +3998,10 @@ impl Renderer {
                     ClipRow::Image(art, caption) => {
                         let img = p.image;
                         let size = (img.width().max(1.0) as u32, img.height().max(1.0) as u32);
-                        let radius = (profile.span - outline_w).max(0.0) * 0.6;
-                        match self.thumb_bitmap(rt, art, size, radius) {
+                        // Concentric with the tile: the outline's own curve,
+                        // starting as much later as the image sits inside it
+                        let inner = profile.nested(img.left - edge.left);
+                        match self.thumb_bitmap(rt, art, size, inner) {
                             Ok(bitmap) => rt.DrawBitmap(
                                 &bitmap,
                                 Some(&img.to_d2d_rect()),
@@ -3435,25 +4072,33 @@ impl Renderer {
         rt: &ID2D1RenderTarget,
         art: &Artwork,
         size: (u32, u32),
-        radius: f32,
+        corner: CornerProfile,
     ) -> Result<ID2D1Bitmap> {
-        Self::thumb_bitmap_in(&self.thumbs, rt, art, size, radius)
+        Self::thumb_bitmap_in(&self.thumbs, rt, art, size, corner)
     }
 
     /// The collapsed notch's album art in `dest` (whole pixels): each cover
     /// on screen as a premade rounded thumbnail (area-resampled once per
     /// cover and size, then a plain blit) at its fade's opacity. Thumbnails
     /// of covers that have faded out are released.
-    fn draw_collapsed_art(&self, rt: &ID2D1RenderTarget, dest: RectF, scale: f32) -> Result<()> {
+    fn draw_collapsed_art(
+        &self,
+        rt: &ID2D1RenderTarget,
+        dest: RectF,
+        scale: f32,
+        alpha: f32,
+    ) -> Result<()> {
         let art = self.collapsed_art.borrow();
         let size = (dest.width().max(1.0) as u32, dest.height().max(1.0) as u32);
         let radius = (crate::config::BASE_COLLAPSED_ARTWORK_RADIUS * scale).round();
+        // A plain circular corner (smoothing 0), as before
+        let corner = CornerProfile::new(radius, 0.0, f32::MAX);
         for (cover, fade) in &art.layers {
-            let opacity = fade.value.clamp(0.0, 1.0);
+            let opacity = fade.value.clamp(0.0, 1.0) * alpha;
             if opacity <= 0.0 {
                 continue;
             }
-            let bitmap = Self::thumb_bitmap_in(&self.collapsed_thumbs, rt, cover, size, radius)?;
+            let bitmap = Self::thumb_bitmap_in(&self.collapsed_thumbs, rt, cover, size, corner)?;
             unsafe {
                 rt.DrawBitmap(
                     &bitmap,
@@ -3476,7 +4121,7 @@ impl Renderer {
         rt: &ID2D1RenderTarget,
         art: &Artwork,
         size: (u32, u32),
-        radius: f32,
+        corner: CornerProfile,
     ) -> Result<ID2D1Bitmap> {
         if let Some((_, _, bitmap)) = cache
             .borrow()
@@ -3485,7 +4130,7 @@ impl Renderer {
         {
             return Ok(bitmap.clone());
         }
-        let thumb = thumbnail(art, size.0, size.1, radius);
+        let thumb = thumbnail(art, size.0, size.1, corner);
         let bitmap = Self::cached_bitmap(rt, &RefCell::new(None), &thumb)?;
         let mut thumbs = cache.borrow_mut();
         thumbs.retain(|(a, _, _)| a != art);
@@ -3862,11 +4507,19 @@ impl Renderer {
         self.draw_timer_panel(rt, &home.timer, dimensions, 1.0)
     }
 
-    /// Home's timer panel at `alpha`: the numerals (setup: the chosen
-    /// duration in white; running: what is left in the timer's orange;
-    /// paused: dimmed; done: 0:00 pulsing gently), the round buttons (the
-    /// primary one in an orange wash, Cancel in a quiet grey one), and the
-    /// duration scale (setup) or a status line.
+    /// Home's Focus / Break timer at `alpha`:
+    /// - the mode pills, each in a quiet wash; the selected one's wash and
+    ///   text in the mode's colour (Focus orange, Break neutral), the
+    ///   highlight gliding between them; while a countdown runs or is paused
+    ///   the other pill is dimmer (no switch);
+    /// - the minute scale: a tick a minute (a label every 5), lit in the
+    ///   mode's colour up to the value at the fixed centre and warming to
+    ///   white toward it, dim past it, fading at both ends; the pointer under
+    ///   the centre. It slides as the value changes (setup: gliding to a new
+    ///   duration; running: what is left);
+    /// - the round buttons (primary in the mode's wash, Cancel in a quiet one
+    ///   outside setup) and the numerals, right-aligned, in the mode's colour
+    ///   (paused dimmed, done pulsing gently).
     fn draw_timer_panel(
         &self,
         rt: &ID2D1RenderTarget,
@@ -3875,15 +4528,15 @@ impl Renderer {
         alpha: f32,
     ) -> Result<()> {
         use crate::config::{
-            BASE_TIMER_GLYPH_SIZE, BASE_TIMER_INDICATOR_HEIGHT, BASE_TIMER_INDICATOR_WIDTH,
-            BASE_TIMER_MAJOR_TICK_HEIGHT, BASE_TIMER_TICK_HEIGHT, BASE_TIMER_TICK_WIDTH,
-            CLIPBOARD_BUTTON_HOVER_GROW, CLIPBOARD_BUTTON_PRESS_GROW, COLOR_TIMER_TICK,
-            TIMER_BUTTON_WASH,
+            BASE_TIMER_GLYPH_SIZE, BASE_TIMER_TICK_WIDTH, CLIPBOARD_BUTTON_HOVER_GROW,
+            CLIPBOARD_BUTTON_PRESS_GROW, COLOR_TIMER_BREAK, TIMER_BUTTON_WASH, TIMER_QUIET_TEXT,
+            TIMER_QUIET_WASH, TIMER_SCALE_FADE_STOPS, TIMER_TICK_DIM, TIMER_TICK_GLOW_STOPS,
         };
-        use crate::timer::STOPS;
+        use crate::timer::{Mode, STOP_COUNT};
         let view = self.timer.get();
         let t = view.countdown;
-        let idle = t.phase() == Phase::Idle;
+        let phase = t.phase();
+        let idle = phase == Phase::Idle;
         let formats = self.media_formats(dimensions)?;
         let px = |v: f32| (v * dimensions.scale).round();
         let brush = |color: &D2D1_COLOR_F, opacity: f32| unsafe {
@@ -3891,67 +4544,152 @@ impl Renderer {
             b.SetOpacity(opacity * alpha);
             Ok::<_, Error>(b)
         };
-
-        // Numerals
-        let (color, opacity) = match t.phase() {
-            Phase::Idle => (COLOR_TEXT_PRIMARY, 1.0),
-            Phase::Running { .. } => (COLOR_TIMER, 1.0),
-            Phase::Paused { .. } => (COLOR_TEXT_SECONDARY, 1.0),
-            Phase::Done { .. } => (COLOR_TIMER, view.pulse),
+        let lerp = |a: D2D1_COLOR_F, b: D2D1_COLOR_F, k: f32| D2D1_COLOR_F {
+            r: a.r + (b.r - a.r) * k,
+            g: a.g + (b.g - a.g) * k,
+            b: a.b + (b.b - a.b) * k,
+            a: a.a + (b.a - a.a) * k,
         };
-        let mut buf = [0u16; 12];
-        let n = timer_numerals(&t, &mut buf);
-        let numerals = brush(&color, opacity)?;
-        self.draw_timer_text(
+        let round = |r: RectF| D2D1_ROUNDED_RECT {
+            rect: r.to_d2d_rect(),
+            radiusX: r.height().min(r.width()) / 2.0,
+            radiusY: r.height().min(r.width()) / 2.0,
+        };
+        // The mode's colour (gliding with the selector)
+        let mix = view.mode.clamp(0.0, 1.0);
+        let accent = lerp(COLOR_TIMER, COLOR_TIMER_BREAK, mix);
+        let quiet = brush(&COLOR_TEXT_PRIMARY, TIMER_QUIET_WASH)?;
+
+        // Mode pills
+        // Each pill's quiet wash gives way to the highlight as it is selected
+        let [focus, rest] = l.modes;
+        unsafe {
+            for (r, selected) in [(focus, 1.0 - mix), (rest, mix)] {
+                quiet.SetOpacity(alpha * TIMER_QUIET_WASH * (1.0 - selected));
+                rt.FillRoundedRectangle(&round(r), &quiet);
+            }
+            quiet.SetOpacity(alpha * TIMER_QUIET_WASH);
+            rt.FillRoundedRectangle(
+                &round(focus.lerp(rest, mix)),
+                &brush(&accent, TIMER_BUTTON_WASH)?,
+            );
+        }
+        let quiet_text = D2D1_COLOR_F {
+            a: TIMER_QUIET_TEXT,
+            ..COLOR_TEXT_PRIMARY
+        };
+        for mode in Mode::ALL {
+            let selected = 1.0 - (mix - mode.index() as f32).abs().min(1.0);
+            let color = lerp(quiet_text, accent, selected);
+            let label: Vec<u16> = mode.label().encode_utf16().collect();
+            unsafe {
+                rt.DrawText(
+                    &label,
+                    &formats.timer_pill,
+                    &l.modes[mode.index()].to_d2d_rect(),
+                    &brush(&color, 1.0)?,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
+        }
+
+        // The scale (a tick per stop), sliding so `value` sits at the centre
+        let value = if idle {
+            view.scale
+        } else {
+            crate::timer::scale_value(&t, std::time::Instant::now()) + view.lag
+        };
+        let (left, right) = (l.ruler.left, l.ruler.right);
+        let fade = |x: f32| {
+            ((x - left).min(right - x) / (TIMER_SCALE_FADE_STOPS * l.step)).clamp(0.0, 1.0)
+        };
+        // A tick's (and its label's) colour and opacity, `s` stops past the
+        // value: up to it the mode's colour warming to white, past it dim
+        // (crossing over within a stop, so nothing jumps as it glides)
+        let tone = |s: f32| {
+            if s <= 0.0 {
+                let glow = (1.0 + s / TIMER_TICK_GLOW_STOPS).max(0.0).powf(1.5);
+                (lerp(accent, COLOR_TEXT_PRIMARY, glow), 1.0)
+            } else {
+                let k = s.min(1.0);
+                (
+                    lerp(COLOR_TEXT_PRIMARY, accent, k),
+                    1.0 + (TIMER_TICK_DIM - 1.0) * k,
+                )
+            }
+        };
+        let tw = px(BASE_TIMER_TICK_WIDTH).max(1.0);
+        let ink = brush(&accent, 1.0)?;
+        let half = l.ruler.width() / l.step / 2.0 + 1.0;
+        let first = (value - half).floor().max(0.0) as usize;
+        let last = ((value + half).ceil().max(0.0) as usize).min(STOP_COUNT - 1);
+        for i in first..=last {
+            let x = l.stop_x(i as f32, value);
+            let f = fade(x);
+            if f <= 0.0 {
+                continue;
+            }
+            let (color, opacity) = tone(i as f32 - value);
+            let tick = RectF::new(x - tw / 2.0, l.ruler.top, x + tw / 2.0, l.ruler.bottom);
+            unsafe {
+                ink.SetColor(&color);
+                ink.SetOpacity(alpha * f * opacity);
+                rt.FillRoundedRectangle(&round(tick), &ink);
+            }
+            let mut buf = [0u16; 3];
+            if let Some(n) = stop_label(i, &mut buf) {
+                let w = l.step * 4.0;
+                let r = RectF::new(x - w / 2.0, l.labels.top, x + w / 2.0, l.labels.bottom);
+                unsafe {
+                    rt.DrawText(
+                        &buf[..n],
+                        &formats.timer_label,
+                        &r.to_d2d_rect(),
+                        &ink,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                }
+            }
+        }
+        // The pointer: a small triangle under the centre
+        let p = l.pointer;
+        let cx = (p.left + p.right) / 2.0;
+        self.fill_triangle(
             rt,
-            &buf[..n],
-            &formats.timer_display,
-            l.display(idle),
-            &numerals,
+            [(cx, p.top), (p.right, p.bottom), (p.left, p.bottom)],
+            &brush(&accent, 1.0)?,
         )?;
 
-        // Round buttons: a wash disc and a glyph, growing a little on hover
-        // and press like the other icon buttons
+        // Round buttons, growing a little on hover and press
         let feedback = self.feedback.borrow();
         let u = px(BASE_TIMER_GLYPH_SIZE);
-        let mut buttons = vec![(PanelHit::TimerPrimary, l.primary)];
-        if !idle {
-            buttons.push((PanelHit::TimerCancel, l.cancel));
-        }
-        for (hit, r) in buttons {
+        for (hit, r, shown) in [
+            (PanelHit::TimerPrimary, l.primary, true),
+            (PanelHit::TimerCancel, l.cancel, !idle),
+        ] {
+            if !shown {
+                continue;
+            }
             let (hover, press) = feedback.clip_levels(hit);
             let grow = 1.0 + CLIPBOARD_BUTTON_HOVER_GROW * hover * 0.5
                 - CLIPBOARD_BUTTON_PRESS_GROW * press * 0.5;
             let (cx, cy) = ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
-            let radius = r.width() / 2.0 * grow;
-            let (wash, ink) = if hit == PanelHit::TimerPrimary {
-                (
-                    brush(&COLOR_TIMER, TIMER_BUTTON_WASH)?,
-                    brush(&COLOR_TIMER, 1.0)?,
-                )
+            let radius = r.width().min(r.height()) / 2.0 * grow;
+            let body = RectF::new(cx - radius, cy - radius, cx + radius, cy + radius);
+            let (fill, ink) = if hit == PanelHit::TimerPrimary {
+                (brush(&accent, TIMER_BUTTON_WASH)?, brush(&accent, 1.0)?)
             } else {
-                (
-                    brush(&COLOR_SPACE_PILL_SELECTED, 1.0)?,
-                    brush(&COLOR_TEXT_PRIMARY, 1.0)?,
-                )
+                (quiet.clone(), brush(&COLOR_TEXT_PRIMARY, 0.8)?)
             };
-            unsafe {
-                rt.FillRoundedRectangle(
-                    &D2D1_ROUNDED_RECT {
-                        rect: RectF::new(cx - radius, cy - radius, cx + radius, cy + radius)
-                            .to_d2d_rect(),
-                        radiusX: radius,
-                        radiusY: radius,
-                    },
-                    &wash,
-                );
-            }
+            unsafe { rt.FillRoundedRectangle(&round(body), &fill) };
             if hit == PanelHit::TimerCancel {
                 self.draw_cross(rt, cx, cy, u * grow, &ink)?;
                 continue;
             }
             // Pause while it runs; otherwise play (start / resume / restart)
-            let icon = if matches!(t.phase(), Phase::Running { .. }) {
+            let icon = if matches!(phase, Phase::Running { .. }) {
                 PlayPauseIcon::Pause
             } else {
                 PlayPauseIcon::Play
@@ -3980,76 +4718,21 @@ impl Renderer {
             }
         }
 
-        let row = l.row;
-        let cy = ((row.top + row.bottom) / 2.0).round();
-        if idle {
-            // Duration scale: a tick per stop (taller where minutes and
-            // hours begin), the indicator on the chosen one
-            let ticks = brush(&COLOR_TIMER_TICK, 1.0)?;
-            let tw = px(BASE_TIMER_TICK_WIDTH).max(1.0);
-            for (i, secs) in STOPS.iter().enumerate() {
-                let major = matches!(secs, 60 | 3600) || i == 0 || i == STOPS.len() - 1;
-                let h = px(if major {
-                    BASE_TIMER_MAJOR_TICK_HEIGHT
-                } else {
-                    BASE_TIMER_TICK_HEIGHT
-                });
-                let x = l.stop_x(i, STOPS.len());
-                let top = (cy - h / 2.0).round();
-                unsafe {
-                    rt.FillRectangle(
-                        &RectF::new(
-                            x - (tw / 2.0).floor(),
-                            top,
-                            x - (tw / 2.0).floor() + tw,
-                            top + h,
-                        )
-                        .to_d2d_rect(),
-                        &ticks,
-                    );
-                }
-            }
-            let (iw, ih) = (
-                px(BASE_TIMER_INDICATOR_WIDTH),
-                px(BASE_TIMER_INDICATOR_HEIGHT),
-            );
-            let x = l.stop_x(t.stop(), STOPS.len());
-            let top = (cy - ih / 2.0).round();
-            let left = (x - iw / 2.0).round();
-            let indicator = brush(&COLOR_TIMER, 1.0)?;
-            unsafe {
-                rt.FillRoundedRectangle(
-                    &D2D1_ROUNDED_RECT {
-                        rect: RectF::new(left, top, left + iw, top + ih).to_d2d_rect(),
-                        radiusX: iw / 2.0,
-                        radiusY: iw / 2.0,
-                    },
-                    &indicator,
-                );
-            }
-        } else {
-            let status = match t.phase() {
-                Phase::Paused { .. } => "Paused".to_string(),
-                Phase::Done { .. } => "Timer done".to_string(),
-                _ => format!(
-                    "{} timer",
-                    crate::timer::describe(t.duration().as_secs(), false)
-                ),
-            };
-            let text: Vec<u16> = status.encode_utf16().collect();
-            let label = brush(&COLOR_TEXT_TERTIARY, 1.0)?;
-            unsafe {
-                rt.DrawText(
-                    &text,
-                    &formats.timer_status,
-                    &row.to_d2d_rect(),
-                    &label,
-                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                );
-            }
-        }
-        Ok(())
+        // Numerals
+        let (color, opacity) = match phase {
+            Phase::Idle | Phase::Running { .. } => (accent, 1.0),
+            Phase::Paused { .. } => (COLOR_TEXT_SECONDARY, 1.0),
+            Phase::Done { .. } => (accent, view.pulse),
+        };
+        let mut buf = [0u16; 12];
+        let n = timer_numerals(&t, &mut buf);
+        self.draw_timer_text(
+            rt,
+            &buf[..n],
+            &formats.timer_display,
+            l.numerals,
+            &brush(&color, opacity)?,
+        )
     }
 
     /// A text layout of `text` in `format` with tabular figures (digits keep
@@ -4206,6 +4889,156 @@ impl Renderer {
             )?;
         }
         Ok(g)
+    }
+
+    /// The update notice's label, laid out (once per label and DPI; the
+    /// version in the label's weight, the words lighter) and its size.
+    fn update_text(
+        &self,
+        dimensions: &NotchDimensions,
+        label: &str,
+    ) -> Result<std::cell::Ref<'_, UpdateText>> {
+        let stale = self
+            .update_text
+            .borrow()
+            .as_ref()
+            .is_none_or(|t| t.key.0 != dimensions.dpi || t.key.1 != label);
+        if stale {
+            let formats = self.media_formats(dimensions)?;
+            let text: Vec<u16> = label.encode_utf16().collect();
+            let lead = label
+                .rfind(' ')
+                .map_or(0, |i| label[..=i].encode_utf16().count());
+            let (layout, size) = unsafe {
+                let layout =
+                    self.dwrite_factory
+                        .CreateTextLayout(&text, &formats.source, 10_000.0, 1.0)?;
+                layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
+                layout.SetFontWeight(
+                    windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT_NORMAL,
+                    DWRITE_TEXT_RANGE {
+                        startPosition: 0,
+                        length: lead as u32,
+                    },
+                )?;
+                layout.SetFontWeight(
+                    windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                    DWRITE_TEXT_RANGE {
+                        startPosition: lead as u32,
+                        length: (text.len() - lead) as u32,
+                    },
+                )?;
+                let mut m = DWRITE_TEXT_METRICS::default();
+                layout.GetMetrics(&mut m)?;
+                let size = (m.widthIncludingTrailingWhitespace.ceil(), m.height.ceil());
+                layout.SetMaxWidth(size.0 + 1.0)?;
+                layout.SetMaxHeight(size.1)?;
+                (layout, size)
+            };
+            drop(formats);
+            *self.update_text.borrow_mut() = Some(UpdateText {
+                key: (dimensions.dpi, label.to_string()),
+                layout,
+                size,
+            });
+        }
+        std::cell::Ref::filter_map(self.update_text.borrow(), Option::as_ref)
+            .map_err(|_| Error::from_thread())
+    }
+
+    /// The update notice in its own window `hwnd`: a small pill of the
+    /// notch's black centred under it at `center_x`, its top `gap` below
+    /// `notch_bottom`. It slides out from beneath the notch and fades in
+    /// with `presence` (0 gone .. 1 shown).
+    pub fn render_update_notice(
+        &self,
+        hwnd: HWND,
+        center_x: i32,
+        notch_bottom: i32,
+        dimensions: &NotchDimensions,
+        label: &str,
+        presence: f32,
+    ) -> Result<()> {
+        let (w, h) = self.draw_update_notice(dimensions, label, presence)?;
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: (presence.clamp(0.0, 1.0) * 255.0).round() as u8,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        unsafe {
+            UpdateLayeredWindow(
+                hwnd,
+                Some(self.cached_screen_dc.get()),
+                Some(&POINT {
+                    x: center_x - w / 2,
+                    y: notch_bottom,
+                }),
+                Some(&SIZE { cx: w, cy: h }),
+                Some(self.cached_mem_dc.get()),
+                Some(&POINT { x: 0, y: 0 }),
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            )
+        }
+    }
+
+    /// The update notice into the shared buffer (top-left); its size.
+    fn draw_update_notice(
+        &self,
+        dimensions: &NotchDimensions,
+        label: &str,
+        presence: f32,
+    ) -> Result<(i32, i32)> {
+        let text = self.update_text(dimensions, label)?;
+        let px = |v: f32| (v * dimensions.scale).round();
+        let (tw, th) = text.size;
+        let (pad_x, pad_y, gap) = (
+            px(BASE_UPDATE_PAD_X),
+            px(BASE_UPDATE_PAD_Y),
+            px(BASE_UPDATE_GAP),
+        );
+        let (pill_w, pill_h) = (tw + 2.0 * pad_x, th + 2.0 * pad_y);
+        let (w, h) = (pill_w.ceil() as i32 + 2, (gap + pill_h).ceil() as i32 + 2);
+        // From tucked under the notch (above this window's top) to `gap` below
+        let p = presence.clamp(0.0, 1.05);
+        let top = gap + (gap + pill_h + 2.0) * (p - 1.0);
+        self.ensure_buffer(w, h)?;
+        let rt_borrow = self.cached_rt.borrow();
+        let Some(rt) = rt_borrow.as_ref() else {
+            return Err(Error::from_thread());
+        };
+        unsafe {
+            rt.BindDC(
+                self.cached_mem_dc.get(),
+                &RECT {
+                    left: 0,
+                    top: 0,
+                    right: w,
+                    bottom: h,
+                },
+            )?;
+            rt.BeginDraw();
+            rt.Clear(Some(&COLOR_TRANSPARENT));
+            let pill = D2D1_ROUNDED_RECT {
+                rect: RectF::new(1.0, top + 1.0, 1.0 + pill_w, top + 1.0 + pill_h).to_d2d_rect(),
+                radiusX: pill_h / 2.0,
+                radiusY: pill_h / 2.0,
+            };
+            let fill = rt.CreateSolidColorBrush(&NOTCH_BG_COLOR, None)?;
+            rt.FillRoundedRectangle(&pill, &fill);
+            let edge = rt.CreateSolidColorBrush(&NOTCH_BORDER_COLOR, None)?;
+            rt.DrawRoundedRectangle(&pill, &edge, dimensions.border_width.max(1.0), None);
+            let ink = rt.CreateSolidColorBrush(&COLOR_TEXT_PRIMARY, None)?;
+            let mut origin =
+                windows::Win32::Graphics::Direct2D::D2D1_POINT_DESCRIPTION::default().point;
+            origin.X = 1.0 + pad_x;
+            origin.Y = top + 1.0 + pad_y;
+            rt.DrawTextLayout(origin, &text.layout, &ink, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            rt.EndDraw(None, None)?;
+        }
+        Ok((w, h))
     }
 
     /// An open arc of `frac` of a full turn around (cx, cy), from 12 o'clock
@@ -4517,8 +5350,24 @@ impl Renderer {
                 empty: role(TextRole::EmptyState, DWRITE_TEXT_ALIGNMENT_CENTER)?,
                 clock_display: role(TextRole::ClockDisplay, DWRITE_TEXT_ALIGNMENT_CENTER)?,
                 date_line: role(TextRole::DateLine, DWRITE_TEXT_ALIGNMENT_CENTER)?,
-                timer_display: role(TextRole::ClockDisplay, DWRITE_TEXT_ALIGNMENT_LEADING)?,
-                timer_status: role(TextRole::MediaMeta, DWRITE_TEXT_ALIGNMENT_LEADING)?,
+                timer_display: self.create_line_format(
+                    &timer_font(&self.dwrite_factory),
+                    crate::config::BASE_TIMER_FONT_SIZE * s,
+                    DWRITE_FONT_WEIGHT(700),
+                    DWRITE_TEXT_ALIGNMENT_TRAILING,
+                )?,
+                timer_label: self.create_line_format(
+                    &timer_font(&self.dwrite_factory),
+                    crate::config::BASE_TIMER_LABEL_FONT_SIZE * s,
+                    DWRITE_FONT_WEIGHT(700),
+                    DWRITE_TEXT_ALIGNMENT_CENTER,
+                )?,
+                timer_pill: self.create_line_format(
+                    &timer_font(&self.dwrite_factory),
+                    crate::config::BASE_TIMER_PILL_FONT_SIZE * s,
+                    DWRITE_FONT_WEIGHT(700),
+                    DWRITE_TEXT_ALIGNMENT_CENTER,
+                )?,
                 timer_slot: role(TextRole::ClockCompact, DWRITE_TEXT_ALIGNMENT_TRAILING)?,
                 clip_text: {
                     let f = role(TextRole::MediaArtist, DWRITE_TEXT_ALIGNMENT_LEADING)?;
@@ -5127,13 +5976,21 @@ impl Renderer {
         hovered: bool,
         clock: &ClockDateState,
     ) -> Result<()> {
-        let width = dimensions.width;
         let height = dimensions.height;
         let border_width = dimensions.border_width;
 
-        if width <= 0 || height <= 0 {
+        if dimensions.width <= 0 || height <= 0 {
             return Ok(());
         }
+
+        // The HUD's endpoint stretch (see `hud::stretch_geometry`): one
+        // deformed silhouette (body, border, shadow), the surface grown to
+        // hold it, the content centred in it; exactly the notch at rest
+        let stretch = crate::hud::stretch_geometry(dimensions, self.hud.get().stretch);
+        let shape = stretch.shape;
+        let left = stretch.left;
+        let width = shape.width;
+        self.stretch.set(Some(stretch));
 
         self.ensure_buffer(width, height)?;
 
@@ -5163,9 +6020,12 @@ impl Renderer {
             let fill_brush = rt.CreateSolidColorBrush(&NOTCH_BG_COLOR, None)?;
 
             // Build mathematical hardware-notch path geometry
-            let path = self.create_notch_geometry(dimensions)?;
+            let path = self.create_notch_geometry(&shape)?;
 
             // Fill interior with pure black
+            if stretch.shape_dx != 0.0 {
+                self.set_offset_xy(rt, stretch.shape_dx, 0.0);
+            }
             rt.FillGeometry(&path, &fill_brush, None);
 
             // Specular highlight border only if not transparent (preserves deep black on hover)
@@ -5179,6 +6039,10 @@ impl Renderer {
                 rt.DrawGeometry(&path, &border_brush, border_width, None);
             }
 
+            // Everything else is drawn relative to the content's place (the
+            // scenes' own offsets add to it)
+            self.content_base.set(stretch.content);
+            self.set_offset(rt, 0.0);
             // Render layout components based on state and height
             let layout = resolve_layout(dimensions);
             match &layout {
@@ -5211,6 +6075,8 @@ impl Renderer {
                     }
                 }
             }
+            self.content_base.set((0.0, 0.0));
+            self.set_offset(rt, 0.0);
 
             rt.EndDraw(None, None)?;
 
@@ -5223,7 +6089,7 @@ impl Renderer {
                     let (w, h) = (width as usize, height as usize);
                     let stride = self.cached_capacity_w.get() as usize;
                     let mut scratch_a = self.scratch_a.borrow_mut();
-                    let key = Some((*dimensions, hovered));
+                    let key = Some((shape, hovered));
                     if self.shadow_key.get() != key {
                         let mut scratch_b = self.scratch_b.borrow_mut();
                         let built = build_shadow_mask(
@@ -5244,8 +6110,9 @@ impl Renderer {
                 }
             }
 
-            // Upload to DWM atomically via UpdateLayeredWindow
-            let pt_dst = POINT { x, y };
+            // Upload to DWM atomically via UpdateLayeredWindow (a left push
+            // starts the window that much further left)
+            let pt_dst = POINT { x: x - left, y };
             let size = SIZE {
                 cx: width,
                 cy: height,
@@ -5307,6 +6174,119 @@ pub(crate) enum IconSeg {
 // grid, and Ujval's own Copy icon from its SVG path; each scaled to the box it
 // occupies. Solid shapes and holes run in opposite directions: filled with the
 // nonzero rule, overlaps merge and holes cut out.
+// HUD icons (hand-made, simple solids; not from `generate.py`).
+/// Update available: an arrow down onto a line (round-capped strokes),
+/// the collapsed notch's update icon.
+const UPDATE_ARROW: &[IconSeg] = &[
+    IconSeg::M(0.0600, -0.3600),
+    IconSeg::L(0.0600, 0.1400),
+    IconSeg::C(0.0600, 0.1731, 0.0331, 0.2000, 0.0000, 0.2000),
+    IconSeg::C(-0.0331, 0.2000, -0.0600, 0.1731, -0.0600, 0.1400),
+    IconSeg::L(-0.0600, -0.3600),
+    IconSeg::C(-0.0600, -0.3931, -0.0331, -0.4200, 0.0000, -0.4200),
+    IconSeg::C(0.0331, -0.4200, 0.0600, -0.3931, 0.0600, -0.3600),
+    IconSeg::Z,
+    IconSeg::M(-0.1576, -0.1024),
+    IconSeg::L(0.0424, 0.0976),
+    IconSeg::C(0.0659, 0.1210, 0.0659, 0.1590, 0.0424, 0.1824),
+    IconSeg::C(0.0190, 0.2059, -0.0190, 0.2059, -0.0424, 0.1824),
+    IconSeg::L(-0.2424, -0.0176),
+    IconSeg::C(-0.2659, -0.0410, -0.2659, -0.0790, -0.2424, -0.1024),
+    IconSeg::C(-0.2190, -0.1259, -0.1810, -0.1259, -0.1576, -0.1024),
+    IconSeg::Z,
+    IconSeg::M(0.2424, -0.0176),
+    IconSeg::L(0.0424, 0.1824),
+    IconSeg::C(0.0190, 0.2059, -0.0190, 0.2059, -0.0424, 0.1824),
+    IconSeg::C(-0.0659, 0.1590, -0.0659, 0.1210, -0.0424, 0.0976),
+    IconSeg::L(0.1576, -0.1024),
+    IconSeg::C(0.1810, -0.1259, 0.2190, -0.1259, 0.2424, -0.1024),
+    IconSeg::C(0.2659, -0.0790, 0.2659, -0.0410, 0.2424, -0.0176),
+    IconSeg::Z,
+    IconSeg::M(-0.3000, 0.3000),
+    IconSeg::L(0.3000, 0.3000),
+    IconSeg::C(0.3331, 0.3000, 0.3600, 0.3269, 0.3600, 0.3600),
+    IconSeg::C(0.3600, 0.3931, 0.3331, 0.4200, 0.3000, 0.4200),
+    IconSeg::L(-0.3000, 0.4200),
+    IconSeg::C(-0.3331, 0.4200, -0.3600, 0.3931, -0.3600, 0.3600),
+    IconSeg::C(-0.3600, 0.3269, -0.3331, 0.3000, -0.3000, 0.3000),
+    IconSeg::Z,
+];
+/// Volume: the speaker itself (its body and cone, open toward the right),
+/// every corner rounded.
+const SPEAKER_BODY: &[IconSeg] = &[
+    IconSeg::M(-0.3600, -0.0700),
+    IconSeg::C(-0.3600, -0.1085, -0.3285, -0.1400, -0.2900, -0.1400),
+    IconSeg::L(-0.2700, -0.1400),
+    IconSeg::C(-0.2315, -0.1400, -0.1769, -0.1614, -0.1486, -0.1875),
+    IconSeg::L(-0.0429, -0.2850),
+    IconSeg::C(0.0137, -0.3373, 0.0600, -0.3170, 0.0600, -0.2400),
+    IconSeg::L(0.0600, 0.2400),
+    IconSeg::C(0.0600, 0.3170, 0.0137, 0.3373, -0.0429, 0.2850),
+    IconSeg::L(-0.1486, 0.1875),
+    IconSeg::C(-0.1769, 0.1614, -0.2315, 0.1400, -0.2700, 0.1400),
+    IconSeg::L(-0.2900, 0.1400),
+    IconSeg::C(-0.3285, 0.1400, -0.3600, 0.1085, -0.3600, 0.0700),
+    IconSeg::Z,
+];
+/// Sound wave 1 (a round-capped arc, radius 0.13..0.18 from the speaker's mouth).
+const SPEAKER_WAVE_1: &[IconSeg] = &[
+    IconSeg::M(0.1818, -0.1353),
+    IconSeg::C(0.2201, -0.1007, 0.2420, -0.0516, 0.2420, 0.0000),
+    IconSeg::C(0.2420, 0.0516, 0.2201, 0.1007, 0.1818, 0.1353),
+    IconSeg::C(0.1707, 0.1452, 0.1536, 0.1443, 0.1437, 0.1333),
+    IconSeg::C(0.1337, 0.1222, 0.1346, 0.1051, 0.1456, 0.0951),
+    IconSeg::C(0.1726, 0.0708, 0.1880, 0.0363, 0.1880, 0.0000),
+    IconSeg::C(0.1880, -0.0363, 0.1726, -0.0708, 0.1456, -0.0951),
+    IconSeg::C(0.1346, -0.1051, 0.1337, -0.1222, 0.1437, -0.1333),
+    IconSeg::C(0.1536, -0.1443, 0.1707, -0.1452, 0.1818, -0.1353),
+    IconSeg::Z,
+];
+/// Sound wave 2 (a round-capped arc, radius 0.25..0.30 from the speaker's mouth).
+const SPEAKER_WAVE_2: &[IconSeg] = &[
+    IconSeg::M(0.2621, -0.2244),
+    IconSeg::C(0.3257, -0.1672, 0.3620, -0.0856, 0.3620, 0.0000),
+    IconSeg::C(0.3620, 0.0856, 0.3257, 0.1672, 0.2621, 0.2244),
+    IconSeg::C(0.2510, 0.2344, 0.2339, 0.2335, 0.2239, 0.2224),
+    IconSeg::C(0.2140, 0.2113, 0.2149, 0.1943, 0.2259, 0.1843),
+    IconSeg::C(0.2782, 0.1373, 0.3080, 0.0703, 0.3080, 0.0000),
+    IconSeg::C(0.3080, -0.0703, 0.2782, -0.1373, 0.2259, -0.1843),
+    IconSeg::C(0.2149, -0.1943, 0.2140, -0.2113, 0.2239, -0.2224),
+    IconSeg::C(0.2339, -0.2335, 0.2510, -0.2344, 0.2621, -0.2244),
+    IconSeg::Z,
+];
+/// Sound wave 3 (a round-capped arc, radius 0.37..0.42 from the speaker's mouth).
+const SPEAKER_WAVE_3: &[IconSeg] = &[
+    IconSeg::M(0.3424, -0.3136),
+    IconSeg::C(0.4313, -0.2336, 0.4820, -0.1196, 0.4820, 0.0000),
+    IconSeg::C(0.4820, 0.1196, 0.4313, 0.2336, 0.3424, 0.3136),
+    IconSeg::C(0.3313, 0.3236, 0.3142, 0.3227, 0.3042, 0.3116),
+    IconSeg::C(0.2943, 0.3005, 0.2952, 0.2835, 0.3062, 0.2735),
+    IconSeg::C(0.3837, 0.2037, 0.4280, 0.1043, 0.4280, 0.0000),
+    IconSeg::C(0.4280, -0.1043, 0.3837, -0.2037, 0.3062, -0.2735),
+    IconSeg::C(0.2952, -0.2835, 0.2943, -0.3005, 0.3042, -0.3116),
+    IconSeg::C(0.3142, -0.3227, 0.3313, -0.3236, 0.3424, -0.3136),
+    IconSeg::Z,
+];
+/// Muted: a cross beside the speaker (round-capped strokes).
+const SPEAKER_CROSS: &[IconSeg] = &[
+    IconSeg::M(0.2055, -0.1155),
+    IconSeg::L(0.3955, 0.0745),
+    IconSeg::C(0.4068, 0.0858, 0.4068, 0.1042, 0.3955, 0.1155),
+    IconSeg::C(0.3842, 0.1268, 0.3658, 0.1268, 0.3545, 0.1155),
+    IconSeg::L(0.1645, -0.0745),
+    IconSeg::C(0.1532, -0.0858, 0.1532, -0.1042, 0.1645, -0.1155),
+    IconSeg::C(0.1758, -0.1268, 0.1942, -0.1268, 0.2055, -0.1155),
+    IconSeg::Z,
+    IconSeg::M(0.1645, 0.0745),
+    IconSeg::L(0.3545, -0.1155),
+    IconSeg::C(0.3658, -0.1268, 0.3842, -0.1268, 0.3955, -0.1155),
+    IconSeg::C(0.4068, -0.1042, 0.4068, -0.0858, 0.3955, -0.0745),
+    IconSeg::L(0.2055, 0.1155),
+    IconSeg::C(0.1942, 0.1268, 0.1758, 0.1268, 0.1645, 0.1155),
+    IconSeg::C(0.1532, 0.1042, 0.1532, 0.0858, 0.1645, 0.0745),
+    IconSeg::Z,
+];
+
 /// Home: a soft-roofed house with an arched door; the Home space.
 const HOUSE_BLANK: &[IconSeg] = &[
     IconSeg::M(0.0900, -0.4521),
@@ -7998,7 +8978,7 @@ mod tests {
                     (badge.top + badge.bottom) / 2.0,
                 );
                 let p = px[y as usize * stride + x as usize];
-                ((p >> 8) & 0xFF) > 0xA0 && (p & 0xFF) < 0x60
+                ((p >> 16) & 0xFF) < 0x60 && ((p >> 8) & 0xFF) > 0xA0 && (p & 0xFF) < 0x60
             };
             with(|_| {});
             let (shown, stride) = render_media_frame(&renderer, &dims, &c);
@@ -8079,7 +9059,7 @@ mod tests {
             let (px, stride) = render_media_frame(&renderer, &dims, &c);
             let green_at = |x: usize, y: usize| {
                 let p = px[y * stride + x];
-                ((p >> 8) & 0xFF) > 0xA0 && (p & 0xFF) < 0x60
+                ((p >> 16) & 0xFF) < 0x60 && ((p >> 8) & 0xFF) > 0xA0 && (p & 0xFF) < 0x60
             };
             // Straddles the corner: overhangs the art's right and bottom edges
             assert!(
@@ -8211,6 +9191,447 @@ mod tests {
         let bits = renderer.cached_bits.get() as *const u32;
         let pixels = unsafe { std::slice::from_raw_parts(bits, stride * dims.height as usize) };
         (pixels.to_vec(), stride)
+    }
+
+    #[test]
+    fn test_collapsed_hud_shows_the_level_at_all_dpis() {
+        let renderer = Renderer::new().unwrap();
+        // Green channel of a pixel (premultiplied on black: brightness)
+        let g = |px: &[u32], stride: usize, x: f32, y: f32| {
+            (px[y as usize * stride + x as usize] >> 8) & 0xFF
+        };
+        for dpi in ALL_DPIS {
+            // At the collapsed size and widened by the HUD
+            let mut dims = NotchDimensions::from_state_and_dpi(NotchState::Collapsed, dpi);
+            for extra in [0.0, crate::config::BASE_HUD_EXTRA_WIDTH] {
+                dims.width = crate::hud::widened_width(
+                    NotchDimensions::from_state_and_dpi(NotchState::Collapsed, dpi).width,
+                    extra,
+                    dims.scale,
+                );
+                let row = crate::layout::collapsed_hud_layout(
+                    &resolve_collapsed_layout(&dims),
+                    dims.scale,
+                );
+                let (y, bar) = ((row.bar.top + row.bar.bottom) / 2.0, row.bar);
+                let at = |t: f32| bar.left + bar.width() * t;
+                // Volume, muted, and halfway through the mute morph
+                for (muted, full) in [(0.0, 200), (1.0, 60), (0.5, 120)] {
+                    renderer.set_hud(crate::hud::HudView {
+                        level: 0.5,
+                        percent: 50,
+                        digits: crate::hud::digit_targets(50),
+                        waves: if muted > 0.0 { 0.0 } else { 2.0 },
+                        muted,
+                        presence: 1.0,
+                        ..Default::default()
+                    });
+                    let (px, stride) = render_collapsed_frame(&renderer, &dims);
+                    // The number is drawn
+                    let t = row.text;
+                    let ink = (t.top as usize..t.bottom as usize).any(|yy| {
+                        (t.left as usize..t.right as usize)
+                            .any(|xx| (px[yy * stride + xx] >> 8) & 0xFF > 60)
+                    });
+                    assert!(ink, "{dpi}: number");
+                    let (filled, track) =
+                        (g(&px, stride, at(0.25), y), g(&px, stride, at(0.75), y));
+                    assert!(filled >= full, "{dpi} muted={muted}: level {filled}");
+                    assert!(track < 80 && track > 10, "{dpi}: track {track}");
+                    assert!(filled > track, "{dpi}: the level stays visible");
+                    // The icon is drawn (some light in its box)
+                    let lit = (row.icon.top as usize..row.icon.bottom as usize).any(|yy| {
+                        (row.icon.left as usize..row.icon.right as usize)
+                            .any(|xx| (px[yy * stride + xx] >> 8) & 0xFF > 100)
+                    });
+                    assert!(lit, "{dpi}: icon");
+                }
+            }
+        }
+        renderer.set_hud(crate::hud::HudView::default());
+    }
+
+    #[test]
+    fn test_collapsed_update_icon_takes_the_artworks_place() {
+        let renderer = Renderer::new().unwrap();
+        for dpi in ALL_DPIS {
+            let dims = NotchDimensions::from_state_and_dpi(NotchState::Collapsed, dpi);
+            let art = resolve_collapsed_layout(&dims).artwork_bounds;
+            let lit = |level: f32| {
+                renderer.set_update_icon(level);
+                let (px, stride) = render_collapsed_frame(&renderer, &dims);
+                let (mut inside, mut outside_left) = (0, 0);
+                for y in 0..dims.height as usize {
+                    for x in 0..dims.width as usize {
+                        let p = px[y * stride + x];
+                        if (p >> 8 & 0xFF) > 150 {
+                            if art.contains(x as f32 + 0.5, y as f32 + 0.5) {
+                                inside += 1;
+                            } else if (x as f32) < art.right {
+                                outside_left += 1;
+                            }
+                        }
+                    }
+                }
+                (inside, outside_left)
+            };
+            // No update: nothing there (no artwork either without media)
+            assert_eq!(lit(0.0).0, 0, "{dpi}");
+            // Available: the icon, inside the artwork's square only
+            let (inside, outside) = lit(1.0);
+            assert!(inside > 8, "{dpi}: drawn ({inside})");
+            assert_eq!(outside, 0, "{dpi}: within the artwork's place");
+            // Arriving: fainter than settled
+            renderer.set_update_icon(0.3);
+            let (px, stride) = render_collapsed_frame(&renderer, &dims);
+            let peak = (0..dims.height as usize)
+                .flat_map(|y| (0..dims.width as usize).map(move |x| (x, y)))
+                .filter(|&(x, y)| art.contains(x as f32 + 0.5, y as f32 + 0.5))
+                .map(|(x, y)| px[y * stride + x] >> 8 & 0xFF)
+                .max()
+                .unwrap();
+            assert!(peak < 150, "{dpi}: fading in ({peak})");
+        }
+        renderer.set_update_icon(0.0);
+    }
+
+    #[test]
+    fn test_update_notice_is_a_black_pill_with_its_label() {
+        let renderer = Renderer::new().unwrap();
+        let label = "Oeca update available \u{00B7} v12.34.56";
+        for dpi in ALL_DPIS {
+            let dims = NotchDimensions::from_state_and_dpi(NotchState::Collapsed, dpi);
+            let read = |presence: f32| {
+                let (w, h) = renderer.draw_update_notice(&dims, label, presence).unwrap();
+                let stride = renderer.cached_capacity_w.get() as usize;
+                let bits = renderer.cached_bits.get() as *const u32;
+                let px = unsafe { std::slice::from_raw_parts(bits, stride * h as usize) };
+                let rows: Vec<Vec<u32>> = (0..h as usize)
+                    .map(|y| px[y * stride..y * stride + w as usize].to_vec())
+                    .collect();
+                rows
+            };
+            // Shown: an opaque body with bright text inside it
+            let rows = read(1.0);
+            let (h, w) = (rows.len(), rows[0].len());
+            let opaque = |p: u32| p >> 24 == 0xFF;
+            let bright = |p: u32| opaque(p) && (p >> 8 & 0xFF) > 150;
+            let mid = &rows[h - 1 - (h - 1) / 3];
+            assert!(opaque(mid[w / 2]), "{dpi}: the pill's body");
+            let text = rows.iter().flatten().filter(|&&p| bright(p)).count();
+            assert!(text > 40, "{dpi}: the label is drawn ({text})");
+            // Its corners are round (transparent), its ends fully rounded
+            assert_eq!(rows[h - 1][0] >> 24, 0, "{dpi}: corner");
+            assert_eq!(rows[h - 1][w - 1] >> 24, 0, "{dpi}: corner");
+            // Wide enough for the label, never wider than a sentence needs
+            assert!(
+                w as f32 > 150.0 * dims.scale && (w as f32) < 360.0 * dims.scale,
+                "{dpi}: {w}"
+            );
+            // Gone: tucked away above the window, nothing drawn
+            let rows = read(0.0);
+            assert!(
+                rows.iter().flatten().all(|&p| p >> 24 == 0),
+                "{dpi}: hidden"
+            );
+        }
+    }
+
+    #[test]
+    fn test_power_notice_draws_battery_colour_and_fitting_text() {
+        let renderer = Renderer::new().unwrap();
+        for dpi in ALL_DPIS {
+            // In the HUD-widened collapsed notch, and in the expanded header
+            let base = NotchDimensions::from_state_and_dpi(NotchState::Collapsed, dpi);
+            let mut dims = base;
+            dims.width = crate::hud::widened_width(
+                base.width,
+                crate::config::BASE_HUD_EXTRA_WIDTH,
+                base.scale,
+            );
+            let row =
+                crate::layout::collapsed_hud_layout(&resolve_collapsed_layout(&dims), dims.scale);
+            // The sentence fits between the battery and the row's end
+            let width = row.text.right - row.bar.left;
+            for on in [false, true] {
+                let texts = renderer
+                    .notice_text(&dims, row.text.height(), width)
+                    .unwrap();
+                let mut m = DWRITE_TEXT_METRICS::default();
+                unsafe { texts.layouts[usize::from(on)].GetMetrics(&mut m).unwrap() };
+                assert!(m.width <= width, "{dpi} {on}: {} > {width}", m.width);
+            }
+            let content = resolve_collapsed_layout(&dims).content_bounds;
+            for (on, yellow) in [(1.0, true), (0.0, false)] {
+                renderer.set_hud(crate::hud::HudView {
+                    presence: 1.0,
+                    notice: 1.0,
+                    power_saving: on,
+                    ..Default::default()
+                });
+                let (px, stride) = render_collapsed_frame(&renderer, &dims);
+                let rgb = |p: u32| ((p >> 16) & 0xFF, (p >> 8) & 0xFF, p & 0xFF);
+                let mut fill = 0;
+                let mut text = 0;
+                let (mut text_right, mut ink_left) = (0usize, usize::MAX);
+                for y in 0..dims.height as usize {
+                    for x in 0..dims.width as usize {
+                        let (r, g, b) = rgb(px[y * stride + x]);
+                        let is_fill = if yellow {
+                            r > 200 && g > 150 && b < 60
+                        } else {
+                            g > 150 && r < 90 && b < 120
+                        };
+                        fill += usize::from(is_fill);
+                        let bright = r > 150 && g > 150 && b > 150;
+                        if bright && (x as f32) > row.bar.left + 4.0 {
+                            text += 1;
+                            text_right = text_right.max(x);
+                        }
+                        if bright || is_fill {
+                            ink_left = ink_left.min(x);
+                        }
+                    }
+                }
+                assert!(fill > 4, "{dpi} {on}: battery fill ({fill} px)");
+                assert!(text > 20, "{dpi} {on}: text ({text} px)");
+                // The battery's left outline is drawn whole, inside the
+                // notch's content edge (not cut off by it)
+                assert!(
+                    ink_left as f32 >= content.left && (ink_left as f32) <= row.icon.left + 2.0,
+                    "{dpi} {on}: battery's left edge at {ink_left} (content from {})",
+                    content.left
+                );
+                // The text ends at the row's right end (right-aligned)
+                assert!(
+                    (row.text.right - text_right as f32).abs() <= 3.0 * dims.scale,
+                    "{dpi} {on}: text ends at {text_right}, row at {}",
+                    row.text.right
+                );
+            }
+        }
+        renderer.set_hud(crate::hud::HudView::default());
+    }
+
+    #[test]
+    fn test_rolling_number_draws_exactly_at_rest_and_rolls_between() {
+        let renderer = Renderer::new().unwrap();
+        for dpi in ALL_DPIS {
+            let dims = NotchDimensions::from_state_and_dpi(NotchState::Collapsed, dpi);
+            let row =
+                crate::layout::collapsed_hud_layout(&resolve_collapsed_layout(&dims), dims.scale);
+            let t = row.text;
+            // The number's pixels, alone: the text rect of a frame
+            let number = |view: crate::hud::HudView| {
+                renderer.set_hud(crate::hud::HudView {
+                    presence: 1.0,
+                    ..view
+                });
+                let (px, stride) = render_collapsed_frame(&renderer, &dims);
+                let mut out = Vec::new();
+                for y in t.top as usize..t.bottom as usize {
+                    out.extend_from_slice(
+                        &px[y * stride + t.left as usize..y * stride + t.right as usize],
+                    );
+                }
+                out
+            };
+            let at = |p: u32| crate::hud::HudView {
+                percent: p as u8,
+                digits: crate::hud::digit_targets(p),
+                ..Default::default()
+            };
+            // At rest each value draws the same way every time, and values
+            // differ from each other (9, 10, 99, 100: digit counts change)
+            let rest = [9, 10, 99, 100].map(|p| number(at(p)));
+            for (i, p) in [9, 10, 99, 100].into_iter().enumerate() {
+                assert_eq!(number(at(p)), rest[i], "{dpi}: {p} at rest is stable");
+                assert!(
+                    rest[i].iter().any(|&c| (c >> 8) & 0xFF > 100),
+                    "{dpi}: {p} drawn"
+                );
+            }
+            assert_ne!(rest[0], rest[1]);
+            assert_ne!(rest[2], rest[3]);
+            // The leading cells stay blank below 10 / 100 (right-aligned,
+            // nothing shifts): 9 has ink only in the ones cell
+            let cell_w = (t.right - t.left) as usize;
+            let rows = rest[0].len() / cell_w;
+            let glyphs = renderer.digit_glyphs(&dims, t.height()).unwrap().cell;
+            let ones_left = (t.width() - glyphs).floor() as usize;
+            let ink_left = (0..rows)
+                .flat_map(|r| (0..cell_w).map(move |x| (r, x)))
+                .filter(|&(r, x)| (rest[0][r * cell_w + x] >> 8) & 0xFF > 40)
+                .map(|(_, x)| x)
+                .min()
+                .unwrap();
+            assert!(ink_left + 1 >= ones_left, "{dpi}: 9 sits in the ones cell");
+            // Mid-roll (9 -> 10, ones wheel half way, turning fast): neither
+            // number, and drawn
+            let mid = crate::hud::HudView {
+                percent: 10,
+                digits: [0.0, 0.5, 9.5],
+                digit_speed: [0.0, 8.0, 30.0],
+                ..Default::default()
+            };
+            let rolling = number(mid);
+            assert_ne!(rolling, rest[0]);
+            assert_ne!(rolling, rest[1]);
+            assert!(rolling.iter().any(|&c| (c >> 8) & 0xFF > 40));
+        }
+        renderer.set_hud(crate::hud::HudView::default());
+    }
+
+    #[test]
+    fn test_stretch_deforms_one_outline_with_hits_and_bounds_at_all_dpis() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+            WS_POPUP,
+        };
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                windows::core::w!("STATIC"),
+                None,
+                WS_POPUP,
+                -30000,
+                -30000,
+                1,
+                1,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        let clock = ClockDateState::from_pure_components(2026, 10, 6, 2, 0, 47, 0, 0, false);
+        let renderer = Renderer::new().unwrap();
+        let alpha = |p: u32| p >> 24;
+        for dpi in ALL_DPIS {
+            let dims = NotchDimensions::from_state_and_dpi(NotchState::Collapsed, dpi);
+            let (w, h) = (dims.width as usize, dims.height as usize);
+            // The volume HUD on show: its icon, slider and number must not move
+            let frame = |stretch: f32| {
+                renderer.set_hud(crate::hud::HudView {
+                    level: 1.0,
+                    percent: 100,
+                    presence: 1.0,
+                    stretch,
+                    ..Default::default()
+                });
+                renderer.render(hwnd, 0, 0, &dims, false, &clock).unwrap();
+                renderer.surface(dims.height)
+            };
+            let (plain, stride) = frame(0.0);
+            assert_eq!(renderer.content_offset(), (0.0, 0.0));
+            let grow = crate::config::BASE_HUD_STRETCH_WIDTH * dims.scale;
+            let ext = grow.ceil() as usize;
+            // The body's side walls (inside the top shoulders), inside their
+            // border strokes (which move with them), a row well above the
+            // bottom, and the bottom row
+            let r = dims.curvature.top_transition_radius;
+            let (wall_l, wall_r) = (r.ceil() as usize + 1, (w as f32 - r).floor() as usize - 1);
+            let b = dims.border_width.ceil() as usize + 1;
+            // (and clear of the bottom corners, which move with their wall)
+            let rb = dims.curvature.bottom_radius.ceil() as usize;
+            let (inner_l, inner_r) = (wall_l + b + rb, wall_r - b - rb);
+            let y = h / 3;
+            let bottom = h - 1;
+            let px = |buf: &[u32], x: usize, y: usize| alpha(buf[y * stride + x]);
+            // Every pixel between the walls: the HUD's content and the body
+            let content_still = |buf: &[u32], shift: usize, what: &str| {
+                for row in 0..h - 2 {
+                    for x in inner_l..inner_r {
+                        assert_eq!(
+                            buf[row * stride + x + shift],
+                            plain[row * stride + x],
+                            "{dpi} {what}: content moved at ({x}, {row})"
+                        );
+                    }
+                }
+            };
+
+            // Stretched right: the left wall exactly where it was, the right
+            // wall `grow` further out, full height; one solid body
+            let (right, _) = frame(1.0);
+            content_still(&right, 0, "right");
+            let wall_x = wall_l - 2;
+            assert_eq!(
+                px(&right, wall_x, y),
+                px(&plain, wall_x, y),
+                "{dpi}: left anchored"
+            );
+            assert_eq!(px(&right, wall_l + 2, y), 255);
+            let new = (w as f32 - r + grow / 2.0) as usize;
+            assert_eq!(px(&plain, new, y), 0, "{dpi}: was outside");
+            assert_eq!(px(&right, new, y), 255, "{dpi}: stretched body");
+            assert_eq!(
+                px(&right, (w as f32 - r + grow) as usize + 3, y),
+                0,
+                "{dpi}: ends"
+            );
+            for x in [w / 4, w / 2, 3 * w / 4] {
+                assert_eq!(
+                    px(&right, x, bottom),
+                    px(&plain, x, bottom),
+                    "{dpi}: full height"
+                );
+            }
+            // Hit testing follows the drawn shape
+            assert_eq!(renderer.hits(new as f32, y as f32), Some(true));
+            assert_eq!(
+                renderer.hits((w / 2) as f32, bottom as f32 + 0.5),
+                Some(true)
+            );
+            assert_eq!(renderer.content_offset(), (0.0, 0.0));
+
+            // Stretched left: the window starts `ext` further left; the right
+            // wall stays put on screen
+            let (left, _) = frame(-1.0);
+            content_still(&left, ext, "left");
+            let screen = |x: usize| x + ext; // plain x -> surface x
+            let wall_x = wall_r + 2;
+            assert_eq!(
+                px(&left, screen(wall_x), y),
+                px(&plain, wall_x, y),
+                "{dpi}: right anchored"
+            );
+            let new = (r - grow / 2.0) as isize; // plain coordinates (may be < 0)
+            assert_eq!(
+                px(&left, (new + ext as isize) as usize, y),
+                255,
+                "{dpi}: stretched"
+            );
+            assert_eq!(
+                px(&left, screen(w / 2), bottom),
+                px(&plain, w / 2, bottom),
+                "{dpi}"
+            );
+            // Drawn `ext` in: on screen, exactly where it was
+            assert_eq!(renderer.content_offset(), (ext as f32, 0.0));
+            assert_eq!(
+                renderer.hits((new + ext as isize) as f32, y as f32),
+                Some(true),
+                "{dpi}: hit on the stretched part"
+            );
+
+            // Back at rest: exactly the original frame (the uploaded columns)
+            let (rest, _) = frame(0.0);
+            for row in 0..h {
+                let range = row * stride..row * stride + w;
+                assert_eq!(rest[range.clone()], plain[range], "{dpi}: row {row}");
+            }
+            assert_eq!(renderer.content_offset(), (0.0, 0.0));
+            assert_eq!(
+                renderer.hits((w / 2) as f32, bottom as f32 + 0.5),
+                Some(true)
+            );
+        }
+        renderer.set_hud(crate::hud::HudView::default());
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
     }
 
     /// Blue-dominant pixel (the test accent) somewhere inside `r`.
@@ -10089,6 +11510,138 @@ mod tests {
         }
     }
 
+    /// Cost of a whole collapsed HUD frame (`render`: draw + upload to an
+    /// off-screen layered window) at 100-300% scaling: the plain collapsed
+    /// notch, the HUD settled in the widened notch, and mid icon morph and
+    /// crossfade. Run with `cargo test --release bench_hud -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_hud_frame_cost() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, SW_SHOWNOACTIVATE, ShowWindow, WS_EX_LAYERED,
+            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+        };
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                windows::core::w!("STATIC"),
+                None,
+                WS_POPUP,
+                -30000,
+                -30000,
+                1,
+                1,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+        let clock = ClockDateState::from_pure_components(2026, 10, 6, 2, 0, 47, 0, 0, false);
+        let views = [
+            ("plain", crate::hud::HudView::default(), 0.0),
+            (
+                "hud",
+                crate::hud::HudView {
+                    level: 0.62,
+                    percent: 62,
+                    digits: crate::hud::digit_targets(62),
+                    waves: 2.0,
+                    presence: 1.0,
+                    ..Default::default()
+                },
+                1.0,
+            ),
+            (
+                "rolling",
+                crate::hud::HudView {
+                    level: 0.64,
+                    percent: 64,
+                    digits: [0.0, 6.4, 63.6],
+                    digit_speed: [0.0, 4.0, 30.0],
+                    waves: 2.0,
+                    presence: 1.0,
+                    ..Default::default()
+                },
+                1.0,
+            ),
+            (
+                "morph",
+                crate::hud::HudView {
+                    level: 0.5,
+                    percent: 40,
+                    digits: crate::hud::digit_targets(40),
+                    waves: 1.0,
+                    muted: 0.5,
+                    presence: 0.6,
+                    ..Default::default()
+                },
+                0.6,
+            ),
+            (
+                "notice",
+                crate::hud::HudView {
+                    presence: 0.7,
+                    notice: 1.0,
+                    power_saving: 0.5,
+                    ..Default::default()
+                },
+                1.0,
+            ),
+            (
+                "stretch",
+                crate::hud::HudView {
+                    level: 1.0,
+                    percent: 100,
+                    digits: crate::hud::digit_targets(100),
+                    waves: 3.0,
+                    presence: 1.0,
+                    stretch: -1.0,
+                    ..Default::default()
+                },
+                1.0,
+            ),
+        ];
+        for dpi in [96u32, 144, 192, 240, 288] {
+            let renderer = Renderer::new().expect("renderer");
+            let base = NotchDimensions::from_state_and_dpi(NotchState::Collapsed, dpi);
+            let mut line = format!("BENCH hud {:>3}%:", dpi * 100 / 96);
+            for (name, view, widen) in views {
+                let mut dims = base;
+                dims.width = crate::hud::widened_width(
+                    base.width,
+                    crate::config::BASE_HUD_EXTRA_WIDTH * widen,
+                    base.scale,
+                );
+                renderer.set_hud(view);
+                let frame = || {
+                    renderer
+                        .render(hwnd, -30000, -30000, &dims, false, &clock)
+                        .unwrap()
+                };
+                for _ in 0..100 {
+                    frame();
+                }
+                let n = 1000;
+                let t = std::time::Instant::now();
+                for _ in 0..n {
+                    frame();
+                }
+                let us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+                line += &format!(" {name} {us:.0} us ({} px)", dims.width);
+            }
+            eprintln!("{line}");
+        }
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+
     /// timings; run with `cargo test --release bench_visualizer -- --ignored
     /// --nocapture`.
     #[test]
@@ -10650,6 +12203,66 @@ mod tests {
     }
 
     #[test]
+    fn test_thumbnail_corners_follow_the_frame_curve_symmetrically() {
+        for (radius, smoothing) in [(9.0f32, 0.0f32), (12.0, 1.0), (7.5, 1.0)] {
+            let corner = CornerProfile::new(radius, smoothing, f32::MAX);
+            let (w, h) = (61u32, 37u32);
+            let c = CornerCoverage::new(w, h, corner);
+            // All four corners mirror each other exactly
+            for y in 0..h {
+                for x in 0..w {
+                    let v = c.at(x, y);
+                    assert_eq!(v, c.at(w - 1 - x, y), "left / right at ({x}, {y})");
+                    assert_eq!(v, c.at(x, h - 1 - y), "top / bottom at ({x}, {y})");
+                }
+            }
+            // Straight edges are whole; the very corner is clear
+            assert_eq!(c.at(w / 2, 0), 1.0);
+            assert_eq!(c.at(0, h / 2), 1.0);
+            assert_eq!(c.at(0, 0), 0.0);
+            // Along the corner's diagonal the coverage changes where the
+            // frame's own curve passes (not a different curve)
+            let (mx, my) = corner.point(0.5);
+            let (cx, cy) = (mx, corner.span - my);
+            let (px, py) = (cx.floor() as u32, cy.floor() as u32);
+            let inside = c.at(px + 2, py + 2);
+            let outside = c.at(px.saturating_sub(2), py.saturating_sub(2));
+            assert!(
+                inside > 0.9 && outside < 0.1,
+                "{radius} {smoothing}: {inside} {outside}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nested_corner_runs_parallel_to_its_frame() {
+        for smoothing in [0.0f32, 1.0] {
+            let outer = CornerProfile::new(15.6, smoothing, f32::MAX);
+            for d in [1.0f32, 2.5, 3.0, 4.5] {
+                let inner = outer.nested(d);
+                assert_eq!(inner.handle, outer.handle, "same curve family");
+                assert!((inner.span - (outer.span - d)).abs() < 1e-5);
+                // Bottom-left corners: the outer walls at x = 0 / y = 0, the
+                // inner ones `d` inside. At the curves' midpoints the gap is
+                // the same `d` as along the straight edges
+                let (ox, oy) = outer.point(0.5);
+                let (ix, iy) = inner.point(0.5);
+                let outer_mid = (ox, -(outer.span - oy));
+                let inner_mid = (d + ix, -(d + inner.span - iy));
+                let gap = (outer_mid.0 - inner_mid.0).hypot(outer_mid.1 - inner_mid.1);
+                assert!(
+                    (gap - d).abs() <= 0.12 * d,
+                    "{smoothing} {d}: diagonal gap {gap} vs edge gap {d}"
+                );
+            }
+        }
+        assert_eq!(
+            CornerProfile::new(3.0, 1.0, f32::MAX).nested(10.0).span,
+            0.0
+        );
+    }
+
+    #[test]
     fn test_clipboard_thumbnail_center_crop_and_rounded() {
         // 300x100: green | orange | blue thirds; the centre square is orange
         let (w, h) = (300u32, 100u32);
@@ -10662,12 +12275,12 @@ mod tests {
             .collect();
         let src = Artwork::new(w, h, px).unwrap();
         // A wide tile: the centre 3:1 band is the whole image, never stretched
-        let wide = thumbnail(&src, 60, 20, 0.0);
+        let wide = thumbnail(&src, 60, 20, CornerProfile::new(0.0, 0.0, f32::MAX));
         assert_eq!((wide.width, wide.height), (60, 20));
         let wide_at = |x: usize| &wide.pixels[(10 * 60 + x) * 4..(10 * 60 + x) * 4 + 4];
         assert_eq!(wide_at(5)[1], 0xFF, "green third on the left");
         assert_eq!(wide_at(55)[0], 0xFF, "blue third on the right");
-        let t = thumbnail(&src, 20, 20, 5.0);
+        let t = thumbnail(&src, 20, 20, CornerProfile::new(5.0, 0.0, f32::MAX));
         assert_eq!(
             (t.width, t.height),
             (20, 20),
@@ -10964,6 +12577,47 @@ mod tests {
     }
 
     #[test]
+    fn test_timer_text_uses_bundled_sunghyun_sans_bold() {
+        use windows::Win32::Graphics::DirectWrite::DWRITE_FONT_SIMULATIONS_NONE;
+        let renderer = Renderer::new().expect("renderer");
+        let font = timer_font(&renderer.dwrite_factory);
+        // Unmodified OpenType (CFF), embedded privately: on every PC
+        assert!(TIMER_BUNDLED_FONT.starts_with(b"OTTO"));
+        assert_eq!(font.name, "Sunghyun Sans");
+        let collection = font.collection.clone().expect("bundled collection");
+        let (mut index, mut exists) = (0u32, windows::core::BOOL(0));
+        unsafe { collection.FindFamilyName(font.family, &mut index, &mut exists) }.unwrap();
+        assert!(exists.as_bool());
+        let family = unsafe { collection.GetFontFamily(index) }.unwrap();
+        let face = unsafe {
+            family.GetFirstMatchingFont(
+                DWRITE_FONT_WEIGHT(700),
+                DWRITE_FONT_STRETCH_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+            )
+        }
+        .unwrap();
+        // The real Bold, not a synthesized one
+        assert_eq!(unsafe { face.GetWeight() }, DWRITE_FONT_WEIGHT(700));
+        assert_eq!(
+            unsafe { face.GetSimulations() },
+            DWRITE_FONT_SIMULATIONS_NONE
+        );
+        let dims = NotchDimensions::from_state_and_dpi(NotchState::Expanded, 96);
+        let formats = renderer.media_formats(&dims).unwrap();
+        // Numerals, scale labels and pills alike
+        for format in [
+            &formats.timer_display,
+            &formats.timer_label,
+            &formats.timer_pill,
+        ] {
+            assert_eq!(format_family(format), "Sunghyun Sans");
+            assert_eq!(unsafe { format.GetFontWeight() }, DWRITE_FONT_WEIGHT(700));
+            assert_eq!(unsafe { format.GetFontCollection() }.unwrap(), collection);
+        }
+    }
+
+    #[test]
     fn test_every_notch_text_role_uses_the_ui_font() {
         let renderer = Renderer::new().expect("renderer");
         let font = ui_font(&renderer.dwrite_factory);
@@ -11211,8 +12865,8 @@ mod tests {
         let mut paused = running;
         paused.primary(now);
         let mut done = Countdown::default();
-        done.set_stop(0);
-        done.primary(now - std::time::Duration::from_secs(10));
+        done.set_stop(crate::timer::stop_of(60).unwrap(), now);
+        done.primary(now - std::time::Duration::from_secs(70));
         assert!(done.poll(now).is_some());
         [
             ("idle", idle),
@@ -11257,17 +12911,25 @@ mod tests {
                     let (px, stride) = expanded_frame(&renderer, &dims);
                     let idle = name == "idle";
                     let at = format!("{name} at {dpi} (media: {})", media.is_some());
-                    assert!(lit_in(&px, stride, l.display(idle), 60), "numerals, {at}");
-                    // Orange numerals while it runs and once done; white
-                    // during setup, dimmed while paused
-                    let orange = timer_in(&px, stride, l.display(idle));
-                    assert_eq!(orange, matches!(name, "running" | "done"), "{at}");
+                    assert!(lit_in(&px, stride, l.numerals, 60), "numerals, {at}");
+                    // Orange numerals in setup, while it runs and once done;
+                    // dimmed while paused
+                    let orange = timer_in(&px, stride, l.numerals);
+                    assert_eq!(orange, name != "paused", "{at}");
                     assert!(timer_in(&px, stride, l.primary), "primary button, {at}");
                     assert_eq!(lit_in(&px, stride, l.cancel, 60), !idle, "Cancel, {at}");
-                    // Setup: the scale with its orange indicator; otherwise
-                    // a quiet status line
-                    assert!(lit_in(&px, stride, l.row, 40), "row, {at}");
-                    assert_eq!(timer_in(&px, stride, l.row), idle, "indicator, {at}");
+                    // Both mode pills, and the scale lit in orange up to the
+                    // pointer (nothing lit once done)
+                    for pill in l.modes {
+                        assert!(lit_in(&px, stride, pill, 40), "pill, {at}");
+                    }
+                    assert!(lit_in(&px, stride, l.ruler, 40), "ruler, {at}");
+                    assert_eq!(
+                        timer_in(&px, stride, l.ruler),
+                        name != "done",
+                        "lit ticks, {at}"
+                    );
+                    assert!(timer_in(&px, stride, l.pointer), "pointer, {at}");
                     // The rest of Home is still there
                     match &media {
                         Some(c) => {
@@ -11291,12 +12953,12 @@ mod tests {
     }
 
     #[test]
-    fn test_long_timer_numerals_fit_before_the_buttons_at_all_dpis() {
+    fn test_long_timer_numerals_fit_their_column_at_all_dpis() {
         let renderer = Renderer::new().expect("renderer");
         renderer.set_space(OecaSpace::Home);
         let now = std::time::Instant::now();
         let mut longest = crate::timer::Countdown::default();
-        longest.set_stop(crate::timer::STOPS.len() - 1); // 12:00:00
+        longest.set_stop(crate::timer::STOP_COUNT - 1, now); // 2:00:00
         let mut running = longest;
         running.primary(now);
         for dpi in ALL_DPIS {
@@ -11313,14 +12975,14 @@ mod tests {
                         ..Default::default()
                     });
                     let (px, stride) = expanded_frame(&renderer, &dims);
-                    let d = l.display(idle);
-                    let first = if idle { l.primary } else { l.cancel };
-                    // Scaled to fit: nothing between the numerals and the buttons
-                    let gap = RectF::new(d.right + 1.0, d.top, first.left - 1.0, d.bottom);
+                    let d = l.numerals;
+                    // Scaled to fit: nothing spills left into the column gap
+                    let spacing = (crate::config::BASE_TIMER_COLUMN_SPACING * dims.scale).round();
+                    let gap = RectF::new(d.left - spacing + 2.0, d.top, d.left - 1.0, d.bottom);
                     assert!(!lit_in(&px, stride, gap, 30), "overflow at {dpi} {idle}");
-                    let before =
-                        RectF::new(l.panel.left - 6.0, d.top, l.panel.left - 1.0, d.bottom);
-                    assert!(!lit_in(&px, stride, before, 30), "left spill at {dpi}");
+                    let after =
+                        RectF::new(l.panel.right + 1.0, d.top, l.panel.right + 6.0, d.bottom);
+                    assert!(!lit_in(&px, stride, after, 30), "right spill at {dpi}");
                     assert!(lit_in(&px, stride, d, 60), "drawn at {dpi}");
                 }
             }
@@ -11587,6 +13249,7 @@ mod tests {
                     collapsed: countdown,
                     slot: 1.0,
                     pulse: 1.0,
+                    ..Default::default()
                 });
                 let (px, stride) = render_collapsed_frame(&renderer, &dims);
                 assert!(timer_in(&px, stride, slot), "slot at {dpi}");
@@ -11601,6 +13264,7 @@ mod tests {
                 collapsed: running,
                 slot: 1.0,
                 pulse: 1.0,
+                ..Default::default()
             });
             let (px, stride) = render_collapsed_frame(&renderer, &dims);
             assert!(
@@ -11613,6 +13277,7 @@ mod tests {
                 collapsed: running,
                 slot: 0.0,
                 pulse: 1.0,
+                ..Default::default()
             });
             let (px, stride) = render_collapsed_frame(&renderer, &dims);
             assert!(
@@ -11641,6 +13306,7 @@ mod tests {
                 collapsed: done,
                 slot: 1.0,
                 pulse,
+                ..Default::default()
             });
             let (px, stride) = render_collapsed_frame(&renderer, &dims);
             (slot.top as usize..slot.bottom as usize)

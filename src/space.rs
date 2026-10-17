@@ -64,6 +64,14 @@ pub struct OecaSettings {
     /// Oeca starts when the user signs in (a per-user Run entry; Settings >
     /// General). Off by default; always mirrors the actual registration.
     pub start_on_launch: bool,
+    /// The timer's Focus and Break durations (seconds: stops of its scale,
+    /// 30 s to 2 h). 25 and 5 minutes by default.
+    pub focus_secs: u32,
+    pub break_secs: u32,
+    /// Oeca asks GitHub Releases for a newer version once a day (Settings >
+    /// About). Off by default: Oeca makes no network request unless the
+    /// user turns this on or checks by hand.
+    pub check_for_updates: bool,
 }
 
 impl Default for OecaSettings {
@@ -79,6 +87,9 @@ impl Default for OecaSettings {
             show_visualizer: true,
             collapse_delay: crate::config::CollapseDelay::Zero,
             start_on_launch: false,
+            focus_secs: crate::timer::Mode::Focus.default_secs(),
+            break_secs: crate::timer::Mode::Break.default_secs(),
+            check_for_updates: false,
         }
     }
 }

@@ -115,7 +115,7 @@ Oeca/
 
 ## Privacy
 
-Oeca makes no network requests: it has no telemetry, analytics, crash reporting or update checks. Its settings and its clipboard history are stored only on your PC, in `%LOCALAPPDATA%\Oeca`; the clipboard history is not encrypted and is discarded when you sign out or restart Windows. The full [privacy policy](website/app/privacy/page.tsx) covers the app, the installer and the website. It will also be published on the Oeca website once that is online.
+Oeca makes no network requests unless you ask it to check for updates: from version 0.3.0, Check for updates (Settings, About) and the optional Check for updates automatically setting, off by default, send one HTTPS request to GitHub's public releases API, with no account or personal data. Oeca never downloads or installs anything itself, and it has no telemetry, analytics or crash reporting. Its settings and its clipboard history are stored only on your PC, in `%LOCALAPPDATA%\Oeca`; the clipboard history is not encrypted and is discarded when you sign out or restart Windows. The full [privacy policy](website/app/privacy/page.tsx) covers the app, the installer and the website. It will also be published on the Oeca website once that is online.
 
 ## Code signing policy
 
@@ -137,7 +137,7 @@ Oeca is free and open-source software, released under the [MIT License](LICENSE)
 
 Oeca was first published under the MIT License, including the v0.1.0 release. For a short time one commit (`c627fd2`) replaced it with a proprietary source-available licence; that change has been reversed, and it never revoked any rights granted under the MIT License.
 
-Third-party components keep their own licences. Those shipped with Oeca, Microsoft's `windows` crates (MIT), the General Sans typeface embedded in official builds (ITF Free Font License, not open source) and Inno Setup, are listed with their notices in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt), which the installer places beside `Oeca.exe`.
+Third-party components keep their own licences. Those shipped with Oeca, Microsoft's `windows` crates (MIT), the General Sans typeface embedded in official builds (ITF Free Font License, not open source), the Sunghyun Sans typeface used by the timer (SIL Open Font License 1.1) and Inno Setup, are listed with their notices in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt), which the installer places beside `Oeca.exe`.
 
 - Icons in the app: Oeca's own, drawn from simple shapes by [assets/icons/generate.py](assets/icons/generate.py) and covered by the MIT License like the rest of the code.
 - Screenshots of Oeca 0.1.0 in this README and on the website show its earlier icons, [designed by UIcons from Flaticon](https://www.flaticon.com/uicons), used under Flaticon's free licence with attribution.

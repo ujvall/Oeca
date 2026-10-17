@@ -80,6 +80,54 @@ pub const WM_APP_SETTINGS_CAPACITY: u32 = WM_APP + 32;
 /// Posted to the notch window when a closing delay is chosen (wParam: the
 /// `CollapseDelay` index). The notch applies it and calls `sync`.
 pub const WM_APP_SETTINGS_DELAY: u32 = WM_APP + 33;
+/// Posted to the notch window from About's update row (wParam: the
+/// `UpdateRequest` index). The notch acts and calls `sync_update`.
+pub const WM_APP_SETTINGS_UPDATE: u32 = WM_APP + 34;
+
+/// What About's update row asks the notch for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateRequest {
+    /// Check now (joins a check already running).
+    Check,
+    /// Open the newest validated release page.
+    ViewRelease,
+}
+
+impl UpdateRequest {
+    pub fn from_index(i: usize) -> Option<Self> {
+        [Self::Check, Self::ViewRelease].get(i).copied()
+    }
+}
+
+/// About's "Updates" section: the installed version (this build's), the
+/// two buttons, and the status line under the version.
+pub const UPDATES_SECTION: &str = "Updates";
+pub const INSTALLED_LABEL: &str = concat!("Oeca ", env!("CARGO_PKG_VERSION"));
+pub const INSTALLED_DESCRIPTION: &str = "Installed version";
+pub const CHECK_LABEL: &str = "Check for updates";
+pub const VIEW_LABEL: &str = "View release";
+
+/// The status line for an update state: a failed check says so, without
+/// hiding a newer release already known.
+pub fn status_line(status: crate::update::Status) -> String {
+    use crate::update::Check;
+    let available = status
+        .available
+        .map(|(a, b, c)| format!("Oeca {a}.{b}.{c} is available."));
+    match (status.check, available) {
+        (Check::Checking, _) => "Checking for updates\u{2026}".into(),
+        (Check::Failed, Some(available)) => format!("Couldn't check for updates. {available}"),
+        (Check::Failed, None) => "Couldn't check for updates. Try again later.".into(),
+        (_, Some(available)) => available,
+        (Check::Done, None) => "You're up to date.".into(),
+        (Check::Idle, None) => "Not checked for updates yet.".into(),
+    }
+}
+
+/// A check is running (the check button is disabled).
+fn checking(status: Option<crate::update::Status>) -> bool {
+    status.is_some_and(|s| s.check == crate::update::Check::Checking)
+}
 /// The Settings window's switch-animation frame timer (runs only while a
 /// switch slides).
 const SWITCH_TIMER_ID: usize = 1;
@@ -195,7 +243,8 @@ impl Category {
     pub fn controls(self) -> &'static [Control] {
         match self {
             Self::General => &Control::ALL[..5],
-            Self::Media => &Control::ALL[5..],
+            Self::Media => &Control::ALL[5..7],
+            Self::About => &Control::ALL[7..],
             _ => &[],
         }
     }
@@ -241,6 +290,8 @@ pub enum Control {
     StartOnLaunch,
     ShowSourceApp,
     ShowVisualizer,
+    /// About's opt-in daily update check.
+    CheckForUpdates,
 }
 
 /// General's sections: a heading over its rows (in `Control::ALL` order).
@@ -257,7 +308,7 @@ pub const SECTIONS: [(&str, &[Control]); 2] = [
 ];
 
 impl Control {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::AlwaysOnTop,
         Self::ReducedMotion,
         Self::CloseOnEscape,
@@ -265,6 +316,7 @@ impl Control {
         Self::StartOnLaunch,
         Self::ShowSourceApp,
         Self::ShowVisualizer,
+        Self::CheckForUpdates,
     ];
 
     pub fn index(self) -> usize {
@@ -284,6 +336,7 @@ impl Control {
             Self::StartOnLaunch => "Start on launch",
             Self::ShowSourceApp => "Show source app",
             Self::ShowVisualizer => "Show visualizer",
+            Self::CheckForUpdates => "Check for updates automatically",
         }
     }
 
@@ -296,6 +349,7 @@ impl Control {
             Self::StartOnLaunch => "Open Oeca when you sign in to Windows",
             Self::ShowSourceApp => "App icon on the Home artwork",
             Self::ShowVisualizer => "Animated bars in the Music space",
+            Self::CheckForUpdates => "Once a day, ask GitHub for a newer version",
         }
     }
 
@@ -308,6 +362,7 @@ impl Control {
             Self::StartOnLaunch => "StartOnLaunch",
             Self::ShowSourceApp => "ShowSourceApp",
             Self::ShowVisualizer => "ShowVisualizer",
+            Self::CheckForUpdates => "AutoCheckForUpdates",
         }
     }
 
@@ -321,6 +376,7 @@ impl Control {
             Self::StartOnLaunch => &mut settings.start_on_launch,
             Self::ShowSourceApp => &mut settings.show_source_app,
             Self::ShowVisualizer => &mut settings.show_visualizer,
+            Self::CheckForUpdates => &mut settings.check_for_updates,
         };
         *value = !*value;
     }
@@ -335,6 +391,7 @@ impl Control {
             Self::StartOnLaunch => settings.start_on_launch,
             Self::ShowSourceApp => settings.show_source_app,
             Self::ShowVisualizer => settings.show_visualizer,
+            Self::CheckForUpdates => settings.check_for_updates,
         }
     }
 }
@@ -350,6 +407,10 @@ pub enum Target {
     Capacity(ClipboardCapacity),
     /// A General closing-delay segment.
     Delay(CollapseDelay),
+    /// About's "Check for updates" button.
+    UpdateCheck,
+    /// About's "View release" button (only while an update is available).
+    ViewRelease,
 }
 
 /// Navigation state: the selected page and keyboard focus. Separate from the
@@ -360,6 +421,8 @@ pub struct Nav {
     pub focus: Target,
     /// Focus ring shown (after keyboard navigation).
     pub focus_visible: bool,
+    /// An update is available: About offers "View release".
+    pub release: bool,
 }
 
 impl Default for Nav {
@@ -368,6 +431,7 @@ impl Default for Nav {
             category: Category::General,
             focus: Target::Category(Category::General),
             focus_visible: false,
+            release: false,
         }
     }
 }
@@ -402,7 +466,17 @@ impl Nav {
                     .iter()
                     .map(|c| Target::Capacity(*c)),
             )
+            .chain(self.update_buttons())
             .collect()
+    }
+
+    /// About's update buttons, left to right.
+    fn update_buttons(self) -> Vec<Target> {
+        if self.category != Category::About {
+            return Vec::new();
+        }
+        let view = self.release.then_some(Target::ViewRelease);
+        view.into_iter().chain([Target::UpdateCheck]).collect()
     }
 
     /// Shows a page. Focus stays put unless it was on a control of another page.
@@ -454,6 +528,11 @@ impl Nav {
             Target::Delay(d) => {
                 Target::Delay(CollapseDelay::ALL[step(d.index(), CollapseDelay::ALL.len())])
             }
+            Target::UpdateCheck | Target::ViewRelease => {
+                let buttons = self.update_buttons();
+                let i = buttons.iter().position(|t| *t == self.focus).unwrap_or(0);
+                buttons[step(i, buttons.len())]
+            }
         };
         self.focus_visible = true;
         self.focus
@@ -481,8 +560,8 @@ pub struct WindowLayout {
     /// General's section headings, in `SECTIONS` order.
     pub sections: [RectF; 2],
     /// The switch rows, in `Control::ALL` order: General's two sections,
-    /// then Media's (in General's first section's place).
-    pub rows: [Row; 7],
+    /// then Media's and About's (in General's first section's place).
+    pub rows: [Row; 8],
     /// Appearance's section headings, in `APPEARANCE_SECTIONS` order.
     pub appearance_sections: [RectF; 2],
     /// Appearance's swatches (each a square hit target), in
@@ -503,6 +582,16 @@ pub struct WindowLayout {
     pub closing_description: RectF,
     pub closing_row: RectF,
     pub closing: [RectF; 4],
+    /// About's update row (under its "Updates" heading, in General's first
+    /// section's place): the installed version over its caption, the
+    /// buttons at the row's right end ("View release" left of "Check"),
+    /// then the status line under the row, across the page.
+    pub update_title: RectF,
+    pub update_description: RectF,
+    pub update_status: RectF,
+    pub update_row: RectF,
+    pub update_check: RectF,
+    pub update_view: RectF,
 }
 
 /// An `N`-segment selector at the right end of a row starting at `top`, and
@@ -546,11 +635,12 @@ pub fn layout(width: f32, height: f32) -> WindowLayout {
     });
     let rows = std::array::from_fn(|i| {
         // "Notch" holds rows 0-1, "Window behavior" 2-4; Media's rows (5, 6)
-        // sit where General's first section's do
+        // and About's (7) sit where General's first section's do
         let (section, slot) = match i {
             0 | 1 => (0, i),
             2..=4 => (1, i - 2),
-            _ => (0, i - 5),
+            5 | 6 => (0, i - 5),
+            _ => (0, 0),
         };
         let top = section_top(section) + SECTION_HEIGHT + slot as f32 * ROW_HEIGHT;
         let switch = RectF::new(right - 40.0, top + 21.0, right, top + 43.0);
@@ -606,6 +696,20 @@ pub fn layout(width: f32, height: f32) -> WindowLayout {
     let closing_description =
         RectF::new(left, closing_top + 32.0, closing_right, closing_top + 52.0);
     let closing_row = RectF::new(left, closing_top, right, closing_top + ROW_HEIGHT);
+    // About: under the automatic-check switch, one row (the version at its
+    // left, two buttons at its right, the selectors' height), then the
+    // status line
+    const BUTTON_HEIGHT: f32 = 28.0;
+    let update_top = row_top + ROW_HEIGHT;
+    let button_top = update_top + 18.0;
+    let update_check = RectF::new(right - 140.0, button_top, right, button_top + BUTTON_HEIGHT);
+    let update_view = RectF::new(
+        update_check.left - 8.0 - 104.0,
+        button_top,
+        update_check.left - 8.0,
+        button_top + BUTTON_HEIGHT,
+    );
+    let update_text_right = update_view.left - 16.0;
     WindowLayout {
         sidebar: RectF::new(0.0, 0.0, SIDEBAR_WIDTH, height),
         items,
@@ -625,6 +729,27 @@ pub fn layout(width: f32, height: f32) -> WindowLayout {
         closing_description,
         closing_row,
         closing,
+        update_title: RectF::new(
+            left,
+            update_top + 12.0,
+            update_text_right,
+            update_top + 32.0,
+        ),
+        update_description: RectF::new(
+            left,
+            update_top + 32.0,
+            update_text_right,
+            update_top + 52.0,
+        ),
+        update_status: RectF::new(
+            left,
+            update_top + ROW_HEIGHT + 16.0,
+            right,
+            update_top + ROW_HEIGHT + 36.0,
+        ),
+        update_row: RectF::new(left, update_top, right, update_top + ROW_HEIGHT),
+        update_check,
+        update_view,
     }
 }
 
@@ -659,6 +784,15 @@ pub fn hit(width: f32, height: f32, category: Category, x: f32, y: f32) -> Optio
     {
         return Some(Target::Delay(d));
     }
+    if category == Category::About {
+        if l.update_check.contains(x, y) {
+            return Some(Target::UpdateCheck);
+        }
+        // Only while shown (see `hit_px`)
+        if l.update_view.contains(x, y) {
+            return Some(Target::ViewRelease);
+        }
+    }
     category
         .controls()
         .iter()
@@ -690,6 +824,8 @@ struct View {
     notch: HWND,
     /// Display copy of the notch's settings, replaced by `sync`.
     settings: OecaSettings,
+    /// Display copy of the notch's update state, replaced by `sync_update`.
+    update: crate::update::Status,
     nav: Nav,
     hover: Option<Target>,
     pressed: Option<Target>,
@@ -703,7 +839,7 @@ struct View {
     corrections: u8,
     /// Each switch's slide (`Control::ALL` order), and the last frame of the
     /// switch timer (Some only while it runs).
-    switches: [crate::renderer::SwitchAnim; 7],
+    switches: [crate::renderer::SwitchAnim; 8],
     switch_tick: Option<std::time::Instant>,
 }
 
@@ -784,6 +920,41 @@ pub fn sync(settings: OecaSettings) {
     if let Some((hwnd, old)) = changed {
         invalidate(hwnd);
         access::toggled(hwnd, old, settings);
+    }
+}
+
+/// Shows the notch's update state (after a check starts or ends, or as
+/// the window opens). "View release" leaves with the release (focus moves
+/// to "Check for updates").
+pub fn sync_update(status: crate::update::Status) {
+    let changed = with_view(|v| {
+        let old = v.update;
+        v.update = status;
+        v.nav.release = status.available.is_some();
+        if !v.nav.release && v.nav.focus == Target::ViewRelease {
+            v.nav.focus = Target::UpdateCheck;
+        }
+        (old != status).then_some(v.hwnd)
+    })
+    .flatten();
+    if let Some(hwnd) = changed {
+        invalidate(hwnd);
+        access::update_changed(hwnd);
+    }
+}
+
+/// Asks the notch to check for updates or open the release (it owns the
+/// update state and syncs back).
+fn request_update(request: UpdateRequest) {
+    if let Some(notch) = with_view(|v| v.notch) {
+        unsafe {
+            let _ = PostMessageW(
+                Some(notch),
+                WM_APP_SETTINGS_UPDATE,
+                WPARAM(request as usize),
+                LPARAM(0),
+            );
+        }
     }
 }
 
@@ -874,6 +1045,7 @@ fn create(notch: HWND, settings: OecaSettings) -> Result<HWND> {
             hwnd,
             notch,
             settings,
+            update: crate::update::Status::default(),
             nav: Nav::default(),
             hover: None,
             pressed: None,
@@ -1053,8 +1225,8 @@ fn client_size(hwnd: HWND) -> (f32, f32) {
 fn hit_px(hwnd: HWND, x: f32, y: f32) -> Option<Target> {
     let s = scale(hwnd);
     let (w, h) = client_size(hwnd);
-    let category = with_view(|v| v.nav.category).unwrap_or_default();
-    hit(w, h, category, x / s, y / s)
+    let nav = with_view(|v| v.nav).unwrap_or_default();
+    hit(w, h, nav.category, x / s, y / s).filter(|t| *t != Target::ViewRelease || nav.release)
 }
 
 /// Client point (physical px) of a mouse message.
@@ -1130,6 +1302,17 @@ fn activate(hwnd: HWND, target: Target) {
         Target::Accent(a) => request_accent(a),
         Target::Capacity(c) => request_capacity(c),
         Target::Delay(d) => request_delay(d),
+        // Disabled while a check runs; "View release" only with a release
+        Target::UpdateCheck => {
+            if !checking(with_view(|v| v.update)) {
+                request_update(UpdateRequest::Check);
+            }
+        }
+        Target::ViewRelease => {
+            if with_view(|v| v.nav.release) == Some(true) {
+                request_update(UpdateRequest::ViewRelease);
+            }
+        }
     }
 }
 
@@ -1558,6 +1741,47 @@ fn paint(v: &mut View) -> Result<()> {
         if category == Category::Media {
             text(MEDIA_SECTION, &v.formats.section, l.sections[0], &secondary);
         }
+        if category == Category::About {
+            text(
+                UPDATES_SECTION,
+                &v.formats.section,
+                l.sections[0],
+                &secondary,
+            );
+            text(INSTALLED_LABEL, &v.formats.body, l.update_title, &primary);
+            text(
+                INSTALLED_DESCRIPTION,
+                &v.formats.caption,
+                l.update_description,
+                &tertiary,
+            );
+            text(
+                &status_line(v.update),
+                &v.formats.caption,
+                l.update_status,
+                &tertiary,
+            );
+            let r = l.update_row;
+            let line = RectF::new(r.left, r.bottom - 1.0, r.right, r.bottom);
+            rt.FillRectangle(&line.to_d2d_rect(), &separator);
+            // Quiet pill buttons (the selectors' track); hover / press
+            // lifts them; disabled while a check runs
+            let checking = checking(Some(v.update));
+            let mut buttons = vec![(Target::UpdateCheck, l.update_check, CHECK_LABEL, !checking)];
+            if v.nav.release {
+                buttons.push((Target::ViewRelease, l.update_view, VIEW_LABEL, true));
+            }
+            for (target, r, label, enabled) in buttons {
+                let active = enabled && (v.hover == Some(target) || v.pressed == Some(target));
+                let fill = if active { &selected_fill } else { &hover_fill };
+                rt.FillRoundedRectangle(&rounded(r, r.height() / 2.0), fill);
+                let ink = if enabled { &primary } else { &tertiary };
+                text(label, &v.formats.segment, r, ink);
+                if v.nav.focus_visible && v.nav.focus == target {
+                    focus_ring(r, r.height() / 2.0);
+                }
+            }
+        }
         if category == Category::Clipboard {
             text(
                 CLIPBOARD_SECTION,
@@ -1717,6 +1941,11 @@ pub enum Element {
     /// A General closing-delay segment (a radio button: selected = the
     /// current delay).
     Delay(CollapseDelay),
+    /// About's installed version (text; its help text is the status line).
+    UpdateVersion,
+    /// About's update buttons (Invoke).
+    UpdateCheck,
+    ViewRelease,
 }
 
 impl From<Target> for Element {
@@ -1727,6 +1956,8 @@ impl From<Target> for Element {
             Target::Accent(a) => Self::Accent(a),
             Target::Capacity(c) => Self::Capacity(c),
             Target::Delay(d) => Self::Delay(d),
+            Target::UpdateCheck => Self::UpdateCheck,
+            Target::ViewRelease => Self::ViewRelease,
         }
     }
 }
@@ -1781,6 +2012,22 @@ impl Element {
                     .into_iter()
                     .flatten(),
             )
+            .chain(
+                (category == Category::About)
+                    .then(|| {
+                        let release = with_view(|v| v.nav.release) == Some(true);
+                        [
+                            Self::Section(6),
+                            Self::Control(Control::CheckForUpdates),
+                            Self::UpdateVersion,
+                        ]
+                        .into_iter()
+                        .chain(release.then_some(Self::ViewRelease))
+                        .chain([Self::UpdateCheck])
+                    })
+                    .into_iter()
+                    .flatten(),
+            )
             .collect()
     }
 
@@ -1792,12 +2039,16 @@ impl Element {
             Self::Section(k) if k < SECTIONS.len() => SECTIONS[k].0,
             Self::Section(4) => CLIPBOARD_SECTION,
             Self::Section(5) => MEDIA_SECTION,
+            Self::Section(6) => UPDATES_SECTION,
             Self::Section(k) => APPEARANCE_SECTIONS[k - SECTIONS.len()],
             Self::Control(c) => c.title(),
             Self::Accent(a) => a.name(),
             Self::Capacity(c) => c.name(),
             Self::Note(i) => CLIPBOARD_NOTES[i],
             Self::Delay(d) => d.name(),
+            Self::UpdateVersion => INSTALLED_LABEL,
+            Self::UpdateCheck => CHECK_LABEL,
+            Self::ViewRelease => VIEW_LABEL,
         }
     }
 
@@ -1823,6 +2074,9 @@ impl Element {
             Self::Capacity(c) => 400 + c.index() as i32,
             Self::Note(i) => 500 + i as i32,
             Self::Delay(d) => 600 + d.index() as i32,
+            Self::UpdateVersion => 700,
+            Self::UpdateCheck => 701,
+            Self::ViewRelease => 702,
             Self::Control(c) => 200 + c.index() as i32,
         }
     }
@@ -1895,7 +2149,8 @@ mod access {
         IRawElementProviderSimple,
         IRawElementProviderFragment,
         IToggleProvider,
-        ISelectionItemProvider
+        ISelectionItemProvider,
+        IInvokeProvider
     )]
     struct Item {
         hwnd: HWND,
@@ -2011,6 +2266,22 @@ mod access {
         }
     }
 
+    /// The update state changed: the status line (the version's and the
+    /// check button's help text) and the check button's enabled state.
+    pub(super) fn update_changed(hwnd: HWND) {
+        if !listening() {
+            return;
+        }
+        for element in [Element::UpdateVersion, Element::UpdateCheck] {
+            if is_live(hwnd, element) {
+                unsafe {
+                    let _ =
+                        UiaRaiseAutomationEvent(&item(hwnd, element), UIA_LiveRegionChangedEventId);
+                }
+            }
+        }
+    }
+
     /// Whether an element a client holds is still on screen: this window is
     /// the open one and the element belongs to the page showing. Elements of
     /// a page navigated away from (whose rects another page's controls may
@@ -2116,6 +2387,10 @@ mod access {
                 (self.element, id),
                 (Element::Control(_), UIA_TogglePatternId)
                     | (
+                        Element::UpdateCheck | Element::ViewRelease,
+                        UIA_InvokePatternId
+                    )
+                    | (
                         Element::Category(_)
                             | Element::Accent(_)
                             | Element::Capacity(_)
@@ -2203,12 +2478,35 @@ mod access {
                 }
                 (Element::Delay(_), UIA_HelpTextPropertyId) => var_str(CLOSING_TITLE),
                 (Element::Note(_), UIA_ControlTypePropertyId) => var_i32(UIA_TextControlTypeId.0),
+                (Element::UpdateVersion, UIA_ControlTypePropertyId) => {
+                    var_i32(UIA_TextControlTypeId.0)
+                }
+                (Element::UpdateVersion, UIA_LiveSettingPropertyId) => var_i32(Polite.0),
+                (Element::UpdateVersion | Element::UpdateCheck, UIA_HelpTextPropertyId) => {
+                    var_str(&status_line(with_view(|v| v.update).unwrap_or_default()))
+                }
+                (Element::UpdateCheck | Element::ViewRelease, UIA_ControlTypePropertyId) => {
+                    var_i32(UIA_ButtonControlTypeId.0)
+                }
+                (Element::UpdateCheck, UIA_AutomationIdPropertyId) => var_str("CheckForUpdates"),
+                (Element::ViewRelease, UIA_AutomationIdPropertyId) => var_str("ViewRelease"),
+                (Element::UpdateCheck, UIA_HasKeyboardFocusPropertyId) => {
+                    var_bool(focus == Some(Target::UpdateCheck))
+                }
+                (Element::ViewRelease, UIA_HasKeyboardFocusPropertyId) => {
+                    var_bool(focus == Some(Target::ViewRelease))
+                }
+                (Element::UpdateCheck, UIA_IsEnabledPropertyId) => {
+                    var_bool(!super::checking(with_view(|v| v.update)))
+                }
                 (
                     Element::Category(_)
                     | Element::Control(_)
                     | Element::Accent(_)
                     | Element::Capacity(_)
-                    | Element::Delay(_),
+                    | Element::Delay(_)
+                    | Element::UpdateCheck
+                    | Element::ViewRelease,
                     UIA_IsKeyboardFocusablePropertyId,
                 ) => var_bool(true),
                 (_, UIA_IsEnabledPropertyId) => var_bool(true),
@@ -2267,7 +2565,10 @@ mod access {
                 Element::Category(c) => l.items[c.index()],
                 Element::PageTitle => l.page_title,
                 Element::Section(k) if k < SECTIONS.len() => l.sections[k],
-                Element::Section(4 | 5) => l.sections[0],
+                Element::Section(4..=6) => l.sections[0],
+                Element::UpdateVersion => l.update_title,
+                Element::UpdateCheck => l.update_check,
+                Element::ViewRelease => l.update_view,
                 Element::Capacity(c) => l.capacity[c.index()],
                 Element::Delay(d) => l.closing[d.index()],
                 Element::Note(i) => l.clipboard_notes[i],
@@ -2296,7 +2597,12 @@ mod access {
                 Element::Accent(a) => Target::Accent(a),
                 Element::Capacity(c) => Target::Capacity(c),
                 Element::Delay(d) => Target::Delay(d),
-                Element::PageTitle | Element::Section(_) | Element::Note(_) => return Ok(()),
+                Element::UpdateCheck => Target::UpdateCheck,
+                Element::ViewRelease => Target::ViewRelease,
+                Element::PageTitle
+                | Element::Section(_)
+                | Element::Note(_)
+                | Element::UpdateVersion => return Ok(()),
             };
             with_view(|v| v.nav.focus = target);
             super::invalidate(self.hwnd);
@@ -2327,6 +2633,20 @@ mod access {
                 )),
                 _ => empty(),
             }
+        }
+    }
+
+    impl IInvokeProvider_Impl for Item_Impl {
+        fn Invoke(&self) -> Result<()> {
+            if !is_live(self.hwnd, self.element) {
+                return not_available();
+            }
+            match self.element {
+                Element::UpdateCheck => super::activate(self.hwnd, Target::UpdateCheck),
+                Element::ViewRelease => super::activate(self.hwnd, Target::ViewRelease),
+                _ => return empty(),
+            }
+            Ok(())
         }
     }
 
@@ -2396,7 +2716,8 @@ mod tests {
             Category::Media.controls(),
             [Control::ShowSourceApp, Control::ShowVisualizer]
         );
-        for c in [Category::Appearance, Category::Clipboard, Category::About] {
+        assert_eq!(Category::About.controls(), [Control::CheckForUpdates]);
+        for c in [Category::Appearance, Category::Clipboard] {
             assert!(c.controls().is_empty(), "{c:?} has no switches");
         }
         assert_eq!(Category::Clipboard.capacities(), &ClipboardCapacity::ALL);
@@ -2411,7 +2732,8 @@ mod tests {
             }
             .focus_order()
             .len(),
-            Category::ALL.len()
+            Category::ALL.len() + 2,
+            "About: the sidebar, the automatic-check switch and Check for updates"
         );
         assert!(
             Category::About
@@ -2435,7 +2757,24 @@ mod tests {
         // Tab order: sidebar entries, then the page's controls
         assert_eq!(nav.focus_order().len(), 7, "Media: its two switches");
         nav.select(Category::About);
-        assert_eq!(nav.focus_order().len(), 5, "About: sidebar only");
+        let switch = Target::Control(Control::CheckForUpdates);
+        assert_eq!(
+            nav.focus_order()[5..],
+            [switch, Target::UpdateCheck],
+            "About: the switch, then Check for updates"
+        );
+        nav.release = true;
+        assert_eq!(
+            nav.focus_order()[5..],
+            [switch, Target::ViewRelease, Target::UpdateCheck],
+            "About: View release while an update is available"
+        );
+        nav.focus = Target::UpdateCheck;
+        assert_eq!(nav.arrow(true), Target::ViewRelease);
+        assert_eq!(nav.arrow(true), Target::ViewRelease, "stops at the end");
+        assert_eq!(nav.arrow(false), Target::UpdateCheck);
+        nav.release = false;
+        nav.focus = Target::Category(Category::About);
         nav.select(Category::General);
         assert_eq!(nav.focus_order().len(), 14, "5 switches + 4 closing delays");
         nav.focus = Target::Category(Category::About);
@@ -2570,7 +2909,7 @@ mod tests {
                     let row = l.rows[c.index()].row;
                     assert_eq!(at(row, page), Some(Target::Control(*c)), "{dpi}");
                     // Controls of a page that is not showing are not hit
-                    assert_eq!(at(row, Category::About), None);
+                    assert_ne!(at(row, Category::About), Some(Target::Control(*c)));
                 }
             }
             assert_eq!(
@@ -2713,6 +3052,28 @@ mod tests {
                     ]
                 );
                 assert_eq!(switches[0].name(category), "Now playing");
+            } else if category == Category::About {
+                // No window open: no release known, so no View release
+                assert_eq!(
+                    switches,
+                    [
+                        Element::Section(6),
+                        Element::Control(Control::CheckForUpdates),
+                        Element::UpdateVersion,
+                        Element::UpdateCheck
+                    ]
+                );
+                assert_eq!(switches[0].name(category), "Updates");
+                assert_eq!(
+                    switches[2].name(category),
+                    concat!("Oeca ", env!("CARGO_PKG_VERSION"))
+                );
+                assert_eq!(switches[3].name(category), "Check for updates");
+                assert_eq!(
+                    switches[1].name(category),
+                    "Check for updates automatically"
+                );
+                assert_eq!(Element::ViewRelease.name(category), "View release");
             } else {
                 assert!(switches.is_empty(), "nothing on {category:?}");
             }
@@ -2730,8 +3091,8 @@ mod tests {
         let d = OecaSettings::default();
         assert_eq!(
             Control::ALL.map(|c| c.is_on(d)),
-            [true, false, true, true, false, true, true],
-            "Always on top on, Reduced motion off, Escape closes on, Confirm clear on, Start on launch off,              source app shown, visualizer shown"
+            [true, false, true, true, false, true, true, false],
+            "Always on top on, Reduced motion off, Escape closes on, Confirm clear on, Start on launch off,              source app shown, visualizer shown, automatic update checks off (opt-in)"
         );
         // Each switch flips exactly its own value, and back
         for c in Control::ALL {
@@ -2779,6 +3140,7 @@ mod tests {
             show_visualizer: false,
             collapse_delay: CollapseDelay::Fifteen,
             start_on_launch: true,
+            ..OecaSettings::default()
         };
         sync(changed);
         navigate(hwnd, Category::General);
@@ -2860,6 +3222,151 @@ mod tests {
                 "{c:?} description"
             );
         }
+        // About's update row: the version, every status line, both buttons
+        use crate::update::{Check, Status};
+        assert!(width_of(INSTALLED_LABEL, TextRole::SettingLabel) <= l.update_title.width());
+        assert!(
+            width_of(INSTALLED_DESCRIPTION, TextRole::SettingDescription)
+                <= l.update_description.width()
+        );
+        let longest = Some((999, 999, 999));
+        for status in [
+            Status::default(),
+            Status {
+                check: Check::Checking,
+                available: longest,
+            },
+            Status {
+                check: Check::Done,
+                available: None,
+            },
+            Status {
+                check: Check::Done,
+                available: longest,
+            },
+            Status {
+                check: Check::Failed,
+                available: None,
+            },
+            Status {
+                check: Check::Failed,
+                available: longest,
+            },
+        ] {
+            let line = status_line(status);
+            assert!(
+                width_of(&line, TextRole::SettingDescription) <= l.update_status.width(),
+                "{line}"
+            );
+        }
+        for (label, r) in [(CHECK_LABEL, l.update_check), (VIEW_LABEL, l.update_view)] {
+            assert!(
+                width_of(label, TextRole::SidebarItem) + 16.0 <= r.width(),
+                "{label}"
+            );
+        }
+        assert!(l.update_title.right < l.update_view.left);
+        assert!(l.update_status.top >= l.update_row.bottom, "under the row");
+        assert!(l.update_view.right < l.update_check.left);
+    }
+
+    fn update_requests() -> Vec<usize> {
+        use windows::Win32::UI::WindowsAndMessaging::{MSG, PM_REMOVE, PeekMessageW};
+        let mut out = Vec::new();
+        let mut msg = MSG::default();
+        while unsafe {
+            PeekMessageW(
+                &mut msg,
+                None,
+                WM_APP_SETTINGS_UPDATE,
+                WM_APP_SETTINGS_UPDATE,
+                PM_REMOVE,
+            )
+        }
+        .as_bool()
+        {
+            out.push(msg.wParam.0);
+        }
+        out
+    }
+
+    #[test]
+    fn test_about_update_row_checks_views_and_follows_the_shared_state() {
+        use crate::update::{Check, Status};
+        let st = |check, available| Status { check, available };
+        assert_eq!(status_line(st(Check::Done, None)), "You're up to date.");
+        assert_eq!(
+            status_line(st(Check::Done, Some((0, 3, 0)))),
+            "Oeca 0.3.0 is available."
+        );
+        assert_eq!(
+            status_line(st(Check::Failed, None)),
+            "Couldn't check for updates. Try again later."
+        );
+        assert_eq!(
+            status_line(st(Check::Failed, Some((0, 3, 0)))),
+            "Couldn't check for updates. Oeca 0.3.0 is available.",
+            "a failure never hides a known release"
+        );
+        assert_eq!(
+            status_line(Status::default()),
+            "Not checked for updates yet."
+        );
+        assert_eq!(UpdateRequest::from_index(0), Some(UpdateRequest::Check));
+        assert_eq!(
+            UpdateRequest::from_index(1),
+            Some(UpdateRequest::ViewRelease)
+        );
+        assert_eq!(UpdateRequest::from_index(2), None);
+        // Hit targets on About only
+        let (w, h) = CLIENT_SIZE;
+        let l = layout(w, h);
+        let centre = |r: RectF| ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
+        let (x, y) = centre(l.update_check);
+        assert_eq!(hit(w, h, Category::About, x, y), Some(Target::UpdateCheck));
+        assert_ne!(
+            hit(w, h, Category::Clipboard, x, y),
+            Some(Target::UpdateCheck)
+        );
+        let (x, y) = centre(l.update_view);
+        assert_eq!(hit(w, h, Category::About, x, y), Some(Target::ViewRelease));
+
+        let hwnd = create(HWND::default(), OecaSettings::default()).unwrap();
+        update_requests();
+        navigate(hwnd, Category::About);
+        let children = || Element::children(Category::About);
+        // Not checked yet: Check for updates asks the notch
+        with_view(|v| v.nav.focus = Target::UpdateCheck);
+        key(hwnd, VK_SPACE.0);
+        assert_eq!(update_requests(), [UpdateRequest::Check as usize]);
+        // Checking: the button is disabled (no duplicate request)
+        sync_update(st(Check::Checking, None));
+        key(hwnd, VK_SPACE.0);
+        assert!(update_requests().is_empty(), "disabled while checking");
+        assert!(!children().contains(&Element::ViewRelease));
+        // Found (by this check, a scheduled one or before opening): View
+        // release appears and asks the notch to open its validated release
+        sync_update(st(Check::Done, Some((0, 3, 0))));
+        assert_eq!(with_view(|v| v.nav.release), Some(true));
+        assert!(children().contains(&Element::ViewRelease));
+        with_view(|v| v.nav.focus = Target::ViewRelease);
+        key(hwnd, VK_SPACE.0);
+        assert_eq!(update_requests(), [UpdateRequest::ViewRelease as usize]);
+        // Up to date: View release goes, focus moves to Check
+        sync_update(st(Check::Done, None));
+        assert_eq!(with_view(|v| v.nav.focus), Some(Target::UpdateCheck));
+        assert!(!children().contains(&Element::ViewRelease));
+        with_view(|v| v.nav.focus = Target::ViewRelease);
+        activate(hwnd, Target::ViewRelease);
+        assert!(update_requests().is_empty(), "no release: nothing to open");
+        // Failed with a release known: View release stays
+        sync_update(st(Check::Failed, Some((0, 3, 0))));
+        assert!(children().contains(&Element::ViewRelease));
+        // Failed: the user can retry
+        sync_update(st(Check::Failed, None));
+        activate(hwnd, Target::UpdateCheck);
+        assert_eq!(update_requests(), [UpdateRequest::Check as usize]);
+        close();
     }
 
     /// Sends a key to the window as the keyboard would.

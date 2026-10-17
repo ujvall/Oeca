@@ -44,7 +44,9 @@ use crate::config::{
     WINDOW_TITLE, calculate_notch_x,
 };
 use crate::config::{DROP_RESULT_MS, DROP_RESULT_TIMER_ID};
+use crate::config::{HUD_HIDE_TIMER_ID, HUD_HOLD_MS, HUD_RELEASE_TIMER_ID};
 use crate::dragdrop::{self, DragEvent, DragSession, DropTarget};
+use crate::hud::VolumeKey;
 use crate::layout::{MediaLayout, PanelHit, resolve_clipboard_layout};
 use crate::layout::{SpaceSelectorLayout, resolve_settings_layout};
 use crate::layout::{
@@ -61,13 +63,20 @@ use crate::timer::{Countdown, Phase, Presence};
 use windows::Win32::System::Ole::{
     OleInitialize, OleUninitialize, RegisterDragDrop, RevokeDragDrop,
 };
+use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::UI::WindowsAndMessaging::{
     GA_ROOT, GetAncestor, WM_INPUT, WM_MBUTTONDOWN, WM_RBUTTONDOWN, WindowFromPoint,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
+    GW_OWNER, GetWindow, IDC_HAND, SW_HIDE, SetCursor, WM_MOUSEWHEEL, WM_RBUTTONUP, WM_SETCURSOR,
+    WS_EX_TRANSPARENT,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetMessageTime, PBT_POWERSETTINGCHANGE, SPI_GETKEYBOARDSPEED, WM_HOTKEY,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
     HWND_NOTOPMOST, SET_WINDOW_POS_FLAGS, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
 };
-use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, WM_MOUSEWHEEL, WS_EX_TRANSPARENT};
 use windows::Win32::{
     Foundation::{CloseHandle, HANDLE},
     Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo},
@@ -386,7 +395,10 @@ struct WindowState {
     slot_presence: Presence,
     bubble: Option<HWND>,
     bubble_shown: bool,
-    timer_drag: bool,
+    /// A press / drag on the timer's scale.
+    timer_drag: Option<TimerDrag>,
+    /// The timer panel's motion (selector, setup scale), on the frames.
+    timer_motion: crate::timer::TimerMotion,
     /// The countdown as last shown collapsed (kept while that fades out).
     timer_shown: Countdown,
     /// A drag along the Music scrubber: where it is (0..1 of the track). The
@@ -394,6 +406,25 @@ struct WindowState {
     scrub: Option<f32>,
     /// The notification-area icon (removed when this state is freed).
     tray: crate::tray::TrayIcon,
+    /// The volume HUD, and the master volume (held only while the HUD
+    /// shows).
+    hud: crate::hud::Hud,
+    /// Volume-key momentum (input times only): a rapid held run into
+    /// 0% / 100% presses that edge of the notch.
+    momentum: crate::hud::Momentum,
+    volume: Option<crate::hud::SystemVolume>,
+    /// Battery / Energy Saver notifications' registrations.
+    saver_watch: [Option<windows::Win32::System::Power::HPOWERNOTIFY>; 2],
+    /// The one update state (release, checks, the notice's dismissal), the
+    /// notice's presence, the collapsed notch's update icon's presence, the
+    /// notice's window (created on first use, owned by the notch), whether
+    /// that shows, and where it was last drawn (x, y, dpi, level).
+    updates: crate::update::UpdateState,
+    update_presence: Presence,
+    update_icon: Presence,
+    update_notice: Option<HWND>,
+    update_shown: bool,
+    update_drawn: Option<(i32, i32, u32, f32)>,
 }
 
 /// `SetWindowPos` z-order arguments for routine moves and resizes: topmost
@@ -407,13 +438,69 @@ fn z_order(always_on_top: bool) -> (Option<HWND>, SET_WINDOW_POS_FLAGS) {
     }
 }
 
-/// Where the setting moves the window when it flips: into the topmost band,
-/// or out of it (`HWND_NOTOPMOST`: top of the normal band, coverable).
+/// Where the setting moves the window when it flips (or the notch first
+/// shows): into the topmost band; or, off, into the normal band just below
+/// the window in use (see `normal_slot`), never above it.
 fn z_band(always_on_top: bool) -> HWND {
     if always_on_top {
         HWND_TOPMOST
     } else {
-        HWND_NOTOPMOST
+        normal_slot(unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() })
+    }
+}
+
+/// The foreground window, as far as placing the notch below it goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Foreground {
+    /// An ordinary (non-topmost) application window, e.g. a game.
+    App(HWND),
+    /// Nothing to go below: none, the desktop or the taskbar, a topmost
+    /// window (inserting after it would make the notch topmost), or Oeca.
+    None,
+}
+
+/// Where a non-topmost notch goes: right below the foreground app window,
+/// so leaving the topmost band (or appearing) never covers what the user is
+/// in (`HWND_NOTOPMOST` alone puts it at the top of the normal band, above
+/// a fullscreen game until that is activated again); else the top of the
+/// normal band.
+fn normal_slot(foreground: HWND) -> HWND {
+    match classify_foreground(foreground) {
+        Foreground::App(app) => app,
+        Foreground::None => HWND_NOTOPMOST,
+    }
+}
+
+fn classify_foreground(hwnd: HWND) -> Foreground {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetClassNameW, GetShellWindow, GetWindowThreadProcessId,
+    };
+    if hwnd.is_invalid() || hwnd == unsafe { GetShellWindow() } {
+        return Foreground::None;
+    }
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    let ex = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
+    let mut class = [0u16; 32];
+    let n = unsafe { GetClassNameW(hwnd, &mut class) }.max(0) as usize;
+    let shell = matches!(
+        String::from_utf16_lossy(&class[..n]).as_str(),
+        "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+    );
+    foreground_kind(
+        pid == std::process::id(),
+        ex & WS_EX_TOPMOST.0 != 0,
+        shell,
+        hwnd,
+    )
+}
+
+/// `classify_foreground`'s decision, from what it found.
+fn foreground_kind(oeca: bool, topmost: bool, shell: bool, hwnd: HWND) -> Foreground {
+    if oeca || topmost || shell {
+        Foreground::None
+    } else {
+        Foreground::App(hwnd)
     }
 }
 
@@ -435,9 +522,10 @@ impl WindowState {
         )
     }
 
-    /// Redraws the settled notch (no-op while the notch animation owns frames).
+    /// Redraws the settled notch (no-op while animation frames run: the next
+    /// one, within a refresh, draws everything).
     fn redraw(&self, hwnd: HWND) {
-        if self.animation.is_none() {
+        if self.animation.is_none() && self.last_frame_time.is_none() {
             let _ = self.renderer.render(
                 hwnd,
                 self.pos_x,
@@ -459,7 +547,9 @@ impl WindowState {
         let animating = self.renderer.feedback().is_animating()
             || self.renderer.switches_animating()
             || self.renderer.media_motion_animating()
-            || self.timer_animating();
+            || self.timer_animating()
+            || self.update_presence.is_animating()
+            || self.update_icon.is_animating();
         if self.feedback_tick.is_none() && animating {
             self.feedback_tick = Some(std::time::Instant::now());
             unsafe {
@@ -547,10 +637,15 @@ impl WindowState {
             .animation
             .as_ref()
             .is_none_or(|a| a.is_space_transition());
-        if self.state != NotchState::Expanded || !width_only || self.renderer.drop_page() {
+        // Nor while the volume HUD covers the header
+        if self.state != NotchState::Expanded
+            || !width_only
+            || self.renderer.drop_page()
+            || self.hud.is_shown()
+        {
             return None;
         }
-        let x = (lparam.0 & 0xFFFF) as i16 as f32;
+        let x = self.client_x(lparam);
         let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
         let (from, to, mix) = match &self.animation {
             Some(anim) => {
@@ -671,6 +766,8 @@ impl WindowState {
     fn open_full_settings(&mut self, hwnd: HWND) {
         // A failure leaves the notch untouched (nothing to show)
         let _ = settings_window::open(hwnd, self.settings);
+        // An update found before Settings opened shows there too
+        settings_window::sync_update(self.updates.status());
     }
 
     /// Tray "Open Oeca" (or a left click on the icon): the notch shown and
@@ -702,6 +799,7 @@ impl WindowState {
                 self.persist_settings();
             }
             settings_window::Control::StartOnLaunch => self.toggle_start_on_launch(),
+            settings_window::Control::CheckForUpdates => self.toggle_update_checks(hwnd),
             // Presentation only: redraw; the live timer follows the
             // visualizer (fast with bars, slow for a lone scrubber)
             settings_window::Control::ShowSourceApp | settings_window::Control::ShowVisualizer => {
@@ -713,6 +811,32 @@ impl WindowState {
                 self.redraw(hwnd);
                 self.kick_live(hwnd);
             }
+        }
+    }
+
+    /// The opt-in daily update check: turned on, a check runs now and then
+    /// once a day; turned off, no further automatic check (checking by hand
+    /// in Settings always works, and a release already found stays).
+    fn toggle_update_checks(&mut self, hwnd: HWND) {
+        settings_window::Control::CheckForUpdates.toggle(&mut self.settings);
+        self.renderer
+            .set_settings(self.settings_open, self.settings);
+        settings_window::sync(self.settings);
+        self.persist_settings();
+        unsafe {
+            if self.settings.check_for_updates {
+                let _ = SetTimer(
+                    Some(hwnd),
+                    crate::update::CHECK_TIMER_ID,
+                    crate::update::RECHECK_MS,
+                    None,
+                );
+            } else {
+                let _ = KillTimer(Some(hwnd), crate::update::CHECK_TIMER_ID);
+            }
+        }
+        if self.settings.check_for_updates {
+            self.check_for_updates(hwnd);
         }
     }
 
@@ -1148,7 +1272,7 @@ impl WindowState {
         {
             return None;
         }
-        let x = (lparam.0 & 0xFFFF) as i16 as f32;
+        let x = self.client_x(lparam);
         let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
         if self.settings_open {
             // Only the switches and the action row are live on the Settings page
@@ -1163,7 +1287,7 @@ impl WindowState {
             .map(|(_, hit)| hit);
         }
         if self.space != OecaSpace::Clipboard {
-            // Home: the timer's buttons, and its scale during setup
+            // Home: the timer's mode pills, its buttons and its scale
             let idle = self.timer.phase() == Phase::Idle;
             return self.timer_layout()?.hit(x, y, idle);
         }
@@ -1232,7 +1356,7 @@ impl WindowState {
     /// The point on the scrubber's track (fraction), if a press there would
     /// scrub.
     fn scrub_at(&self, lparam: LPARAM) -> Option<f32> {
-        let x = (lparam.0 & 0xFFFF) as i16 as f32;
+        let x = self.client_x(lparam);
         let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
         let track = self.scrub_track()?;
         track
@@ -1260,7 +1384,7 @@ impl WindowState {
             self.end_scrub(hwnd, false);
             return;
         };
-        let x = (lparam.0 & 0xFFFF) as i16 as f32;
+        let x = self.client_x(lparam);
         let f = MediaLayout::scrub_fraction(track, x);
         if self.scrub != Some(f) {
             self.scrub = Some(f);
@@ -1356,7 +1480,60 @@ impl WindowState {
             collapsed: self.timer_shown,
             slot: self.slot_presence.level(),
             pulse,
+            mode: self.timer_motion.mode(),
+            scale: self.timer_motion.scale(),
+            lag: self.timer_motion.lag(),
         });
+    }
+
+    /// The scale's value on show now (minutes): the setup's gliding value,
+    /// else what is left.
+    fn shown_scale(&self) -> f32 {
+        if self.timer.phase() == Phase::Idle {
+            self.timer_motion.scale()
+        } else {
+            crate::timer::scale_value(&self.timer, std::time::Instant::now())
+                + self.timer_motion.lag()
+        }
+    }
+
+    /// The timer panel's motion follows the countdown (selector, setup
+    /// scale, gliding from `from`) on the notch's frames, started if idle;
+    /// under no motion it is simply drawn.
+    fn aim_timer_motion(&mut self, hwnd: HWND, from: f32) {
+        let instant = !self.motion_enabled();
+        self.timer_motion
+            .aim(&self.timer, Some(from), std::time::Instant::now(), instant);
+        self.push_timer_view();
+        if self.timer_motion.is_animating() {
+            if self.last_frame_time.is_none() {
+                self.start_frames(hwnd);
+            }
+        } else {
+            self.redraw(hwnd);
+        }
+    }
+
+    /// Saves the Focus / Break durations (settings) after they changed.
+    fn persist_timer_durations(&mut self) {
+        use crate::timer::Mode;
+        let (focus, rest) = (
+            self.timer.secs_for(Mode::Focus),
+            self.timer.secs_for(Mode::Break),
+        );
+        if (self.settings.focus_secs, self.settings.break_secs) != (focus, rest) {
+            self.settings.focus_secs = focus;
+            self.settings.break_secs = rest;
+            self.persist_settings();
+        }
+    }
+
+    /// Whether a client point is on Home's timer panel (a click there is
+    /// the timer's, never the notch background's).
+    fn on_timer_panel(&self, lparam: LPARAM) -> bool {
+        let x = self.client_x(lparam);
+        let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+        self.timer_layout().is_some_and(|l| l.panel.contains(x, y))
     }
 
     /// Aims the collapsed presentations at what the countdown, the notch and
@@ -1382,9 +1559,149 @@ impl WindowState {
         let instant = !self.motion_enabled();
         self.bubble_presence.set(bubble, instant);
         self.slot_presence.set(slot, instant);
+        // Update: the notice under the collapsed notch first; once it is
+        // dismissed, the icon in the artwork's place (never both)
+        let (notice, icon) = update_targets(&self.updates, collapsed);
+        self.update_presence.set(notice, instant);
+        self.update_icon.set(icon, instant);
+        self.renderer.set_update_icon(self.update_icon.level());
         self.push_timer_view();
         self.kick_feedback(hwnd);
         self.update_bubble(hwnd);
+        self.draw_update_notice(hwnd);
+    }
+
+    /// Starts an update check (scheduled or from Settings) unless one is
+    /// running already (its result answers both), off the UI thread.
+    fn check_for_updates(&mut self, hwnd: HWND) {
+        if let Some(id) = self.updates.begin()
+            && !crate::update::check_async(hwnd, WM_APP_UPDATE_READY, id)
+        {
+            self.updates.finish(id, crate::update::Outcome::Failed);
+        }
+        settings_window::sync_update(self.updates.status());
+    }
+
+    /// An update check's outcome, into the shared state (a stale one changes
+    /// nothing); the notice, the icon and Settings follow it.
+    fn update_ready(&mut self, hwnd: HWND, id: usize, outcome: crate::update::Outcome) {
+        if !self.updates.finish(id, outcome) {
+            return;
+        }
+        // A different release: drawn and named afresh
+        self.update_drawn = None;
+        if let (Some(notice), Some(r)) = (self.update_notice, self.updates.release()) {
+            let title: Vec<u16> = r.title().encode_utf16().chain([0]).collect();
+            unsafe {
+                let _ = SetWindowTextW(notice, windows::core::PCWSTR(title.as_ptr()));
+            }
+        }
+        settings_window::sync_update(self.updates.status());
+        self.refresh_timer_presence(hwnd);
+    }
+
+    /// Opens the newest validated release page (the icon, the notice and
+    /// Settings all open this one).
+    fn open_update(&self) {
+        if let Some(release) = self.updates.release() {
+            crate::update::open_release(release);
+        }
+    }
+
+    /// The update notice was clicked (`open`: the release page in the
+    /// browser), right-clicked, or has been on show long enough: it leaves
+    /// and is not offered again for this version. The release stays
+    /// available: the icon takes the notice's place.
+    fn dismiss_update(&mut self, hwnd: HWND, open: bool) {
+        if open {
+            self.open_update();
+        }
+        self.updates.dismiss_notice();
+        unsafe {
+            let _ = KillTimer(Some(hwnd), crate::update::HIDE_TIMER_ID);
+        }
+        self.refresh_timer_presence(hwnd);
+    }
+
+    /// The collapsed notch's update icon is showing and under the point.
+    fn update_icon_at(&self, lparam: LPARAM) -> bool {
+        if self.state != NotchState::Collapsed
+            || self.animation.is_some()
+            || self.update_icon.level() < 0.5
+        {
+            return false;
+        }
+        let x = self.client_x(lparam);
+        let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+        crate::layout::resolve_collapsed_layout(&self.dimensions)
+            .artwork_bounds
+            .contains(x, y)
+    }
+
+    /// Draws the update notice centred under the notch at its presence (shown
+    /// on first need, hidden once fully gone; redrawn only when it moves).
+    /// Its time on show starts when it appears.
+    fn draw_update_notice(&mut self, hwnd: HWND) {
+        let p = self.update_presence.level();
+        let Some(release) = self.updates.release() else {
+            return;
+        };
+        if p <= 0.0 && !self.update_presence.is_animating() {
+            self.update_drawn = None;
+            if std::mem::take(&mut self.update_shown)
+                && let Some(notice) = self.update_notice
+            {
+                unsafe {
+                    let _ = ShowWindow(notice, SW_HIDE);
+                    let _ = KillTimer(Some(hwnd), crate::update::HIDE_TIMER_ID);
+                }
+            }
+            return;
+        }
+        let label = release.label();
+        if self.update_notice.is_none() {
+            self.update_notice = create_update_notice(hwnd, &release.title());
+        }
+        let Some(notice) = self.update_notice else {
+            return;
+        };
+        let center_x = self.pos_x + self.dimensions.width / 2;
+        let bottom = self.pos_y + self.dimensions.height
+            - self.dimensions.shadow_margin_bottom.round() as i32;
+        let key = (center_x, bottom, self.dimensions.dpi, p);
+        if self.update_drawn == Some(key) {
+            return;
+        }
+        self.update_drawn = Some(key);
+        let _ = self.renderer.render_update_notice(
+            notice,
+            center_x,
+            bottom,
+            &self.dimensions,
+            &label,
+            p,
+        );
+        if !self.update_shown {
+            self.update_shown = true;
+            let (after, flags) = z_order(self.settings.always_on_top);
+            unsafe {
+                let _ = SetWindowPos(
+                    notice,
+                    after,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | flags,
+                );
+                let _ = SetTimer(
+                    Some(hwnd),
+                    crate::update::HIDE_TIMER_ID,
+                    crate::update::SHOW_MS,
+                    None,
+                );
+            }
+        }
     }
 
     /// Draws the bubble where the notch's right edge is now (shown on first
@@ -1456,11 +1773,13 @@ impl WindowState {
         }
     }
 
-    /// After the countdown's phase changed: re-arm its wake-up, re-aim the
-    /// collapsed presentations, redraw, and announce the new state.
-    fn timer_changed(&mut self, hwnd: HWND) {
+    /// After the countdown's phase changed (its scale showing `from` just
+    /// before): re-arm its wake-up, re-aim the collapsed presentations and
+    /// the panel's motion, redraw, and announce the new state.
+    fn timer_changed(&mut self, hwnd: HWND, from: f32) {
         self.arm_timer_tick(hwnd);
         self.refresh_timer_presence(hwnd);
+        self.aim_timer_motion(hwnd, from);
         self.redraw(hwnd);
         notify_accessibility_state_changed(
             hwnd,
@@ -1479,8 +1798,9 @@ impl WindowState {
     /// own deadline (a stale wake-up changes nothing), else shows the new
     /// second.
     fn on_timer_tick(&mut self, hwnd: HWND) {
+        let from = self.shown_scale();
         if self.timer.poll(std::time::Instant::now()).is_some() {
-            self.timer_changed(hwnd);
+            self.timer_changed(hwnd, from);
             return;
         }
         self.arm_timer_tick(hwnd);
@@ -1491,36 +1811,288 @@ impl WindowState {
         }
     }
 
+    /// A volume key (registered hotkey, repeating while held): queued for
+    /// the volume worker (the UI thread never waits on a step), and the HUD
+    /// shown at once at the actual level; each applied step then arrives as
+    /// a change. Without an audio endpoint the keys go back to Windows, this
+    /// press included.
+    fn volume_key(&mut self, hwnd: HWND, key: VolumeKey) {
+        if self.volume.is_none() {
+            self.volume = crate::hud::SystemVolume::open(hwnd, WM_APP_VOLUME_CHANGED).ok();
+        }
+        let current = self.volume.as_ref().map(|v| {
+            v.queue(key);
+            v.level()
+        });
+        match current {
+            Some(Ok((level, muted))) => {
+                // Timed by the key's own input (its message time), never by
+                // when the audio service applies it
+                let at = unsafe { GetMessageTime() } as u32;
+                let gap = crate::hud::rapid_gap_ms(keyboard_speed());
+                self.momentum.press(key, at, level, gap);
+                // Reversed or muted: a stretch lets go at once
+                if self.momentum.edge().is_none() && self.hud.is_stretched() {
+                    self.hud.stretch(None, !self.motion_enabled());
+                }
+                // No repeat within the gap: the key was released
+                unsafe {
+                    let _ = SetTimer(Some(hwnd), HUD_RELEASE_TIMER_ID, gap, None);
+                }
+                self.show_hud(hwnd, level, muted);
+            }
+            _ => self.give_back_volume_keys(hwnd, key),
+        }
+    }
+
+    /// Battery / Energy Saver turned on or off. On: decorative motion in
+    /// flight lands at its end now (the HUD's bar, number, waves, stretch;
+    /// the countdown's presentations; hover), so nothing jumps later and
+    /// no frames are left running; a notch expand / collapse in progress
+    /// still completes. Off: motion returns, unless the user's own Reduced
+    /// motion is on (the saved setting is never touched).
+    /// With `notice` (a real change, not the startup report) the HUD says
+    /// so: Power Saving Mode On / Off, for `HUD_NOTICE_HOLD_MS`. Turning on,
+    /// it appears at once (no motion any more); off, it animates in.
+    fn power_saver_changed(&mut self, hwnd: HWND, notice: bool) {
+        if !self.motion_enabled() {
+            self.hud.settle();
+            self.renderer.set_hud(self.hud.view());
+            if self.animation.is_none() {
+                let _ = self.apply_hud_width();
+            }
+            self.refresh_timer_presence(hwnd);
+            self.kick_feedback(hwnd);
+        }
+        if notice {
+            self.hud
+                .show_power(power_saver_active(), !self.motion_enabled());
+            unsafe {
+                let _ = SetTimer(
+                    Some(hwnd),
+                    HUD_HIDE_TIMER_ID,
+                    crate::config::HUD_NOTICE_HOLD_MS,
+                    None,
+                );
+            }
+            self.hud_changed(hwnd);
+            return;
+        }
+        // Frames stop at the next one if nothing moves any more
+        self.redraw(hwnd);
+    }
+
+    /// The volume key was released (it stopped repeating): a stretch
+    /// relaxes back to the notch's exact shape.
+    fn volume_released(&mut self, hwnd: HWND) {
+        self.momentum.release();
+        if self.hud.is_stretched() {
+            self.hud.stretch(None, !self.motion_enabled());
+            self.hud_changed(hwnd);
+        }
+    }
+
+    fn give_back_volume_keys(&mut self, hwnd: HWND, key: VolumeKey) {
+        self.volume = None;
+        crate::hud::release_volume_keys(hwnd);
+        crate::hud::replay(key);
+    }
+
+    /// The master volume changed (a step applied, or a change elsewhere):
+    /// the volume HUD follows the actual level.
+    fn volume_changed(&mut self, hwnd: HWND) {
+        let Some(volume) = &self.volume else {
+            return;
+        };
+        if let Some(key) = volume.take_failure() {
+            return self.give_back_volume_keys(hwnd, key);
+        }
+        if !self.hud.is_shown() {
+            return;
+        }
+        if let Ok((level, muted)) = volume.level() {
+            // A held key's run pressing against its end stretches the notch
+            // toward that side for as long as it does (only Oeca's own keys;
+            // never under Reduced motion); leaving the end lets go
+            let now = unsafe { GetTickCount() };
+            let edge = self.momentum.pressing(level, now);
+            if edge.is_some() && self.motion_enabled() {
+                self.hud.stretch(edge, false);
+            } else if self.hud.is_stretched() {
+                self.hud.stretch(None, !self.motion_enabled());
+            }
+            self.hud.update(level, muted, !self.motion_enabled());
+            self.hud_changed(hwnd);
+        }
+    }
+
+    /// Shows (or keeps showing) the HUD at a new level; it leaves
+    /// `HUD_HOLD_MS` after the last one.
+    fn show_hud(&mut self, hwnd: HWND, level: f32, muted: bool) {
+        self.hud.show(level, muted, !self.motion_enabled());
+        unsafe {
+            let _ = SetTimer(Some(hwnd), HUD_HIDE_TIMER_ID, HUD_HOLD_MS, None);
+        }
+        self.hud_changed(hwnd);
+    }
+
+    fn hide_hud(&mut self, hwnd: HWND) {
+        self.hud.hide(!self.motion_enabled());
+        // Changes elsewhere no longer matter; the next press re-reads the
+        // (possibly new) default output
+        self.volume = None;
+        self.hud_changed(hwnd);
+    }
+
+    /// The HUD has a new target: it moves on the notch's frames (started if
+    /// idle; running ones are simply retargeted, never restarted). Reduced
+    /// motion: the end state is drawn now.
+    fn hud_changed(&mut self, hwnd: HWND) {
+        self.renderer.set_hud(self.hud.view());
+        if self.hud.is_animating() {
+            if self.last_frame_time.is_none() {
+                self.start_frames(hwnd);
+            }
+            return;
+        }
+        if self.apply_hud_width() {
+            self.update_bubble(hwnd);
+        }
+        self.redraw(hwnd);
+    }
+
+    /// A mouse message's client x in content coordinates (the content is
+    /// drawn from elsewhere while the HUD stretches the notch).
+    fn client_x(&self, lparam: LPARAM) -> f32 {
+        f32::from((lparam.0 & 0xFFFF) as i16) - self.renderer.content_offset().0
+    }
+
+    /// Where a collapse ends (DIP width): the collapsed notch, as wide as
+    /// the HUD makes it (exactly the reference width without it).
+    fn collapsed_target_dip(&self) -> f32 {
+        if self.hud.extra_width() <= 0.0 {
+            return crate::config::geometry_for(NotchState::Collapsed, (0.0, 0.0))[0];
+        }
+        let dims = self.settled_dims(NotchState::Collapsed, self.dimensions.dpi);
+        dims.width as f32 / dims.scale
+    }
+
+    /// The settled notch of `state`: the collapsed one widened by the HUD.
+    fn settled_dims(&self, state: NotchState, dpi: u32) -> NotchDimensions {
+        let mut dims = space_dimensions(state, dpi, self.size_space());
+        if state == NotchState::Collapsed {
+            dims.width = crate::hud::widened_width(dims.width, self.hud.extra_width(), dims.scale);
+        }
+        dims
+    }
+
+    /// The settled collapsed notch follows the HUD's widening (centred).
+    /// True if its size changed. No-op while expanded or animating (the notch
+    /// animation carries the width, see `animation_frame`).
+    fn apply_hud_width(&mut self) -> bool {
+        if self.animation.is_some() || self.state != NotchState::Collapsed {
+            return false;
+        }
+        let dims = self.settled_dims(NotchState::Collapsed, self.dimensions.dpi);
+        if dims == self.dimensions {
+            return false;
+        }
+        self.dimensions = dims;
+        let screen_width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+        self.pos_x = calculate_notch_x(screen_width, dims.width);
+        true
+    }
+
     /// The round primary button: start / pause / resume / restart. Media
     /// playback is never touched.
     fn timer_primary(&mut self, hwnd: HWND) {
+        let from = self.shown_scale();
         if self.timer.primary(std::time::Instant::now()) {
-            self.timer_changed(hwnd);
+            self.timer_changed(hwnd, from);
         }
     }
 
     /// Cancel: back to the idle setup (the duration is kept).
     fn timer_cancel(&mut self, hwnd: HWND) {
+        let from = self.shown_scale();
         if self.timer.cancel() {
-            self.timer_changed(hwnd);
+            self.timer_changed(hwnd, from);
         }
     }
 
-    /// The scale under the pointer (setup only): the nearest stop.
+    /// A mode pill: Focus / Break, at any time (a running countdown is
+    /// paused and kept for when its mode comes back).
+    fn timer_mode(&mut self, hwnd: HWND, mode: crate::timer::Mode) {
+        let from = self.shown_scale();
+        if self.timer.set_mode(mode, std::time::Instant::now()) {
+            self.timer_changed(hwnd, from);
+        }
+    }
+
+    /// The time was set on the scale (drag, tap or wheel), `from` the value
+    /// shown before: in setup the scale glides to it; otherwise the
+    /// countdown runs on from it (its wake-up re-armed).
+    fn timer_time_set(&mut self, hwnd: HWND, from: f32) {
+        if self.timer.phase() == Phase::Idle {
+            self.aim_timer_motion(hwnd, from);
+            self.announce_timer(hwnd);
+        } else {
+            self.timer_changed(hwnd, from);
+        }
+    }
+
+    /// A press on the scale (any phase): a drag may start here, from the
+    /// value shown now.
+    fn begin_timer_drag(&mut self, lparam: LPARAM) {
+        self.timer_drag = Some(TimerDrag {
+            x0: self.client_x(lparam),
+            value0: self.shown_scale(),
+            stop: None,
+        });
+    }
+
+    /// The scale follows the drag: moving it left by a stop's width adds a
+    /// stop (the ruler is dragged under its fixed pointer). Nothing until it
+    /// moves half a stop (a tap is not a drag); each stop is set once.
     fn drag_timer_to(&mut self, hwnd: HWND, lparam: LPARAM) {
-        let x = (lparam.0 & 0xFFFF) as i16 as f32;
-        let Some(l) = self.timer_layout() else {
+        let (Some(drag), Some(l)) = (self.timer_drag, self.timer_layout()) else {
             return;
         };
-        if self.timer.set_stop(l.stop_at(x, crate::timer::STOPS.len())) {
-            self.push_timer_view();
-            self.redraw(hwnd);
+        let dx = drag.x0 - self.client_x(lparam);
+        if drag.stop.is_none() && dx.abs() < l.step / 2.0 {
+            return;
+        }
+        let stop = timer_stop(drag.value0 + dx / l.step);
+        if drag.stop == Some(stop) {
+            return;
+        }
+        self.timer_drag = Some(TimerDrag {
+            stop: Some(stop),
+            ..drag
+        });
+        let from = self.shown_scale();
+        if self.timer.set_stop(stop, std::time::Instant::now()) {
+            self.timer_time_set(hwnd, from);
         }
     }
 
-    /// A drag along the scale ended: announce the chosen duration once.
-    fn end_timer_drag(&mut self, hwnd: HWND) {
-        self.timer_drag = false;
+    /// A press on the scale ended (`lparam`: where, if released there): a
+    /// tap sets the stop tapped; then the durations are saved and announced
+    /// once.
+    fn end_timer_drag(&mut self, hwnd: HWND, lparam: Option<LPARAM>) {
+        let Some(drag) = self.timer_drag.take() else {
+            return;
+        };
+        if drag.stop.is_none()
+            && let (Some(lparam), Some(l)) = (lparam, self.timer_layout())
+        {
+            let from = self.shown_scale();
+            let stop = timer_stop(l.stop_at(self.client_x(lparam), from));
+            if self.timer.set_stop(stop, std::time::Instant::now()) {
+                self.timer_time_set(hwnd, from);
+            }
+        }
+        self.persist_timer_durations();
         self.announce_timer(hwnd);
     }
 
@@ -1580,10 +2152,26 @@ impl WindowState {
 
     /// Transport control under a client-area point (only when media UI is visible).
     fn media_control_at(&self, lparam: LPARAM) -> Option<MediaControl> {
-        let x = (lparam.0 & 0xFFFF) as i16 as f32;
+        let x = self.client_x(lparam);
         let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
         self.active_media_layout()?.control_at(x, y)
     }
+}
+
+/// A press / drag on the timer's scale: where it started, the value shown
+/// then, and the stop it has set (None until it moves: a tap so far).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TimerDrag {
+    x0: f32,
+    value0: f32,
+    stop: Option<usize>,
+}
+
+/// The stop nearest a (fractional) scale value, on the scale.
+fn timer_stop(value: f32) -> usize {
+    value
+        .round()
+        .clamp(0.0, (crate::timer::STOP_COUNT - 1) as f32) as usize
 }
 
 /// The Clipboard space's clear flow. Clear: asks first when `confirm` is on
@@ -1705,6 +2293,31 @@ const WM_APP_DROP_DECODED: u32 = WM_APP + 43;
 /// Posted when a drop result has been on show long enough.
 const WM_APP_DROP_RESULT_DONE: u32 = WM_APP + 44;
 
+/// Posted by the master volume's change callback (an audio thread).
+const WM_APP_VOLUME_CHANGED: u32 = WM_APP + 45;
+/// Posted when the HUD has been on show long enough.
+const WM_APP_HUD_HIDE: u32 = WM_APP + 47;
+/// Posted when a volume key stopped repeating (released).
+const WM_APP_VOLUME_RELEASED: u32 = WM_APP + 48;
+/// Posted when Battery / Energy Saver turned on or off (effective motion).
+const WM_APP_POWER_SAVER: u32 = WM_APP + 49;
+/// Posted by an update check (lParam: a `Box<update::Release>` when a newer
+/// stable release exists, else 0).
+const WM_APP_UPDATE_READY: u32 = WM_APP + 51;
+/// Posted by the update notice: wParam 1 opens the release, 0 dismisses.
+const WM_APP_UPDATE_CLICK: u32 = WM_APP + 52;
+/// Posted when the daily update check is due (applied through the state,
+/// so a busy state replays it).
+const WM_APP_UPDATE_CHECK: u32 = WM_APP + 53;
+
+/// The update notice and the collapsed notch's icon, from the shared update
+/// state: the notice while it is due (under the collapsed notch only), the
+/// icon once it was dismissed, for as long as the release is newer.
+fn update_targets(updates: &crate::update::UpdateState, collapsed: bool) -> (bool, bool) {
+    let due = updates.notice_due();
+    (due && collapsed, updates.release().is_some() && !due)
+}
+
 /// Whose a click is, by the top-level window under it: the notch itself
 /// (handled by its own mouse messages), Oeca's Settings window (Oeca in use),
 /// or anything else (outside). The notch's transparent margins pass clicks
@@ -1795,9 +2408,116 @@ fn live_period_ms(
 }
 
 /// Animations run only when neither the user (Reduced motion) nor the system
-/// asked for reduced motion.
+/// asked for reduced motion, and Windows is not saving power.
 pub(crate) fn motion_allowed(reduced_motion: bool, system_animations: bool) -> bool {
-    system_animations && !reduced_motion
+    effective_motion(reduced_motion, system_animations, power_saver_active())
+}
+
+/// The motion actually used: the user's Reduced motion OR the system's
+/// animation setting OR an active Battery / Energy Saver. The saved setting
+/// is never changed by the last two.
+pub(crate) fn effective_motion(reduced_motion: bool, system_animations: bool, saver: bool) -> bool {
+    system_animations && !reduced_motion && !saver
+}
+
+/// Windows' power saving, as last reported: Battery Saver, and Energy Saver
+/// (Windows 11 24H2+; either one counts). Set from their power-setting
+/// notifications (the UI thread), read wherever motion is decided.
+static BATTERY_SAVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ENERGY_SAVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether each saver has reported yet (its first report, on registering,
+/// only states the current mode: no notice).
+static BATTERY_SAVER_SEEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static ENERGY_SAVER_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn power_saver_active() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    BATTERY_SAVER.load(Relaxed) || ENERGY_SAVER.load(Relaxed)
+}
+
+/// Energy Saver's status, 0 off / 1 standard / 2 high savings (winnt.h,
+/// Windows SDK 10.0.26100; not in the `windows` crate's metadata yet).
+const GUID_ENERGY_SAVER_STATUS: windows::core::GUID =
+    windows::core::GUID::from_u128(0x550e8400_e29b_41d4_a716_446655440000);
+
+/// Which power-saving status a notification reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Saver {
+    Battery,
+    Energy,
+}
+
+impl Saver {
+    const ALL: [Saver; 2] = [Saver::Battery, Saver::Energy];
+
+    fn guid(self) -> windows::core::GUID {
+        match self {
+            Self::Battery => windows::Win32::System::SystemServices::GUID_POWER_SAVING_STATUS,
+            Self::Energy => GUID_ENERGY_SAVER_STATUS,
+        }
+    }
+
+    fn flag(self) -> &'static std::sync::atomic::AtomicBool {
+        match self {
+            Self::Battery => &BATTERY_SAVER,
+            Self::Energy => &ENERGY_SAVER,
+        }
+    }
+
+    fn seen(self) -> &'static std::sync::atomic::AtomicBool {
+        match self {
+            Self::Battery => &BATTERY_SAVER_SEEN,
+            Self::Energy => &ENERGY_SAVER_SEEN,
+        }
+    }
+}
+
+/// A `PBT_POWERSETTINGCHANGE` for one of the savers: which, and whether on
+/// (Battery Saver 1; Energy Saver 1 or 2).
+///
+/// # Safety
+/// `lparam` is the `WM_POWERBROADCAST` / `PBT_POWERSETTINGCHANGE` one.
+unsafe fn saver_report(lparam: LPARAM) -> Option<(Saver, bool)> {
+    let setting = lparam.0 as *const windows::Win32::System::Power::POWERBROADCAST_SETTING;
+    if setting.is_null() {
+        return None;
+    }
+    let s = unsafe { &*setting };
+    if s.DataLength < 4 {
+        return None;
+    }
+    let value = unsafe { std::ptr::read_unaligned(s.Data.as_ptr().cast::<u32>()) };
+    Saver::ALL
+        .into_iter()
+        .find(|saver| saver.guid() == s.PowerSetting)
+        .map(|saver| (saver, value != 0))
+}
+
+/// Asks for both savers' notifications (each is sent once at once with its
+/// current state, then on every change). Before any arrives, and where they
+/// are not offered, the power status's Battery Saver flag stands in.
+fn watch_power_saving(hwnd: HWND) -> [Option<windows::Win32::System::Power::HPOWERNOTIFY>; 2] {
+    use windows::Win32::System::Power::{
+        GetSystemPowerStatus, RegisterPowerSettingNotification, SYSTEM_POWER_STATUS,
+    };
+    let mut status = SYSTEM_POWER_STATUS::default();
+    if unsafe { GetSystemPowerStatus(&mut status) }.is_ok() {
+        BATTERY_SAVER.store(
+            status.SystemStatusFlag == 1,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    Saver::ALL.map(|saver| {
+        unsafe {
+            RegisterPowerSettingNotification(
+                windows::Win32::Foundation::HANDLE(hwnd.0),
+                &saver.guid(),
+                windows::Win32::UI::WindowsAndMessaging::DEVICE_NOTIFY_WINDOW_HANDLE,
+            )
+        }
+        .ok()
+    })
 }
 
 /// Checks if system-level client area animations are enabled.
@@ -2008,6 +2728,12 @@ fn start_or_reverse_animation(hwnd: HWND, state: &mut WindowState) -> Result<()>
     }
     // A scrub in progress ends without seeking
     state.end_scrub(hwnd, false);
+    // Opening or closing ends a held key's stretch (it relaxes on the way)
+    state.momentum.release();
+    if state.hud.is_stretched() {
+        state.hud.stretch(None, !state.motion_enabled());
+        state.renderer.set_hud(state.hud.view());
+    }
     // Collapsing closes the Settings page; the next expansion shows the space
     if target_state == NotchState::Collapsed && state.settings_open {
         state.settings_open = false;
@@ -2029,7 +2755,7 @@ fn start_or_reverse_animation(hwnd: HWND, state: &mut WindowState) -> Result<()>
         state.animation = None;
         state.renderer.set_transition(None);
         state.state = target_state;
-        let new_dims = space_dimensions(target_state, state.dimensions.dpi, state.size_space());
+        let new_dims = state.settled_dims(target_state, state.dimensions.dpi);
         state.dimensions = new_dims;
 
         let screen_width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
@@ -2115,6 +2841,10 @@ fn start_or_reverse_animation(hwnd: HWND, state: &mut WindowState) -> Result<()>
         );
         let mut anim = AnimationState::start(state.state, from, target_state, size, scene);
         anim.scale = state.dimensions.scale;
+        // Opening from a notch the HUD has widened: from its actual width
+        if state.state == NotchState::Collapsed && state.hud.extra_width() > 0.0 {
+            anim.pos[0] = from.0;
+        }
         anim
     };
 
@@ -2200,6 +2930,44 @@ fn set_notch_state(hwnd: HWND, state: &mut WindowState, new_state: NotchState) -
     Ok(())
 }
 
+/// The keyboard repeat rate setting (0..31; Windows' default 31 if unread).
+fn keyboard_speed() -> u32 {
+    let mut speed = 31u32;
+    unsafe {
+        let _ = SystemParametersInfoW(
+            SPI_GETKEYBOARDSPEED,
+            0,
+            Some(&mut speed as *mut u32 as *mut core::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+    }
+    speed
+}
+
+/// A frame with only the HUD moving: the settled notch follows its widening
+/// and is drawn once; the frames stop when the HUD settles.
+fn hud_frame(hwnd: HWND, state: &mut WindowState, hud_active: bool) {
+    let resized = state.apply_hud_width();
+    let drawing = std::time::Instant::now();
+    let _ = state.renderer.render(
+        hwnd,
+        state.pos_x,
+        state.pos_y,
+        &state.dimensions,
+        state.hovered,
+        state.clock.state(),
+    );
+    let cost = drawing.elapsed().as_secs_f64() * 1000.0;
+    state.frame_lead_ms = cost.max(state.frame_lead_ms * 0.9);
+    // The countdown bubble rides the notch's edge
+    if resized && state.bubble_shown {
+        state.update_bubble(hwnd);
+    }
+    if !hud_active {
+        state.stop_frames(hwnd);
+    }
+}
+
 /// Private: a `WM_DPICHANGED` that arrived re-entrantly, replayed later (the real
 /// message cannot be posted). wParam carries the original DPI pair.
 const WM_APP_DEFERRED_DPICHANGED: u32 = WM_APP + 16;
@@ -2219,7 +2987,27 @@ fn animation_frame(hwnd: HWND, state: &mut WindowState) {
     };
     state.last_frame_time = Some(now);
 
+    // The volume HUD moves on the same frames
+    let hud_active = state.hud.step(delta_ms);
+    state.renderer.set_hud(state.hud.view());
+    // ...and the timer panel's selector / scale
+    let timer_moving = state.timer_motion.is_animating();
+    let timer_active = state.timer_motion.step(delta_ms);
+    if timer_moving {
+        state.push_timer_view();
+    }
+    let hud_active = hud_active || timer_active;
+    if state.animation.is_none() {
+        hud_frame(hwnd, state, hud_active);
+        return;
+    }
+
+    // A collapse lands on the width the HUD gives the collapsed notch
+    let collapsed_width = state.collapsed_target_dip();
     let still_active = if let Some(anim) = &mut state.animation {
+        if anim.target_state == NotchState::Collapsed {
+            anim.target[0] = collapsed_width;
+        }
         anim.step(delta_ms)
     } else {
         false
@@ -2260,8 +3048,7 @@ fn animation_frame(hwnd: HWND, state: &mut WindowState) {
         // Animation complete: snap cleanly to target state and deactivate timer
         if let Some(anim) = state.animation.take() {
             state.state = anim.target_state;
-            state.dimensions =
-                space_dimensions(anim.target_state, state.dimensions.dpi, state.size_space());
+            state.dimensions = state.settled_dims(anim.target_state, state.dimensions.dpi);
             // The last frame was already at the target; draw the
             // settled state once (exact pixels, no transition)
             state.renderer.set_transition(None);
@@ -2285,7 +3072,10 @@ fn animation_frame(hwnd: HWND, state: &mut WindowState) {
                 state.timer_title().as_deref(),
             );
         }
-        state.stop_frames(hwnd);
+        // A HUD still moving keeps the frames (they continue as HUD frames)
+        if !hud_active {
+            state.stop_frames(hwnd);
+        }
         unsafe {
             let _ = SetWindowPos(
                 hwnd,
@@ -2487,14 +3277,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = ScreenToClient(hwnd, &mut pt);
             }
 
-            let dims = match with_state(hwnd, |state| state.dimensions) {
-                Access::Ran(d) => Some(d),
+            // On the notch as last drawn (its stretched shape while the HUD
+            // stretches it, see `Renderer::hits`)
+            let (x, y) = (pt.x as f32, pt.y as f32);
+            let hit = match with_state(hwnd, |state| {
+                state
+                    .renderer
+                    .hits(x, y)
+                    .unwrap_or_else(|| state.dimensions.contains_point(x, y))
+            }) {
+                Access::Ran(hit) => Some(hit),
                 // In use by an outer handler: last completed snapshot
-                Access::Busy => HIT_DIMS.get(),
+                Access::Busy => HIT_DIMS.get().map(|d| d.contains_point(x, y)),
                 Access::Missing => None,
             };
-            let is_inside = if let Some(dims) = dims {
-                dims.contains_point(pt.x as f32, pt.y as f32)
+            let is_inside = if let Some(hit) = hit {
+                hit
             } else {
                 let mut rect = RECT::default();
                 unsafe {
@@ -2564,6 +3362,53 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
 
+        WM_APP_UPDATE_READY => {
+            // wParam: the check's id; lParam owns a `Box<update::Outcome>`,
+            // taken back exactly once, as for a drop's decoded result
+            let ptr = lparam.0 as *mut crate::update::Outcome;
+            let take = || (!ptr.is_null()).then(|| unsafe { *Box::from_raw(ptr) });
+            let ready = |state: &mut WindowState| {
+                if let Some(outcome) = take() {
+                    state.update_ready(hwnd, wparam.0, outcome);
+                }
+            };
+            match with_state(hwnd, ready) {
+                Access::Ran(()) => {}
+                Access::Busy => unsafe {
+                    if PostMessageW(Some(hwnd), msg, wparam, lparam).is_err() {
+                        drop(take());
+                    }
+                },
+                Access::Missing => drop(take()),
+            }
+            LRESULT(0)
+        }
+
+        WM_APP_UPDATE_CLICK => {
+            with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                state.dismiss_update(hwnd, wparam.0 != 0);
+            });
+            LRESULT(0)
+        }
+
+        WM_APP_UPDATE_CHECK => {
+            with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                state.check_for_updates(hwnd);
+            });
+            LRESULT(0)
+        }
+
+        settings_window::WM_APP_SETTINGS_UPDATE => {
+            with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                match settings_window::UpdateRequest::from_index(wparam.0) {
+                    Some(settings_window::UpdateRequest::Check) => state.check_for_updates(hwnd),
+                    Some(settings_window::UpdateRequest::ViewRelease) => state.open_update(),
+                    None => {}
+                }
+            });
+            LRESULT(0)
+        }
+
         WM_APP_DROP_DECODED => {
             // lParam owns a `Box<dragdrop::Decoded>` from `decode_async`: it
             // is taken back exactly once, when applied or when the window
@@ -2596,6 +3441,43 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
 
+        WM_HOTKEY => {
+            if let Some(key) = VolumeKey::from_hotkey(wparam.0) {
+                with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                    state.volume_key(hwnd, key);
+                });
+            }
+            LRESULT(0)
+        }
+
+        WM_APP_VOLUME_CHANGED => {
+            with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                state.volume_changed(hwnd);
+            });
+            LRESULT(0)
+        }
+
+        WM_APP_HUD_HIDE => {
+            with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                state.hide_hud(hwnd);
+            });
+            LRESULT(0)
+        }
+
+        WM_APP_VOLUME_RELEASED => {
+            with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                state.volume_released(hwnd);
+            });
+            LRESULT(0)
+        }
+
+        WM_APP_POWER_SAVER => {
+            with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                state.power_saver_changed(hwnd, wparam.0 != 0);
+            });
+            LRESULT(0)
+        }
+
         WM_MOUSEWHEEL => {
             // Over the timer during setup: one stop per notch of the wheel
             with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
@@ -2607,13 +3489,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 unsafe {
                     let _ = ScreenToClient(hwnd, &mut pt);
                 }
+                let (cx, cy) = state.renderer.content_offset();
+                pt.x -= cx as i32;
+                pt.y -= cy as i32;
                 let over = state
                     .timer_layout()
                     .is_some_and(|l| l.panel.contains(pt.x as f32, pt.y as f32));
-                if over && delta != 0 && state.timer.step_stop(delta.signum().into()) {
-                    state.push_timer_view();
-                    state.redraw(hwnd);
-                    state.announce_timer(hwnd);
+                let from = state.shown_scale();
+                let now = std::time::Instant::now();
+                if over && delta != 0 && state.timer.step(delta.signum().into(), now) {
+                    state.timer_time_set(hwnd, from);
+                    state.persist_timer_durations();
                 }
             });
             LRESULT(0)
@@ -2631,8 +3517,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_APP_ANIM_FRAME => {
             with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
                 state.frame_clock.frame_received();
-                // A frame queued just before the animation ended draws nothing
-                if state.animation.is_some() {
+                // A frame queued just before the frames stopped draws nothing
+                if state.animation.is_some() || state.last_frame_time.is_some() {
                     animation_frame(hwnd, state);
                 }
             });
@@ -2659,6 +3545,40 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 unsafe {
                     let _ = KillTimer(Some(hwnd), DROP_RESULT_TIMER_ID);
                     let _ = PostMessageW(Some(hwnd), WM_APP_DROP_RESULT_DONE, WPARAM(0), LPARAM(0));
+                }
+                return LRESULT(0);
+            }
+            if wparam.0 == HUD_HIDE_TIMER_ID || wparam.0 == HUD_RELEASE_TIMER_ID {
+                // One-shots, applied as messages (a busy state replays them)
+                let posted = if wparam.0 == HUD_HIDE_TIMER_ID {
+                    WM_APP_HUD_HIDE
+                } else {
+                    WM_APP_VOLUME_RELEASED
+                };
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), wparam.0);
+                    let _ = PostMessageW(Some(hwnd), posted, WPARAM(0), LPARAM(0));
+                }
+                return LRESULT(0);
+            }
+            if wparam.0 == crate::update::CHECK_TIMER_ID {
+                // The next check a day later (failures wait for it too);
+                // this one through the shared state (joins a running one)
+                unsafe {
+                    let _ = SetTimer(
+                        Some(hwnd),
+                        crate::update::CHECK_TIMER_ID,
+                        crate::update::RECHECK_MS,
+                        None,
+                    );
+                    let _ = PostMessageW(Some(hwnd), WM_APP_UPDATE_CHECK, WPARAM(0), LPARAM(0));
+                }
+                return LRESULT(0);
+            }
+            if wparam.0 == crate::update::HIDE_TIMER_ID {
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), wparam.0);
+                    let _ = PostMessageW(Some(hwnd), WM_APP_UPDATE_CLICK, WPARAM(0), LPARAM(0));
                 }
                 return LRESULT(0);
             }
@@ -2696,10 +3616,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         .bubble_presence
                         .step_on(dt, crate::timer::ABSORB_SPRING);
                     state.slot_presence.step(dt);
+                    state.update_presence.step(dt);
+                    state.update_icon.step(dt);
+                    state.renderer.set_update_icon(state.update_icon.level());
                     state.push_timer_view();
-                    let animating = feedback || switches || media || state.timer_animating();
+                    let animating = feedback
+                        || switches
+                        || media
+                        || state.timer_animating()
+                        || state.update_presence.is_animating()
+                        || state.update_icon.is_animating();
                     state.redraw(hwnd);
                     state.update_bubble(hwnd);
+                    state.draw_update_notice(hwnd);
                     if !animating {
                         state.feedback_tick = None;
                         unsafe {
@@ -2795,7 +3724,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
         WM_MOUSEMOVE => {
             with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
-                if state.timer_drag {
+                if state.timer_drag.is_some() {
                     state.drag_timer_to(hwnd, lparam);
                 }
                 if state.scrub.is_some() {
@@ -2841,7 +3770,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     | PanelHit::FullSettings
                     | PanelHit::TimerPrimary
                     | PanelHit::TimerCancel
-                    | PanelHit::TimerScale => None,
+                    | PanelHit::TimerScale
+                    | PanelHit::TimerMode(_) => None,
                 });
                 let changed = {
                     let mut feedback = state.renderer.feedback();
@@ -2908,12 +3838,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // Press compresses smoothly on the shared feedback timer
                     state.kick_feedback(hwnd);
                 } else if state.panel_hit(lparam) == Some(PanelHit::TimerScale) {
-                    // The timer's scale: jump to the stop, then follow the drag
-                    state.timer_drag = true;
+                    // The timer's scale: drag it (or tap a stop)
+                    state.begin_timer_drag(lparam);
                     unsafe {
                         SetCapture(hwnd);
                     }
-                    state.drag_timer_to(hwnd, lparam);
                 } else if let Some(button) = state.panel_hit(lparam).filter(|h| h.is_button()) {
                     // Clipboard icon button: grows a little more while pressed
                     state.renderer.feedback().press_clip(button);
@@ -2936,8 +3865,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     return;
                 }
                 // A drag along the timer's scale ends (never toggles the notch)
-                if state.timer_drag {
-                    state.end_timer_drag(hwnd);
+                if state.timer_drag.is_some() {
+                    state.end_timer_drag(hwnd, Some(lparam));
                     unsafe {
                         let _ = ReleaseCapture();
                     }
@@ -2997,6 +3926,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             return;
                         }
                         PanelHit::TimerScale => return,
+                        PanelHit::TimerMode(mode) => {
+                            state.timer_mode(hwnd, mode);
+                            return;
+                        }
                         PanelHit::Row(index) | PanelHit::Copy(index) => {
                             // Clipboard busy: nothing changes; no retry
                             let _ = state.restore_clipboard(hwnd, index);
@@ -3019,6 +3952,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 } else if let Some(space) = state.space_at(lparam) {
                     // Space capsule: switches spaces; never toggles the notch
                     state.select_space(hwnd, space);
+                } else if state.on_timer_panel(lparam) {
+                    // Between the timer's controls: its panel, not the
+                    // notch's background
+                } else if state.update_icon_at(lparam) {
+                    // The collapsed notch's update icon: the release page;
+                    // never toggles the notch
+                    state.open_update();
                 } else {
                     state.reset_feedback(hwnd);
                     let _ = start_or_reverse_animation(hwnd, state);
@@ -3030,8 +3970,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_CAPTURECHANGED => {
             // Capture lost mid-press (e.g. another window took it): cancel the press
             with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
-                if state.timer_drag {
-                    state.end_timer_drag(hwnd);
+                if state.timer_drag.is_some() {
+                    state.end_timer_drag(hwnd, None);
                 }
                 // A scrub whose capture was taken away seeks nowhere
                 state.end_scrub(hwnd, false);
@@ -3059,7 +3999,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     } else {
                         GetDpiForWindow(hwnd)
                     };
-                    let new_dims = space_dimensions(state.state, new_dpi, state.size_space());
+                    let new_dims = state.settled_dims(state.state, new_dpi);
 
                     let screen_width = GetSystemMetrics(SM_CXSCREEN);
                     let new_x = calculate_notch_x(screen_width, new_dims.width);
@@ -3104,7 +4044,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 unsafe {
                     let dpi = GetDpiForWindow(hwnd);
                     let dpi = if dpi > 0 { dpi } else { GetDpiForSystem() };
-                    let new_dims = space_dimensions(state.state, dpi, state.size_space());
+                    let new_dims = state.settled_dims(state.state, dpi);
 
                     let screen_width = GetSystemMetrics(SM_CXSCREEN);
                     let new_x = calculate_notch_x(screen_width, new_dims.width);
@@ -3180,6 +4120,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
         WM_POWERBROADCAST => {
             let event = wparam.0 as u32;
+            if event == PBT_POWERSETTINGCHANGE {
+                // lParam is only valid now: read it, then apply as a message
+                if let Some((saver, on)) = unsafe { saver_report(lparam) } {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let before = power_saver_active();
+                    let seen = saver.seen().swap(true, Relaxed);
+                    saver.flag().store(on, Relaxed);
+                    let after = power_saver_active();
+                    // Only a real change of the effective state (not the
+                    // first report, not the other saver agreeing) is shown
+                    if after != before {
+                        let notice = crate::hud::power_notice_due(seen, before, after);
+                        unsafe {
+                            let _ = PostMessageW(
+                                Some(hwnd),
+                                WM_APP_POWER_SAVER,
+                                WPARAM(usize::from(notice)),
+                                LPARAM(0),
+                            );
+                        }
+                    }
+                }
+                return LRESULT(1);
+            }
             if event == PBT_APMRESUMEAUTOMATIC || event == PBT_APMRESUMESUSPEND {
                 with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
                     let changed = state.clock.refresh();
@@ -3375,6 +4339,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = KillTimer(Some(hwnd), AUTO_COLLAPSE_TIMER_ID);
                 let _ = KillTimer(Some(hwnd), TIMER_TICK_TIMER_ID);
                 let _ = KillTimer(Some(hwnd), DROP_RESULT_TIMER_ID);
+                let _ = KillTimer(Some(hwnd), HUD_HIDE_TIMER_ID);
+                let _ = KillTimer(Some(hwnd), HUD_RELEASE_TIMER_ID);
                 PostQuitMessage(0);
             }
             // Stop reporting outside clicks (no-op if never registered)
@@ -3388,9 +4354,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // (if the state is busy, HighResTimer's Drop releases it on free).
             // The countdown bubble goes too (owned by the notch, it would be
             // destroyed with it anyway)
+            crate::hud::release_volume_keys(hwnd);
             let _ = with_state(hwnd, |state| {
                 state.stop_frames(hwnd);
                 state.tray.remove();
+                state.volume = None;
+                for watch in state.saver_watch.iter_mut().filter_map(Option::take) {
+                    unsafe {
+                        let _ = windows::Win32::System::Power::UnregisterPowerSettingNotification(
+                            watch,
+                        );
+                    }
+                }
                 if let Some(bubble) = state.bubble.take() {
                     unsafe {
                         let _ = DestroyWindow(bubble);
@@ -3464,6 +4439,75 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 /// The countdown bubble's window class: it only shows what the notch renders
 /// into it, so it has no state of its own.
 const BUBBLE_CLASS_NAME: windows::core::PCWSTR = windows::core::w!("OecaTimerBubbleClass");
+const UPDATE_CLASS_NAME: windows::core::PCWSTR = windows::core::w!("OecaUpdateNoticeClass");
+
+/// The update notice: never activated; a click (on the pill: its
+/// transparent surroundings pass clicks through) opens the release, a
+/// right-click dismisses it. Both are posted to the notch.
+unsafe extern "system" fn update_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let post = |open: usize| unsafe {
+        if let Ok(owner) = GetWindow(hwnd, GW_OWNER) {
+            let _ = PostMessageW(Some(owner), WM_APP_UPDATE_CLICK, WPARAM(open), LPARAM(0));
+        }
+    };
+    match msg {
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_SETCURSOR => unsafe {
+            if let Ok(hand) = LoadCursorW(None, IDC_HAND) {
+                SetCursor(Some(hand));
+            }
+            LRESULT(1)
+        },
+        WM_LBUTTONUP => {
+            post(1);
+            LRESULT(0)
+        }
+        WM_RBUTTONUP => {
+            post(0);
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// Creates the (hidden) update notice: a layered popup that never
+/// activates, owned by the notch so it can never outlive it; `title` is
+/// what screen readers say for it.
+fn create_update_notice(owner: HWND, title: &str) -> Option<HWND> {
+    let title: Vec<u16> = title.encode_utf16().chain([0]).collect();
+    unsafe {
+        let hinstance = GetModuleHandleW(None).ok()?;
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(update_wndproc),
+            hInstance: hinstance.into(),
+            lpszClassName: UPDATE_CLASS_NAME,
+            ..Default::default()
+        };
+        // Already registered (an earlier notice): fails harmlessly
+        let _ = RegisterClassExW(&wc);
+        CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            UPDATE_CLASS_NAME,
+            windows::core::PCWSTR(title.as_ptr()),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            Some(owner),
+            None,
+            Some(hinstance.into()),
+            None,
+        )
+        .ok()
+    }
+}
 
 unsafe extern "system" fn bubble_wndproc(
     hwnd: HWND,
@@ -3634,7 +4678,8 @@ fn run_window(ole: bool) -> Result<()> {
         let mut settings_store = crate::settings_store::SettingsStore::open();
         let mut settings = settings_store.load().unwrap_or_default();
         settings.start_on_launch = crate::startup::is_enabled();
-        let ex_style = if settings.always_on_top {
+        let always_on_top = settings.always_on_top;
+        let ex_style = if always_on_top {
             WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
         } else {
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
@@ -3712,6 +4757,9 @@ fn run_window(ole: bool) -> Result<()> {
         // defaults), but never over a settings file that could not be used,
         // e.g. one from a newer Oeca: only a setting change replaces that
         let _ = settings_store.initialize(&settings);
+        // The timer starts in Focus with the saved durations (the countdown
+        // itself is never saved)
+        let timer = Countdown::with_secs(settings.focus_secs, settings.break_secs);
         let state = Box::new(WindowState {
             renderer,
             high_res_timer: HighResTimer::default(),
@@ -3741,15 +4789,26 @@ fn run_window(ole: bool) -> Result<()> {
             clear_pending: false,
             grace: GracePeriod::default(),
             outside_watch: false,
-            timer: Countdown::default(),
+            timer,
+            timer_motion: crate::timer::TimerMotion::new(&timer),
             bubble_presence: Presence::default(),
             slot_presence: Presence::default(),
             bubble: None,
             bubble_shown: false,
-            timer_drag: false,
+            timer_drag: None,
             timer_shown: Countdown::default(),
             scrub: None,
             tray: crate::tray::TrayIcon::default(),
+            hud: crate::hud::Hud::default(),
+            momentum: crate::hud::Momentum::default(),
+            volume: None,
+            saver_watch: [None, None],
+            updates: crate::update::UpdateState::default(),
+            update_presence: Presence::default(),
+            update_icon: Presence::default(),
+            update_notice: None,
+            update_shown: false,
+            update_drawn: None,
         });
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
 
@@ -3760,6 +4819,20 @@ fn run_window(ole: bool) -> Result<()> {
             let _ = state.media.initialize(hwnd);
             // Event-driven clipboard history (no polling)
             let _ = clipboard::start_listening(hwnd);
+            // The volume keys show the HUD
+            crate::hud::take_volume_keys(hwnd);
+            // Battery / Energy Saver: Oeca moves as if Reduced motion were on
+            state.saver_watch = watch_power_saving(hwnd);
+            // Update availability, only if the user turned it on: once
+            // startup has settled, then daily
+            if state.settings.check_for_updates {
+                let _ = SetTimer(
+                    Some(hwnd),
+                    crate::update::CHECK_TIMER_ID,
+                    crate::update::FIRST_CHECK_MS,
+                    None,
+                );
+            }
             state
                 .renderer
                 .render(hwnd, x, y, &state.dimensions, false, state.clock.state())
@@ -3786,8 +4859,20 @@ fn run_window(ole: bool) -> Result<()> {
             }
         }
 
-        // 7. Display window without stealing focus
+        // 7. Display window without stealing focus; not on top, it shows
+        // below the window in use (a game already running stays in front)
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        if !always_on_top {
+            let _ = SetWindowPos(
+                hwnd,
+                Some(z_band(false)),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
 
         // Notification-area icon: without a taskbar yet it is simply absent
         // until Explorer announces itself (TaskbarCreated)
@@ -3821,6 +4906,42 @@ fn run_window(ole: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_update_notice_then_icon_never_both() {
+        use crate::update::{Outcome, Release, UpdateState};
+        let mut s = UpdateState::default();
+        let found = |s: &mut UpdateState, outcome| {
+            let id = s.begin().unwrap();
+            assert!(s.finish(id, outcome));
+        };
+        // Nothing known (or a failed check): neither
+        assert_eq!(update_targets(&s, true), (false, false));
+        found(&mut s, Outcome::Failed);
+        assert_eq!(update_targets(&s, true), (false, false));
+        // A newer release: the notice under the collapsed notch (waiting
+        // while expanded), the artwork stays
+        let release = Release {
+            version: (0, 3, 0),
+            url: "https://github.com/ujvall/Oeca/releases/tag/v0.3.0".into(),
+            installer: None,
+        };
+        found(&mut s, Outcome::Newer(release));
+        assert_eq!(update_targets(&s, true), (true, false));
+        assert_eq!(update_targets(&s, false), (false, false));
+        // Dismissed: the icon takes over, for as long as it is newer
+        s.dismiss_notice();
+        assert_eq!(update_targets(&s, true), (false, true));
+        found(&mut s, Outcome::Failed);
+        assert_eq!(
+            update_targets(&s, true),
+            (false, true),
+            "a failure keeps it"
+        );
+        // Current again: the artwork returns
+        found(&mut s, Outcome::Current);
+        assert_eq!(update_targets(&s, true), (false, false));
+    }
 
     #[test]
     fn test_state_guard_refuses_reentry_and_replays_after_exit() {
@@ -4308,11 +5429,98 @@ mod tests {
         assert_eq!(z_order(false), (None, SWP_NOZORDER));
         // Flipping moves into / out of the topmost band
         assert_eq!(z_band(true), HWND_TOPMOST);
-        assert_eq!(z_band(false), HWND_NOTOPMOST);
+        // Off: never the topmost band; below the app in use, else the top of
+        // the normal band
+        assert_ne!(z_band(false), HWND_TOPMOST);
+        assert_eq!(normal_slot(HWND::default()), HWND_NOTOPMOST);
+        let app = HWND(0x1234 as *mut _);
+        assert_eq!(
+            foreground_kind(false, false, false, app),
+            Foreground::App(app)
+        );
+        for (oeca, topmost, shell) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            assert_eq!(
+                foreground_kind(oeca, topmost, shell, app),
+                Foreground::None,
+                "never below Oeca itself, a topmost window or the desktop / taskbar"
+            );
+        }
         settings.always_on_top = !settings.always_on_top;
         assert!(!settings.always_on_top);
         settings.always_on_top = !settings.always_on_top;
         assert!(settings.always_on_top);
+    }
+
+    #[test]
+    fn test_power_saver_is_effective_reduced_motion_never_the_saved_one() {
+        // Effective motion: the user's preference OR the system OR a saver
+        assert!(effective_motion(false, true, false));
+        assert!(!effective_motion(false, true, true), "saver on: snap");
+        assert!(!effective_motion(true, true, false), "the user's own");
+        assert!(!effective_motion(true, true, true));
+        assert!(
+            !effective_motion(false, false, false),
+            "system animations off"
+        );
+        // The saved setting is a separate value the saver never touches
+        let settings = OecaSettings::default();
+        let effective = effective_motion(settings.reduced_motion, true, true);
+        assert!(!effective && !settings.reduced_motion);
+        // Saver off again: back to whatever the user chose
+        assert!(effective_motion(settings.reduced_motion, true, false));
+        assert!(!effective_motion(true, true, false));
+    }
+
+    #[test]
+    fn test_saver_reports_are_read_from_the_notification() {
+        use windows::Win32::System::SystemServices::GUID_POWER_SAVING_STATUS;
+        #[repr(C)]
+        struct Setting {
+            guid: windows::core::GUID,
+            len: u32,
+            data: u32,
+        }
+        let read = |guid, data| {
+            let mut s = Setting { guid, len: 4, data };
+            unsafe { saver_report(LPARAM(&mut s as *mut Setting as isize)) }
+        };
+        assert_eq!(
+            read(GUID_POWER_SAVING_STATUS, 1),
+            Some((Saver::Battery, true))
+        );
+        assert_eq!(
+            read(GUID_POWER_SAVING_STATUS, 0),
+            Some((Saver::Battery, false))
+        );
+        assert_eq!(
+            read(GUID_ENERGY_SAVER_STATUS, 2),
+            Some((Saver::Energy, true))
+        );
+        assert_eq!(
+            read(GUID_ENERGY_SAVER_STATUS, 1),
+            Some((Saver::Energy, true))
+        );
+        assert_eq!(
+            read(GUID_ENERGY_SAVER_STATUS, 0),
+            Some((Saver::Energy, false))
+        );
+        assert_eq!(
+            read(windows::core::GUID::zeroed(), 1),
+            None,
+            "other settings"
+        );
+        assert_eq!(unsafe { saver_report(LPARAM(0)) }, None);
+        let mut short = Setting {
+            guid: GUID_POWER_SAVING_STATUS,
+            len: 0,
+            data: 1,
+        };
+        let lp = LPARAM(&mut short as *mut Setting as isize);
+        assert_eq!(unsafe { saver_report(lp) }, None, "no data");
     }
 
     #[test]

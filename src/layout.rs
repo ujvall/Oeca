@@ -319,89 +319,105 @@ pub enum PanelHit {
     CancelClear,
     /// The clear confirmation's Clear: forgets the history.
     ConfirmClear,
-    /// Home's timer: the round primary button (Start / Pause / Resume /
-    /// Restart), the round Cancel button, and the duration scale.
+    /// Home's timer: the primary button (Start / Pause / Resume / Restart),
+    /// the Cancel button, the minute scale, and a mode pill (Focus / Break).
     TimerPrimary,
     TimerCancel,
     TimerScale,
+    TimerMode(crate::timer::Mode),
 }
 
 impl PanelHit {
-    /// Icon buttons (they grow on hover/press); a row box or the timer's
-    /// scale is not one.
+    /// Icon buttons (they grow on hover/press); a row box, the timer's
+    /// scale or a mode pill is not one.
     pub fn is_button(self) -> bool {
-        !matches!(self, Self::Row(_) | Self::TimerScale)
+        !matches!(self, Self::Row(_) | Self::TimerScale | Self::TimerMode(_))
     }
 }
 
-/// Home's countdown timer: the numerals with their round buttons at the
-/// row's right end (Cancel, then the primary button), and under them the
-/// duration scale (setup) or a status line.
+/// Home's Focus / Break timer, in two columns. Left: the mode pills over
+/// the scale (labels over the ticks, a tick per stop, the pointer under its
+/// fixed centre: the scale slides so the value sits there). Right: the
+/// numerals (right-aligned) over the round buttons (primary at the right
+/// edge, Cancel beside it).
 ///
 /// ```text
-/// 4:59                 (x) (||)
-/// 5 min timer
+///       [Focus] [Break]
+///  15   20   25   30   35          25:00
+///  |||||||||||||||||||||||
+///             ^                 (x) (>)
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TimerLayout {
     pub panel: RectF,
-    /// Numerals row (the text itself stops before the buttons: `display`).
-    pub numerals: RectF,
+    /// The Focus and Break pills (`Mode::index` order).
+    pub modes: [RectF; 2],
+    pub labels: RectF,
+    pub ruler: RectF,
+    pub pointer: RectF,
     pub primary: RectF,
     pub cancel: RectF,
-    /// Second row: the scale (setup) or the status line.
-    pub row: RectF,
-    /// Half the indicator's width: the scale's first and last stops sit this
-    /// far inside the row so the indicator never leaves it.
-    pub inset: f32,
+    /// Where the numerals draw (right-aligned; the same whatever is shown).
+    pub numerals: RectF,
+    /// The scale: px from one stop to the next.
+    pub step: f32,
 }
 
 impl TimerLayout {
     pub fn offset_x(self, dx: f32) -> Self {
         Self {
             panel: self.panel.offset_x(dx),
-            numerals: self.numerals.offset_x(dx),
+            modes: self.modes.map(|r| r.offset_x(dx)),
+            labels: self.labels.offset_x(dx),
+            ruler: self.ruler.offset_x(dx),
+            pointer: self.pointer.offset_x(dx),
             primary: self.primary.offset_x(dx),
             cancel: self.cancel.offset_x(dx),
-            row: self.row.offset_x(dx),
-            inset: self.inset,
+            numerals: self.numerals.offset_x(dx),
+            step: self.step,
         }
     }
 
-    /// Where the numerals may draw: up to the first button shown (Cancel
-    /// only outside setup).
-    pub fn display(&self, idle: bool) -> RectF {
-        let first = if idle { self.primary } else { self.cancel };
-        let gap = (self.primary.left - self.cancel.right).max(0.0);
+    /// The scale's fixed centre (where the value is).
+    pub fn scale_centre(&self) -> f32 {
+        ((self.ruler.left + self.ruler.right) / 2.0).round()
+    }
+
+    /// The whole scale, a generous target: from its labels down to the
+    /// panel's bottom (drag or tap it, in any phase).
+    pub fn scale(&self) -> RectF {
         RectF::new(
-            self.numerals.left,
-            self.numerals.top,
-            (first.left - gap).max(self.numerals.left),
-            self.numerals.bottom,
+            self.ruler.left,
+            self.labels.top,
+            self.ruler.right,
+            self.panel.bottom,
         )
     }
 
-    /// Whole-pixel x of the scale's stop `i` (of `n`).
-    pub fn stop_x(&self, i: usize, n: usize) -> f32 {
-        let (left, right) = (self.row.left + self.inset, self.row.right - self.inset);
-        let step = (right - left) / (n.max(2) - 1) as f32;
-        (left + i.min(n - 1) as f32 * step).round()
+    /// x of stop `i` while the scale shows `value` at its centre.
+    pub fn stop_x(&self, i: f32, value: f32) -> f32 {
+        self.scale_centre() + (i - value) * self.step
     }
 
-    /// The stop nearest `x` (clamped to the scale).
-    pub fn stop_at(&self, x: f32, n: usize) -> usize {
-        let (left, right) = (self.row.left + self.inset, self.row.right - self.inset);
-        let step = (right - left) / (n.max(2) - 1) as f32;
-        (((x - left) / step).round().max(0.0) as usize).min(n - 1)
+    /// The (fractional) stop at `x` while the scale shows `value`.
+    pub fn stop_at(&self, x: f32, value: f32) -> f32 {
+        value + (x - self.scale_centre()) / self.step
     }
 
-    /// What a point hits: the buttons shown, and the scale during setup.
+    /// What a point hits: a mode pill, the buttons shown (Cancel outside
+    /// setup), the scale.
     pub fn hit(&self, px: f32, py: f32, idle: bool) -> Option<PanelHit> {
+        if let Some(mode) = crate::timer::Mode::ALL
+            .into_iter()
+            .find(|m| self.modes[m.index()].contains(px, py))
+        {
+            return Some(PanelHit::TimerMode(mode));
+        }
         if self.primary.contains(px, py) {
             Some(PanelHit::TimerPrimary)
         } else if !idle && self.cancel.contains(px, py) {
             Some(PanelHit::TimerCancel)
-        } else if idle && self.row.contains(px, py) {
+        } else if self.scale().contains(px, py) {
             Some(PanelHit::TimerScale)
         } else {
             None
@@ -431,8 +447,11 @@ pub fn resolve_home_timer_layout(
 ) -> Option<HomeTimerLayout> {
     use crate::config::{
         BASE_TIMER_BUTTON_GAP, BASE_TIMER_BUTTON_SIZE, BASE_TIMER_COLUMN_GAP,
-        BASE_TIMER_DISPLAY_HEIGHT, BASE_TIMER_INDICATOR_WIDTH, BASE_TIMER_PANEL_WIDTH,
-        BASE_TIMER_ROW_GAP, BASE_TIMER_SCALE_HEIGHT,
+        BASE_TIMER_COLUMN_SPACING, BASE_TIMER_DISPLAY_HEIGHT, BASE_TIMER_LABEL_GAP,
+        BASE_TIMER_LABEL_HEIGHT, BASE_TIMER_PANEL_MAX_WIDTH, BASE_TIMER_PILL_GAP,
+        BASE_TIMER_PILL_HEIGHT, BASE_TIMER_PILL_WIDTH, BASE_TIMER_POINTER_GAP,
+        BASE_TIMER_POINTER_HEIGHT, BASE_TIMER_POINTER_WIDTH, BASE_TIMER_RULER_HEIGHT,
+        BASE_TIMER_SIDE_WIDTH, BASE_TIMER_STEP, BASE_TIMER_TICK_GAP,
     };
     let ResolvedLayout::Expanded { components, .. } = resolve_layout(dimensions) else {
         return None;
@@ -476,32 +495,78 @@ pub fn resolve_home_timer_layout(
             )
         }
     };
-    let w = px(BASE_TIMER_PANEL_WIDTH).min(region.width());
-    let (display_h, row_gap, row_h) = (
-        px(BASE_TIMER_DISPLAY_HEIGHT),
-        px(BASE_TIMER_ROW_GAP),
-        px(BASE_TIMER_SCALE_HEIGHT),
-    );
-    let h = display_h + row_gap + row_h;
+    let w = px(BASE_TIMER_PANEL_MAX_WIDTH).min(region.width().floor());
+    let h = px(72.0).min(c.bottom.floor() - c.top.ceil());
     let left = (region.left + (region.width() - w) / 2.0).round();
     let top = (region.top + (region.height() - h) / 2.0)
         .round()
-        .max(c.top);
+        .max(c.top.ceil());
     let panel = RectF::new(left, top, left + w, top + h);
-    let numerals = RectF::new(left, top, panel.right, top + display_h);
-    let (b, gap) = (px(BASE_TIMER_BUTTON_SIZE), px(BASE_TIMER_BUTTON_GAP));
-    let b_top = (top + (display_h - b) / 2.0).round();
-    let primary = RectF::new(panel.right - b, b_top, panel.right, b_top + b);
-    let cancel = RectF::new(primary.left - gap - b, b_top, primary.left - gap, b_top + b);
-    let row_top = numerals.bottom + row_gap;
+    // Right: the numerals over the buttons
+    let side = px(BASE_TIMER_SIDE_WIDTH).min(w / 2.0);
+    let side_left = panel.right - side;
+    let numerals = RectF::new(
+        side_left,
+        top,
+        panel.right,
+        top + px(BASE_TIMER_DISPLAY_HEIGHT),
+    );
+    let (b, bgap) = (
+        px(BASE_TIMER_BUTTON_SIZE).min(panel.bottom - numerals.bottom),
+        px(BASE_TIMER_BUTTON_GAP),
+    );
+    let primary = RectF::new(panel.right - b, panel.bottom - b, panel.right, panel.bottom);
+    let cancel = RectF::new(
+        primary.left - bgap - b,
+        primary.top,
+        primary.left - bgap,
+        primary.bottom,
+    );
+    // Left: the pills (centred over the scale) over the scale
+    let scale_right = side_left - px(BASE_TIMER_COLUMN_SPACING);
+    let centre = ((left + scale_right) / 2.0).round();
+    // (narrowed to the scale's width in the narrowest band)
+    let pgap = px(BASE_TIMER_PILL_GAP);
+    let pw = px(BASE_TIMER_PILL_WIDTH).min(((scale_right - left - pgap) / 2.0).floor());
+    let pill_h = px(BASE_TIMER_PILL_HEIGHT);
+    let pills_left = (centre - (2.0 * pw + pgap) / 2.0).round();
+    let pill = |i: f32| {
+        let l = pills_left + i * (pw + pgap);
+        RectF::new(l, top, l + pw, top + pill_h)
+    };
+    let labels_top = top + pill_h + px(BASE_TIMER_LABEL_GAP);
+    let labels = RectF::new(
+        left,
+        labels_top,
+        scale_right,
+        labels_top + px(BASE_TIMER_LABEL_HEIGHT),
+    );
+    let ruler_top = labels.bottom + px(BASE_TIMER_TICK_GAP);
+    let ruler = RectF::new(
+        left,
+        ruler_top,
+        scale_right,
+        (ruler_top + px(BASE_TIMER_RULER_HEIGHT)).min(panel.bottom),
+    );
+    let pw_ptr = px(BASE_TIMER_POINTER_WIDTH);
+    let pointer_top = ruler.bottom + px(BASE_TIMER_POINTER_GAP);
+    let pointer = RectF::new(
+        centre - (pw_ptr / 2.0).round(),
+        pointer_top.min(panel.bottom),
+        centre - (pw_ptr / 2.0).round() + pw_ptr,
+        (pointer_top + px(BASE_TIMER_POINTER_HEIGHT)).min(panel.bottom),
+    );
     Some(HomeTimerLayout {
         timer: TimerLayout {
             panel,
-            numerals,
+            modes: [pill(0.0), pill(1.0)],
+            labels,
+            ruler,
+            pointer,
             primary,
             cancel,
-            row: RectF::new(left, row_top, panel.right, row_top + row_h),
-            inset: (px(BASE_TIMER_INDICATOR_WIDTH) / 2.0).ceil(),
+            numerals,
+            step: px(BASE_TIMER_STEP),
         },
         clock,
         divider,
@@ -519,6 +584,75 @@ pub fn timer_slot_rect(layout: &CollapsedLayout, scale: f32) -> RectF {
         right,
         layout.clock_bounds.bottom,
     )
+}
+
+/// The volume HUD as one row: the icon (centred in `icon`,
+/// `glyph` wide), the level bar, the level number right-aligned in `text`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HudLayout {
+    pub icon: RectF,
+    pub glyph: f32,
+    pub bar: RectF,
+    pub text: RectF,
+}
+
+fn hud_row(icon: RectF, glyph: f32, top: f32, bottom: f32, right: f32, scale: f32) -> HudLayout {
+    let px = |v: f32| (v * scale).round();
+    let text = RectF::new(
+        right - px(crate::config::BASE_HUD_TEXT_WIDTH),
+        top,
+        right,
+        bottom,
+    );
+    let h = px(crate::config::BASE_HUD_BAR_HEIGHT).max(2.0);
+    let bar_top = ((top + bottom - h) / 2.0).round();
+    let left = icon.right + px(crate::config::BASE_HUD_GAP);
+    let bar = RectF::new(
+        left,
+        bar_top,
+        (text.left - px(crate::config::BASE_HUD_GAP)).max(left),
+        bar_top + h,
+    );
+    HudLayout {
+        icon,
+        glyph,
+        bar,
+        text,
+    }
+}
+
+/// The HUD number's three digit cells (hundreds, tens, ones), each `cell`
+/// wide, right-aligned in `text`: fixed whatever the number, so it never
+/// shifts as digits come and go.
+pub fn hud_digit_cells(text: RectF, cell: f32) -> [RectF; 3] {
+    let at = |k: f32| {
+        let left = text.right - (3.0 - k) * cell;
+        RectF::new(left, text.top, left + cell, text.bottom)
+    };
+    [at(0.0), at(1.0), at(2.0)]
+}
+
+/// The HUD in the collapsed notch: icon in the artwork's place, number in
+/// the visualizer's (as the countdown slot), the bar across the clock.
+pub fn collapsed_hud_layout(layout: &CollapsedLayout, scale: f32) -> HudLayout {
+    let icon = layout.artwork_bounds;
+    hud_row(
+        icon,
+        (icon.height() * 0.9).round(),
+        layout.clock_bounds.top,
+        layout.clock_bounds.bottom,
+        layout.visualizer_bounds.right,
+        scale,
+    )
+}
+
+/// The HUD on the expanded notch: across the header (pills to Settings icon).
+pub fn header_hud_layout(selector: &SpaceSelectorLayout, scale: f32) -> HudLayout {
+    let s = selector.settings;
+    let left = selector.home.left;
+    let icon = RectF::new(left, s.top, left + s.height(), s.bottom);
+    let glyph = (crate::config::BASE_SPACE_ICON_SIZE * 1.2 * scale).round();
+    hud_row(icon, glyph, s.top, s.bottom, s.right, scale)
 }
 
 /// The countdown bubble beside the collapsed notch: a floating circle of
@@ -639,11 +773,13 @@ impl ClipboardLayout {
         TileParts {
             tile: t,
             text: RectF::new(t.left + pad, t.top + pad, t.right - pad, copy.top),
+            // Whole pixels, so its thumbnail is built at exactly its size
+            // (a fractional edge would be stretched by a sub-pixel)
             image: RectF::new(
-                t.left + inset,
-                t.top + inset,
-                t.right - inset,
-                copy.top - inset / 2.0,
+                (t.left + inset).round(),
+                (t.top + inset).round(),
+                (t.right - inset).round(),
+                (copy.top - inset / 2.0).round(),
             ),
             caption: RectF::new(t.left + pad, copy.top, trash.left, copy.bottom),
             copy,
@@ -3092,46 +3228,185 @@ mod tests {
         }
     }
 
-    /// Buttons inside the panel, side by side; the numerals row and the
-    /// scale row stacked; the scale's stops in order and hit-testable.
+    /// Everything inside the panel, in order top to bottom (pills, labels,
+    /// ticks, pointer, buttons / numerals) with nothing overlapping; the
+    /// scale's minutes evenly spaced about its fixed centre; every control
+    /// hit-testable as drawn.
     fn timer_panel_is_well_formed(t: &TimerLayout, dpi: u32) {
-        for r in [t.numerals, t.primary, t.cancel, t.row] {
+        let scale = dpi as f32 / 96.0;
+        for r in [
+            t.modes[0], t.modes[1], t.labels, t.ruler, t.pointer, t.primary, t.cancel, t.numerals,
+        ] {
             assert!(inside(&r, &t.panel), "{dpi}: {r:?} in {:?}", t.panel);
         }
+        // Big enough to use: the whole of Home's content height, a real
+        // scale, the full-size buttons and type
+        assert!(t.panel.height() >= (70.0 * scale).floor(), "{dpi}: height");
+        assert!(
+            t.ruler.width() >= (88.0 * scale).floor(),
+            "{dpi}: a usable scale"
+        );
+        let px = |v: f32| (v * scale).round();
+        assert_eq!(
+            t.primary.width(),
+            px(crate::config::BASE_TIMER_BUTTON_SIZE),
+            "{dpi}"
+        );
+        assert_eq!(
+            t.modes[0].height(),
+            px(crate::config::BASE_TIMER_PILL_HEIGHT),
+            "{dpi}"
+        );
+        // Left column, top to bottom: pills, labels, ticks, pointer
+        assert!(
+            t.modes[0].right <= t.modes[1].left,
+            "{dpi}: pills side by side"
+        );
+        let pills_mid = (t.modes[0].left + t.modes[1].right) / 2.0;
+        assert!(
+            (pills_mid - t.scale_centre()).abs() <= 1.0,
+            "{dpi}: pills centred over the pointer"
+        );
+        assert!(t.modes[0].bottom <= t.labels.top, "{dpi}");
+        assert!(
+            t.labels.bottom <= t.ruler.top && t.ruler.bottom <= t.pointer.top,
+            "{dpi}"
+        );
+        // Right column: the numerals over the buttons, clear of the scale;
+        // the primary button at the right edge (it never moves), Cancel
+        // beside it; equal circles
+        assert!(t.ruler.right < t.numerals.left, "{dpi}: two columns");
+        assert!(t.numerals.bottom <= t.primary.top, "{dpi}");
+        assert_eq!(
+            t.numerals.right, t.panel.right,
+            "right-aligned to the panel"
+        );
+        assert_eq!(t.primary.right, t.panel.right, "{dpi}");
+        assert_eq!(t.primary.width(), t.primary.height(), "{dpi}: round");
+        assert_eq!(t.primary.width(), t.cancel.width());
         assert!(t.cancel.right < t.primary.left, "{dpi}");
-        assert_eq!(t.primary.width(), t.primary.height(), "round buttons");
-        assert!(t.numerals.bottom <= t.row.top, "{dpi}");
-        assert!(t.display(true).right < t.primary.left, "{dpi}");
-        assert!(t.display(false).right < t.cancel.left, "{dpi}");
+        assert!(t.ruler.right < t.cancel.left, "{dpi}");
+        // The pointer sits under the scale's centre; stops evenly spaced,
+        // the same at every value
+        let centre = t.scale_centre();
         assert!(
-            t.display(false).width() > t.panel.width() * 0.4,
-            "room for numerals at {dpi}"
+            (((t.pointer.left + t.pointer.right) / 2.0) - centre).abs() <= 1.0,
+            "{dpi}"
         );
-        let n = crate::timer::STOPS.len();
-        let xs: Vec<f32> = (0..n).map(|i| t.stop_x(i, n)).collect();
-        assert!(
-            xs.windows(2).all(|w| w[0] < w[1]),
-            "stops in order at {dpi}"
-        );
-        assert!(xs[0] >= t.row.left && xs[n - 1] <= t.row.right, "{dpi}");
-        for (i, x) in xs.iter().enumerate() {
-            assert_eq!(t.stop_at(*x, n), i, "round trip at {dpi}");
+        assert_eq!(t.step, (crate::config::BASE_TIMER_STEP * scale).round());
+        for value in [-1.0f32, 0.0, 25.0, 59.5, 122.0] {
+            assert_eq!(
+                t.stop_x(value, value),
+                centre,
+                "{dpi}: the value at the centre"
+            );
+            let step = t.stop_x(value + 1.0, value) - t.stop_x(value, value);
+            assert!((step - t.step).abs() < 1e-3, "{dpi}: even spacing");
+            assert!((t.stop_at(t.stop_x(value + 3.0, value), value) - (value + 3.0)).abs() < 1e-3);
         }
-        assert_eq!(t.stop_at(t.row.left - 100.0, n), 0, "clamped");
-        assert_eq!(t.stop_at(t.row.right + 100.0, n), n - 1, "clamped");
-        let centre = |r: RectF| ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
-        let (px, py) = centre(t.primary);
-        assert_eq!(t.hit(px, py, true), Some(PanelHit::TimerPrimary));
-        let (cx, cy) = centre(t.cancel);
-        assert_eq!(t.hit(cx, cy, false), Some(PanelHit::TimerCancel));
-        assert_eq!(t.hit(cx, cy, true), None, "no Cancel during setup");
-        let (rx, ry) = centre(t.row);
-        assert_eq!(t.hit(rx, ry, true), Some(PanelHit::TimerScale));
-        assert_eq!(t.hit(rx, ry, false), None, "the scale is setup-only");
-        let (nx, ny) = (t.numerals.left + 2.0, centre(t.numerals).1);
+        // Hits: everything works in every phase (Cancel once started)
+        let mid = |r: RectF| ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
+        use crate::timer::Mode;
+        for idle in [true, false] {
+            let (px, py) = mid(t.primary);
+            assert_eq!(t.hit(px, py, idle), Some(PanelHit::TimerPrimary));
+            let (cx, cy) = mid(t.cancel);
+            let cancel = (!idle).then_some(PanelHit::TimerCancel);
+            assert_eq!(t.hit(cx, cy, idle), cancel, "Cancel only once started");
+            for (x, y) in [mid(t.ruler), mid(t.labels), mid(t.pointer)] {
+                assert_eq!(t.hit(x, y, idle), Some(PanelHit::TimerScale), "{dpi}");
+            }
+            for mode in Mode::ALL {
+                let (mx, my) = mid(t.modes[mode.index()]);
+                assert_eq!(t.hit(mx, my, idle), Some(PanelHit::TimerMode(mode)));
+            }
+        }
+        let (nx, ny) = (t.numerals.right - 2.0, mid(t.numerals).1);
         assert_eq!(t.hit(nx, ny, true), None, "numerals are not a control");
         assert!(PanelHit::TimerPrimary.is_button() && PanelHit::TimerCancel.is_button());
-        assert!(!PanelHit::TimerScale.is_button());
+        assert!(!PanelHit::TimerScale.is_button() && !PanelHit::TimerMode(Mode::Focus).is_button());
+    }
+
+    #[test]
+    fn test_clipboard_image_is_whole_pixels_and_evenly_inset() {
+        for dpi in ALL_DPIS {
+            let dims = space_dimensions(NotchState::Expanded, dpi, OecaSpace::Clipboard);
+            let l = resolve_clipboard_layout(&dims).unwrap();
+            for i in 0..crate::config::CLIPBOARD_TILES {
+                let p = l.tile_parts(i);
+                let img = p.image;
+                for v in [img.left, img.top, img.right, img.bottom] {
+                    assert_eq!(v, v.round(), "{dpi}: whole pixels");
+                }
+                // The same inset from the tile on the left, top and right (so
+                // one nested corner fits all of them)
+                let (l_in, t_in, r_in) = (
+                    img.left - p.tile.left,
+                    img.top - p.tile.top,
+                    p.tile.right - img.right,
+                );
+                assert!(
+                    (l_in - t_in).abs() <= 1.0 && (l_in - r_in).abs() <= 1.0,
+                    "{dpi}: {l_in} {t_in} {r_in}"
+                );
+                assert!(img.width() > 0.0 && img.height() > 0.0);
+                assert!(img.bottom <= p.copy.top, "{dpi}: clear of the buttons");
+            }
+        }
+    }
+
+    #[test]
+    fn test_hud_digit_cells_are_fixed_right_aligned_and_inside() {
+        for dpi in ALL_DPIS {
+            let dims = NotchDimensions::from_state_and_dpi(NotchState::Collapsed, dpi);
+            let text = collapsed_hud_layout(&resolve_collapsed_layout(&dims), dims.scale).text;
+            let cell = (7.5 * dims.scale).round();
+            let cells = hud_digit_cells(text, cell);
+            assert_eq!(cells[2].right, text.right, "{dpi}: right-aligned");
+            for k in 0..2 {
+                assert_eq!(cells[k].right, cells[k + 1].left, "{dpi}: contiguous");
+            }
+            assert!(cells[0].left >= text.left, "{dpi}: three digits fit");
+            assert!(cells.iter().all(|c| c.width() == cell && c.top == text.top));
+        }
+    }
+
+    #[test]
+    fn test_hud_rows_fit_collapsed_and_header_at_all_dpis() {
+        let check = |h: HudLayout, bounds: RectF, what: &str| {
+            for r in [h.icon, h.bar, h.text] {
+                assert!(inside(&r, &bounds), "{what}: {r:?} in {bounds:?}");
+            }
+            assert!(
+                h.icon.right < h.bar.left && h.bar.right < h.text.left,
+                "{what}"
+            );
+            assert!(h.bar.width() >= 40.0, "{what}: a usable bar");
+            assert!(h.bar.height() >= 2.0 && h.glyph <= h.icon.height().max(h.icon.width()));
+            // Centred on the row
+            let mid = |r: RectF| (r.top + r.bottom) / 2.0;
+            assert!((mid(h.bar) - mid(h.text)).abs() <= 1.0, "{what}");
+        };
+        for dpi in ALL_DPIS {
+            let dims = NotchDimensions::from_state_and_dpi(NotchState::Collapsed, dpi);
+            let l = resolve_collapsed_layout(&dims);
+            check(
+                collapsed_hud_layout(&l, dims.scale),
+                l.content_bounds,
+                "collapsed",
+            );
+            for space in OecaSpace::ALL {
+                let dims = space_dimensions(NotchState::Expanded, dpi, space);
+                let sel = resolve_space_selector_in(&dims, space).unwrap();
+                let header = RectF::new(
+                    sel.home.left,
+                    sel.home.top,
+                    sel.settings.right,
+                    sel.home.bottom,
+                );
+                check(header_hud_layout(&sel, dims.scale), header, "header");
+            }
+        }
     }
 
     #[test]

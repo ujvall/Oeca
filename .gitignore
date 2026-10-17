@@ -6,3 +6,5 @@ CLAUDE.md
 skills-lock.json
 # General Sans (ITF Free Font License): may not be published in this public repository
 /assets/fonts/*.otf
+# Sunghyun Sans (SIL OFL 1.1): may be redistributed, with its licence
+!/assets/fonts/SunghyunSans-Bold.otf

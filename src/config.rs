@@ -62,6 +62,17 @@ impl CornerProfile {
         }
     }
 
+    /// The corner of something inset `d` inside a shape with this corner
+    /// (an image in a tile, say): the same curve family, starting `d`
+    /// later, so the two run parallel all the way round (for a circle,
+    /// exactly radius - inset). Never negative.
+    pub fn nested(self, d: f32) -> Self {
+        Self {
+            span: (self.span - d).max(0.0),
+            handle: self.handle,
+        }
+    }
+
     /// Point on the corner curve at parameter t (corner-local coordinates).
     pub fn point(&self, t: f32) -> (f32, f32) {
         let (s, k) = (self.span, self.handle);
@@ -428,27 +439,69 @@ pub const COLOR_TIMER: D2D1_COLOR_F = D2D1_COLOR_F {
     b: 10.0 / 255.0,
     a: 1.0,
 };
-pub const TIMER_BUTTON_WASH: f32 = 0.22;
-/// Home timer panel (DIP at 96 DPI): numerals row, then the duration scale
-/// (setup) or a status line; round buttons at the row's right end.
-pub const BASE_TIMER_PANEL_WIDTH: f32 = 178.0;
-pub const BASE_TIMER_DISPLAY_HEIGHT: f32 = 32.0;
-pub const BASE_TIMER_ROW_GAP: f32 = 6.0;
-pub const BASE_TIMER_SCALE_HEIGHT: f32 = 20.0;
-pub const BASE_TIMER_BUTTON_SIZE: f32 = 30.0;
-pub const BASE_TIMER_BUTTON_GAP: f32 = 8.0;
-pub const BASE_TIMER_GLYPH_SIZE: f32 = 11.0;
-/// Scale: tick (minor / unit-start) heights and width, indicator size.
-pub const BASE_TIMER_TICK_HEIGHT: f32 = 6.0;
-pub const BASE_TIMER_MAJOR_TICK_HEIGHT: f32 = 10.0;
-pub const BASE_TIMER_TICK_WIDTH: f32 = 1.0;
-pub const BASE_TIMER_INDICATOR_WIDTH: f32 = 3.0;
-pub const BASE_TIMER_INDICATOR_HEIGHT: f32 = 16.0;
-pub const COLOR_TIMER_TICK: D2D1_COLOR_F = D2D1_COLOR_F {
-    r: 1.0,
-    g: 1.0,
-    b: 1.0,
-    a: 0.28,
+pub const TIMER_BUTTON_WASH: f32 = 0.25;
+/// Break's quiet counterpart to the timer orange: a soft neutral (its
+/// numerals, lit ticks, pointer and selected pill).
+pub const COLOR_TIMER_BREAK: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 0.80,
+    g: 0.83,
+    b: 0.88,
+    a: 1.0,
+};
+/// Home timer panel (DIP at 96 DPI): as wide as its band allows (up to
+/// the maximum), Home's content height, in two columns. Left: the Focus /
+/// Break pills over the minute scale (labels, ticks, the pointer under its
+/// centre). Right: the numerals over the round buttons.
+pub const BASE_TIMER_PANEL_MAX_WIDTH: f32 = 260.0;
+pub const BASE_TIMER_SIDE_WIDTH: f32 = 78.0;
+pub const BASE_TIMER_COLUMN_SPACING: f32 = 12.0;
+pub const BASE_TIMER_PILL_WIDTH: f32 = 46.0;
+pub const BASE_TIMER_PILL_HEIGHT: f32 = 20.0;
+pub const BASE_TIMER_PILL_GAP: f32 = 4.0;
+/// Pills to labels, labels to ticks, ticks to pointer.
+pub const BASE_TIMER_LABEL_GAP: f32 = 7.0;
+pub const BASE_TIMER_TICK_GAP: f32 = 2.0;
+pub const BASE_TIMER_POINTER_GAP: f32 = 3.0;
+pub const BASE_TIMER_LABEL_HEIGHT: f32 = 10.0;
+pub const BASE_TIMER_RULER_HEIGHT: f32 = 20.0;
+pub const BASE_TIMER_POINTER_HEIGHT: f32 = 6.0;
+pub const BASE_TIMER_POINTER_WIDTH: f32 = 9.0;
+/// The numerals' box (the rest of the height is the buttons' row).
+pub const BASE_TIMER_DISPLAY_HEIGHT: f32 = 38.0;
+/// Round buttons, their gap and glyph size.
+pub const BASE_TIMER_BUTTON_SIZE: f32 = 26.0;
+pub const BASE_TIMER_BUTTON_GAP: f32 = 7.0;
+pub const BASE_TIMER_GLYPH_SIZE: f32 = 9.0;
+/// Type (Sunghyun Sans Bold): the numerals, the scale's labels, the pills.
+pub const BASE_TIMER_FONT_SIZE: f32 = 28.0;
+pub const BASE_TIMER_LABEL_FONT_SIZE: f32 = 9.0;
+pub const BASE_TIMER_PILL_FONT_SIZE: f32 = 11.0;
+/// Unselected pills and the Cancel button: a quiet white wash, white text.
+pub const TIMER_QUIET_WASH: f32 = 0.11;
+pub const TIMER_QUIET_TEXT: f32 = 0.62;
+/// Rounded faces for the numerals, first installed wins (none ships with
+/// Windows: with none, the numerals use Oeca's own typeface).
+pub const TIMER_FONT_CANDIDATES: [(&str, PCWSTR); 5] = [
+    ("SF Pro Rounded", w!("SF Pro Rounded")),
+    ("Nunito", w!("Nunito")),
+    ("Varela Round", w!("Varela Round")),
+    ("Helvetica Rounded", w!("Helvetica Rounded")),
+    ("Arial Rounded MT Bold", w!("Arial Rounded MT Bold")),
+];
+/// The scale: a tick per stop (30 s, 45 s, then every minute) this
+/// far apart, and the ticks' width; the lit ticks warm to white over this
+/// many stops before the value, ticks past it are this dim, and both ends
+/// fade out over this many stops.
+pub const BASE_TIMER_STEP: f32 = 7.0;
+pub const BASE_TIMER_TICK_WIDTH: f32 = 1.75;
+pub const TIMER_TICK_GLOW_STOPS: f32 = 4.0;
+pub const TIMER_TICK_DIM: f32 = 0.37;
+pub const TIMER_SCALE_FADE_STOPS: f32 = 2.5;
+/// The selector's highlight glides between the pills; the scale glides to
+/// a new duration; both near-critically damped.
+pub const TIMER_SPRING: Spring = Spring {
+    zeta: 0.95,
+    response: 0.3,
 };
 /// Home without media: the clock and the timer share the content area as two
 /// columns this far either side of the centre divider.
@@ -470,6 +523,57 @@ pub const BASE_TIMER_NECK_REACH: f32 = 7.0;
 /// How far the bubble's window reaches back over the notch's body, so the
 /// neck joins the wall even where the notch's bottom corner curves away.
 pub const BASE_TIMER_BUBBLE_OVERLAP: f32 = 4.0;
+
+/// Volume HUD (hud.rs): it stays this long after the last key
+/// press or change, then gives way to what the notch showed before.
+pub const HUD_HIDE_TIMER_ID: usize = 1009;
+pub const HUD_HOLD_MS: u32 = 1_500;
+/// The power-saving notice stays a little longer (a sentence to read).
+pub const HUD_NOTICE_HOLD_MS: u32 = 2_500;
+/// HUD row: icon, level bar (this thick, this far from its neighbours), the
+/// level number right-aligned in a column this wide.
+pub const BASE_HUD_BAR_HEIGHT: f32 = 4.0;
+pub const BASE_HUD_GAP: f32 = 10.0;
+pub const BASE_HUD_TEXT_WIDTH: f32 = 26.0;
+/// While the HUD shows, the collapsed notch grows this much wider (DIP),
+/// in on `EXPAND_SPRING`, back out on `COLLAPSE_SPRING`.
+pub const BASE_HUD_EXTRA_WIDTH: f32 = 36.0;
+/// The level bar: slightly underdamped, ~4% overshoot of each change, then
+/// settles (a held key's stream of steps reads as one continuous motion).
+pub const HUD_LEVEL_SPRING: Spring = Spring {
+    zeta: 0.72,
+    response: 0.32,
+};
+/// A volume key held rapidly into 100% (0%) stretches the notch toward the
+/// right (left) for as long as it is held there: that side reaches this
+/// much further out (DIP), subtly; the other edge, the height and the
+/// content stay exactly where they are. Released, it relaxes back to its
+/// exact shape. Lightly underdamped: elastic, a ~1.5% settle.
+pub const BASE_HUD_STRETCH_WIDTH: f32 = 4.0;
+/// The number's digit wheels: critically damped (a wheel never rolls past
+/// its digit and back), each on its own; quick enough for held-key steps.
+pub const HUD_DIGIT_SPRING: Spring = Spring {
+    zeta: 1.0,
+    response: 0.26,
+};
+/// A digit wheel turning this fast (values / s) shows its full motion blur;
+/// slower, proportionally less; at rest none.
+pub const HUD_DIGIT_BLUR_SPEED: f32 = 25.0;
+pub const HUD_STRETCH_SPRING: Spring = Spring {
+    zeta: 0.8,
+    response: 0.34,
+};
+/// No volume-key repeat within the rapid gap: the key was released (a
+/// one-shot re-armed on every press; runs only while a key is in use).
+pub const HUD_RELEASE_TIMER_ID: usize = 1010;
+/// The bar's empty track, and its fill's opacity while muted.
+pub const COLOR_HUD_TRACK: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 1.0,
+    g: 1.0,
+    b: 1.0,
+    a: 0.18,
+};
+pub const HUD_MUTED_OPACITY: f32 = 0.4;
 
 pub const MEDIA_FEEDBACK_TIMER_ID: usize = 1003;
 pub const MEDIA_FEEDBACK_FRAME_MS: u32 = 16;
