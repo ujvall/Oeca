@@ -1,8 +1,8 @@
 import type { Metadata } from "next";
 import { Nav } from "@/components/Nav";
 import { Footer } from "@/components/Footer";
-import { ReleaseTimeline } from "@/components/ReleaseTimeline";
-import { RELEASES } from "@/lib/releases";
+import { ReleaseTimeline, UpcomingEntry } from "@/components/ReleaseTimeline";
+import { RELEASES, UPCOMING } from "@/lib/releases";
 import { RELEASES_URL } from "@/lib/site";
 
 const title = "Changelog: Oeca";
@@ -48,6 +48,7 @@ export default function Changelog() {
               .
             </p>
           </header>
+          {UPCOMING && <UpcomingEntry upcoming={UPCOMING} />}
           <ReleaseTimeline releases={RELEASES} />
         </div>
       </main>

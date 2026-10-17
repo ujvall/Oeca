@@ -85,7 +85,7 @@ export function Download() {
           </div>
         </dl>
         <p className="t-caption mx-auto mt-10 max-w-4xl text-left">
-          Oeca makes no network requests. Read the{" "}
+          Oeca makes no network requests unless you check for updates. Read the{" "}
           <a className="link" href="/privacy/">
             Privacy policy
           </a>{" "}

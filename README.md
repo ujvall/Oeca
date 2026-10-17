@@ -7,10 +7,10 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ujvall/Oeca/releases/latest/download/Oeca-Setup.exe"><img src="assets/readme/button-download.png" alt="Download for Windows" height="44"></a>
+  <a href="https://github.com/ujvall/Oeca/releases/download/v0.3.0/Oeca-Setup-0.3.0.exe"><img src="assets/readme/button-download.png" alt="Download for Windows" height="44"></a>
   <a href="https://github.com/ujvall/Oeca/releases"><img src="assets/readme/button-releases.png" alt="All releases" height="44"></a>
   <img src="assets/readme/chip-windows.png" alt="Windows 10 or later, 64-bit" height="44">
-  <img src="assets/readme/chip-version.png" alt="Version 0.2.0" height="44">
+  <img src="assets/readme/chip-version.png" alt="Version 0.3.0" height="44">
 </p>
 
 <br>
@@ -119,7 +119,7 @@ Oeca makes no network requests unless you ask it to check for updates: from vers
 
 ## Code signing policy
 
-**Status: pending.** Oeca is applying for free code signing from [SignPath Foundation](https://signpath.org). Current releases, including v0.2.0, are not signed. Once the application is accepted, releases will be built by the GitHub Actions workflow in this repository, signed through SignPath and published here, with this notice: Free code signing provided by SignPath.io, certificate by SignPath Foundation.
+**Status: pending.** Oeca is applying for free code signing from [SignPath Foundation](https://signpath.org). Current releases, including v0.3.0, are not signed. Once the application is accepted, releases will be built by the GitHub Actions workflow in this repository, signed through SignPath and published here, with this notice: Free code signing provided by SignPath.io, certificate by SignPath Foundation.
 
 - Authors, Reviewers and Approvers: [Ujval Sai (@ujvall)](https://github.com/ujvall), currently the only maintainer.
 - Every signing request is approved manually by the maintainer, for releases built from this repository only.

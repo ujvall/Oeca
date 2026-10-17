@@ -26,6 +26,43 @@ export type Release = {
 
 export const RELEASES: Release[] = [
   {
+    version: "0.3.0",
+    tag: "v0.3.0",
+    publishedAt: "2026-10-17T11:16:59Z",
+    url: "https://github.com/ujvall/Oeca/releases/tag/v0.3.0",
+    installerUrl: "https://github.com/ujvall/Oeca/releases/download/v0.3.0/Oeca-Setup-0.3.0.exe",
+    summary: "A volume display in the notch, Focus and Break timers, Energy Saver awareness, and optional update checks.",
+    sections: [
+      {
+        title: "Added",
+        items: [
+          "A volume display in the notch: the volume keys show the level and mute state in place of the Windows volume flyout",
+          "Energy Saver awareness: while it is on, Oeca moves as if Reduced motion were on, and the notch briefly shows when it turns on or off",
+          "Focus and Break modes for the timer, each with its own duration from 30 seconds to 2 hours, remembered between launches",
+          "Update notices: when a check finds a newer Oeca, a notice appears under the notch, then a download icon in place of the artwork; either opens the release page",
+          "Check for updates in Settings, under About: the installed version, the result of the last check, a link to a newer release, and an optional daily check",
+        ],
+      },
+      {
+        title: "Improved",
+        items: [
+          "The timer's numerals and labels use the rounded Sunghyun Sans typeface",
+          "Changing a running timer's duration glides to the new time instead of jumping",
+        ],
+      },
+      {
+        title: "Changed",
+        items: [
+          "Oeca can now contact GitHub, only to check for updates: when you choose Check for updates, or once a day if you turn on Check for updates automatically (off by default). Each check is one HTTPS request with no account, telemetry or personal data. Nothing is downloaded or installed for you",
+        ],
+      },
+    ],
+    notes: [
+      "Requires Windows 10 or Windows 11, with a compatible 64-bit system.",
+      "Windows may display a security warning because the installer is not code-signed.",
+    ],
+  },
+  {
     version: "0.2.0",
     tag: "v0.2.0",
     publishedAt: "2026-10-15T17:00:00Z",
@@ -100,6 +137,15 @@ export const RELEASES: Release[] = [
 ];
 
 export const LATEST = RELEASES[0];
+
+/** The next version, prepared in the repository but not published on GitHub
+ *  Releases: the changelog shows it as unreleased, never as the latest
+ *  version or a download. When it is published, move it into RELEASES (with
+ *  its tag, date, release page and verified installer) and set this to
+ *  undefined. */
+export type Upcoming = Pick<Release, "version" | "summary" | "sections" | "notes">;
+
+export const UPCOMING: Upcoming | undefined = undefined;
 
 /** "v0.1.0" -> "v0-1-0", a stable in-page anchor. */
 export const releaseId = (r: Release) => r.tag.replace(/\./g, "-");

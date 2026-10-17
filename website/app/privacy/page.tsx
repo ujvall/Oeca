@@ -4,7 +4,7 @@ import { REPO_URL } from "@/lib/site";
 
 const title = "Privacy policy: Oeca";
 const description =
-  "What the Oeca app, its installer and this website do with your data. The app makes no network requests.";
+  "What the Oeca app, its installer and this website do with your data. The app only connects to GitHub when you ask it to check for updates.";
 
 export const metadata: Metadata = {
   title,
@@ -23,25 +23,34 @@ export const metadata: Metadata = {
   twitter: { card: "summary_large_image", title, description, images: ["/opengraph-image.png"] },
 };
 
-// Every statement about the app is checked against its source code: no
-// networking APIs or features (Cargo.toml, src/), storage in
+// Every statement about the app is checked against its source code: the
+// only network request is the update check (src/update.rs, opt-in or by
+// hand: settings_store.rs `check_for_updates`), storage in
 // clipboard_store.rs and settings_store.rs, Start on launch in startup.rs.
 export default function Privacy() {
   return (
     <LegalPage
       title="Privacy policy"
       lead="Oeca is maintained by one person, Ujval Sai. This page explains what the Oeca app, its installer and this website do with information about you."
-      updated={["2026-10-15", "15 October 2026"]}
+      updated={["2026-10-17", "17 October 2026"]}
     >
       <h2>The Oeca app</h2>
       <p>
-        <strong>Oeca makes no network requests.</strong> It contains no telemetry, analytics, advertising, crash
-        reporting or update checks, and it does not send anything about you or your PC to the developer or
-        anyone else. You can confirm this in the{" "}
+        <strong>Oeca makes no network requests unless you ask it to check for updates.</strong> It contains no
+        telemetry, analytics, advertising or crash reporting, and it does not send anything about you or your PC to
+        the developer. You can confirm this in the{" "}
         <a className="link" href={REPO_URL}>
           source code
         </a>
-        . Everything below stays on your PC.
+        . Oeca 0.2.0 and earlier make no network requests at all.
+      </p>
+      <p>
+        From version 0.3.0, Oeca can check GitHub Releases for a newer version: when you choose Check for updates in
+        Settings, under About, and once a day if you turn on Check for updates automatically there (it is off by
+        default). Each check is one HTTPS request to GitHub&apos;s public API, <code>api.github.com</code>, with no
+        account or personal data; it names Oeca and its version. GitHub receives the usual information about the
+        request, such as your IP address. Oeca never downloads or installs anything itself: a newer version only
+        shows a notice that opens its release page. Everything below stays on your PC.
       </p>
 
       <h3>Clipboard history</h3>
@@ -101,7 +110,7 @@ export default function Privacy() {
 
       <h2>The installer</h2>
       <p>
-        <code>Oeca-Setup.exe</code> makes no network requests. It installs Oeca for your Windows account only, in{" "}
+        The installer makes no network requests. It installs Oeca for your Windows account only, in{" "}
         <code>%LOCALAPPDATA%\Programs\Oeca</code>, and adds an entry to Installed apps so you can uninstall it.
       </p>
 

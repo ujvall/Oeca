@@ -37,7 +37,7 @@ export default function CodeSigning() {
       <h2>Status: pending</h2>
       <p>
         Oeca is applying for free code signing from SignPath Foundation. The application has not been
-        accepted yet. <strong>No Oeca release is code-signed at the moment</strong>, including v0.2.0,
+        accepted yet. <strong>No Oeca release is code-signed at the moment</strong>, including v0.3.0,
         so Windows SmartScreen may ask you to confirm before running the installer. This page will be updated when
         signing is active, and only signed files will be described as signed.
       </p>
