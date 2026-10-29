@@ -566,6 +566,8 @@ pub const HUD_STRETCH_SPRING: Spring = Spring {
 /// No volume-key repeat within the rapid gap: the key was released (a
 /// one-shot re-armed on every press; runs only while a key is in use).
 pub const HUD_RELEASE_TIMER_ID: usize = 1010;
+/// One-shot after Windows' brightness flyout was hidden: was it brightness's?
+pub const HUD_FLYOUT_TIMER_ID: usize = 1013;
 /// The bar's empty track, and its fill's opacity while muted.
 pub const COLOR_HUD_TRACK: D2D1_COLOR_F = D2D1_COLOR_F {
     r: 1.0,

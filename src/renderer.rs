@@ -3131,22 +3131,30 @@ impl Renderer {
             (row.icon.top + row.icon.bottom) / 2.0,
         );
         // The speaker, its sound waves for the level (each fades in / out on
-        // its own as the count glides), and the cross while muted
-        unsafe { white.SetOpacity(alpha) };
-        self.draw_glyph(rt, SPEAKER_BODY, cx, cy, row.glyph, &white)?;
-        for (i, wave) in [SPEAKER_WAVE_1, SPEAKER_WAVE_2, SPEAKER_WAVE_3]
-            .into_iter()
-            .enumerate()
-        {
-            let w = (hud.waves - i as f32).clamp(0.0, 1.0);
-            if w > 0.0 {
-                unsafe { white.SetOpacity(alpha * w) };
-                self.draw_glyph(rt, wave, cx, cy, row.glyph, &white)?;
+        // its own as the count glides), and the cross while muted; the sun
+        // crossfades in for the screen's brightness
+        let speaker = alpha * (1.0 - hud.brightness);
+        if speaker > 0.0 {
+            unsafe { white.SetOpacity(speaker) };
+            self.draw_glyph(rt, SPEAKER_BODY, cx, cy, row.glyph, &white)?;
+            for (i, wave) in [SPEAKER_WAVE_1, SPEAKER_WAVE_2, SPEAKER_WAVE_3]
+                .into_iter()
+                .enumerate()
+            {
+                let w = (hud.waves - i as f32).clamp(0.0, 1.0);
+                if w > 0.0 {
+                    unsafe { white.SetOpacity(speaker * w) };
+                    self.draw_glyph(rt, wave, cx, cy, row.glyph, &white)?;
+                }
+            }
+            if hud.muted > 0.0 {
+                unsafe { white.SetOpacity(speaker * hud.muted) };
+                self.draw_glyph(rt, SPEAKER_CROSS, cx, cy, row.glyph, &white)?;
             }
         }
-        if hud.muted > 0.0 {
-            unsafe { white.SetOpacity(alpha * hud.muted) };
-            self.draw_glyph(rt, SPEAKER_CROSS, cx, cy, row.glyph, &white)?;
+        if hud.brightness > 0.0 {
+            unsafe { white.SetOpacity(alpha * hud.brightness) };
+            self.draw_glyph(rt, SUN, cx, cy, row.glyph, &white)?;
         }
 
         let bar = row.bar;
@@ -6284,6 +6292,80 @@ const SPEAKER_CROSS: &[IconSeg] = &[
     IconSeg::L(0.2055, 0.1155),
     IconSeg::C(0.1942, 0.1268, 0.1758, 0.1268, 0.1645, 0.1155),
     IconSeg::C(0.1532, 0.1042, 0.1532, 0.0858, 0.1645, 0.0745),
+    IconSeg::Z,
+];
+/// Brightness: the sun (a disc and eight round-capped rays), the HUD's icon
+/// while it shows the screen's brightness.
+const SUN: &[IconSeg] = &[
+    IconSeg::M(0.1700, 0.0000),
+    IconSeg::C(0.1700, 0.0939, 0.0939, 0.1700, 0.0000, 0.1700),
+    IconSeg::C(-0.0939, 0.1700, -0.1700, 0.0939, -0.1700, 0.0000),
+    IconSeg::C(-0.1700, -0.0939, -0.0939, -0.1700, 0.0000, -0.1700),
+    IconSeg::C(0.0939, -0.1700, 0.1700, -0.0939, 0.1700, 0.0000),
+    IconSeg::Z,
+    IconSeg::M(0.3200, -0.0400),
+    IconSeg::L(0.3900, -0.0400),
+    IconSeg::C(0.4121, -0.0400, 0.4300, -0.0221, 0.4300, 0.0000),
+    IconSeg::C(0.4300, 0.0221, 0.4121, 0.0400, 0.3900, 0.0400),
+    IconSeg::L(0.3200, 0.0400),
+    IconSeg::C(0.2979, 0.0400, 0.2800, 0.0221, 0.2800, 0.0000),
+    IconSeg::C(0.2800, -0.0221, 0.2979, -0.0400, 0.3200, -0.0400),
+    IconSeg::Z,
+    IconSeg::M(0.2546, 0.1980),
+    IconSeg::L(0.3041, 0.2475),
+    IconSeg::C(0.3197, 0.2631, 0.3197, 0.2884, 0.3041, 0.3041),
+    IconSeg::C(0.2884, 0.3197, 0.2631, 0.3197, 0.2475, 0.3041),
+    IconSeg::L(0.1980, 0.2546),
+    IconSeg::C(0.1824, 0.2389, 0.1824, 0.2136, 0.1980, 0.1980),
+    IconSeg::C(0.2136, 0.1824, 0.2389, 0.1824, 0.2546, 0.1980),
+    IconSeg::Z,
+    IconSeg::M(0.0400, 0.3200),
+    IconSeg::L(0.0400, 0.3900),
+    IconSeg::C(0.0400, 0.4121, 0.0221, 0.4300, 0.0000, 0.4300),
+    IconSeg::C(-0.0221, 0.4300, -0.0400, 0.4121, -0.0400, 0.3900),
+    IconSeg::L(-0.0400, 0.3200),
+    IconSeg::C(-0.0400, 0.2979, -0.0221, 0.2800, 0.0000, 0.2800),
+    IconSeg::C(0.0221, 0.2800, 0.0400, 0.2979, 0.0400, 0.3200),
+    IconSeg::Z,
+    IconSeg::M(-0.1980, 0.2546),
+    IconSeg::L(-0.2475, 0.3041),
+    IconSeg::C(-0.2631, 0.3197, -0.2884, 0.3197, -0.3041, 0.3041),
+    IconSeg::C(-0.3197, 0.2884, -0.3197, 0.2631, -0.3041, 0.2475),
+    IconSeg::L(-0.2546, 0.1980),
+    IconSeg::C(-0.2389, 0.1824, -0.2136, 0.1824, -0.1980, 0.1980),
+    IconSeg::C(-0.1824, 0.2136, -0.1824, 0.2389, -0.1980, 0.2546),
+    IconSeg::Z,
+    IconSeg::M(-0.3200, 0.0400),
+    IconSeg::L(-0.3900, 0.0400),
+    IconSeg::C(-0.4121, 0.0400, -0.4300, 0.0221, -0.4300, 0.0000),
+    IconSeg::C(-0.4300, -0.0221, -0.4121, -0.0400, -0.3900, -0.0400),
+    IconSeg::L(-0.3200, -0.0400),
+    IconSeg::C(-0.2979, -0.0400, -0.2800, -0.0221, -0.2800, 0.0000),
+    IconSeg::C(-0.2800, 0.0221, -0.2979, 0.0400, -0.3200, 0.0400),
+    IconSeg::Z,
+    IconSeg::M(-0.2546, -0.1980),
+    IconSeg::L(-0.3041, -0.2475),
+    IconSeg::C(-0.3197, -0.2631, -0.3197, -0.2884, -0.3041, -0.3041),
+    IconSeg::C(-0.2884, -0.3197, -0.2631, -0.3197, -0.2475, -0.3041),
+    IconSeg::L(-0.1980, -0.2546),
+    IconSeg::C(-0.1824, -0.2389, -0.1824, -0.2136, -0.1980, -0.1980),
+    IconSeg::C(-0.2136, -0.1824, -0.2389, -0.1824, -0.2546, -0.1980),
+    IconSeg::Z,
+    IconSeg::M(-0.0400, -0.3200),
+    IconSeg::L(-0.0400, -0.3900),
+    IconSeg::C(-0.0400, -0.4121, -0.0221, -0.4300, 0.0000, -0.4300),
+    IconSeg::C(0.0221, -0.4300, 0.0400, -0.4121, 0.0400, -0.3900),
+    IconSeg::L(0.0400, -0.3200),
+    IconSeg::C(0.0400, -0.2979, 0.0221, -0.2800, 0.0000, -0.2800),
+    IconSeg::C(-0.0221, -0.2800, -0.0400, -0.2979, -0.0400, -0.3200),
+    IconSeg::Z,
+    IconSeg::M(0.1980, -0.2546),
+    IconSeg::L(0.2475, -0.3041),
+    IconSeg::C(0.2631, -0.3197, 0.2884, -0.3197, 0.3041, -0.3041),
+    IconSeg::C(0.3197, -0.2884, 0.3197, -0.2631, 0.3041, -0.2475),
+    IconSeg::L(0.2546, -0.1980),
+    IconSeg::C(0.2389, -0.1824, 0.2136, -0.1824, 0.1980, -0.1980),
+    IconSeg::C(0.1824, -0.2136, 0.1824, -0.2389, 0.1980, -0.2546),
     IconSeg::Z,
 ];
 

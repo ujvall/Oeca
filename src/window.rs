@@ -44,7 +44,7 @@ use crate::config::{
     WINDOW_TITLE, calculate_notch_x,
 };
 use crate::config::{DROP_RESULT_MS, DROP_RESULT_TIMER_ID};
-use crate::config::{HUD_HIDE_TIMER_ID, HUD_HOLD_MS, HUD_RELEASE_TIMER_ID};
+use crate::config::{HUD_FLYOUT_TIMER_ID, HUD_HIDE_TIMER_ID, HUD_HOLD_MS, HUD_RELEASE_TIMER_ID};
 use crate::dragdrop::{self, DragEvent, DragSession, DropTarget};
 use crate::hud::VolumeKey;
 use crate::layout::{MediaLayout, PanelHit, resolve_clipboard_layout};
@@ -415,6 +415,8 @@ struct WindowState {
     volume: Option<crate::hud::SystemVolume>,
     /// Battery / Energy Saver notifications' registrations.
     saver_watch: [Option<windows::Win32::System::Power::HPOWERNOTIFY>; 2],
+    brightness_watch: Option<windows::Win32::System::Power::HPOWERNOTIFY>,
+    flyout_hook: Option<windows::Win32::UI::Accessibility::HWINEVENTHOOK>,
     /// The one update state (release, checks, the notice's dismissal), the
     /// notice's presence, the collapsed notch's update icon's presence, the
     /// notice's window (created on first use, owned by the notch), whether
@@ -1926,6 +1928,17 @@ impl WindowState {
         }
     }
 
+    /// The brightness keys changed the screen's brightness to `percent`
+    /// (Windows' own flyout for it was hidden): the HUD shows the level.
+    fn brightness_changed(&mut self, hwnd: HWND, percent: u8) {
+        self.hud
+            .show_brightness(f32::from(percent) / 100.0, !self.motion_enabled());
+        unsafe {
+            let _ = SetTimer(Some(hwnd), HUD_HIDE_TIMER_ID, HUD_HOLD_MS, None);
+        }
+        self.hud_changed(hwnd);
+    }
+
     /// Shows (or keeps showing) the HUD at a new level; it leaves
     /// `HUD_HOLD_MS` after the last one.
     fn show_hud(&mut self, hwnd: HWND, level: f32, muted: bool) {
@@ -2301,6 +2314,9 @@ const WM_APP_HUD_HIDE: u32 = WM_APP + 47;
 const WM_APP_VOLUME_RELEASED: u32 = WM_APP + 48;
 /// Posted when Battery / Energy Saver turned on or off (effective motion).
 const WM_APP_POWER_SAVER: u32 = WM_APP + 49;
+/// Posted for a brightness change with Windows' flyout (wParam: the level,
+/// 0..=100).
+const WM_APP_BRIGHTNESS: u32 = WM_APP + 54;
 /// Posted by an update check (lParam: a `Box<update::Release>` when a newer
 /// stable release exists, else 0).
 const WM_APP_UPDATE_READY: u32 = WM_APP + 51;
@@ -3478,6 +3494,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
 
+        WM_APP_BRIGHTNESS => {
+            with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                state.brightness_changed(hwnd, wparam.0 as u8);
+            });
+            LRESULT(0)
+        }
+
         WM_MOUSEWHEEL => {
             // Over the timer during setup: one stop per notch of the wheel
             with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
@@ -3559,6 +3582,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let _ = KillTimer(Some(hwnd), wparam.0);
                     let _ = PostMessageW(Some(hwnd), posted, WPARAM(0), LPARAM(0));
                 }
+                return LRESULT(0);
+            }
+            if wparam.0 == HUD_FLYOUT_TIMER_ID {
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), HUD_FLYOUT_TIMER_ID);
+                }
+                crate::hud::restore_unpaired_flyout();
                 return LRESULT(0);
             }
             if wparam.0 == crate::update::CHECK_TIMER_ID {
@@ -4122,7 +4152,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let event = wparam.0 as u32;
             if event == PBT_POWERSETTINGCHANGE {
                 // lParam is only valid now: read it, then apply as a message
-                if let Some((saver, on)) = unsafe { saver_report(lparam) } {
+                if let Some(level) = unsafe { crate::hud::brightness_report(lparam) } {
+                    crate::hud::brightness_reported(hwnd, level);
+                } else if let Some((saver, on)) = unsafe { saver_report(lparam) } {
                     use std::sync::atomic::Ordering::Relaxed;
                     let before = power_saver_active();
                     let seen = saver.seen().swap(true, Relaxed);
@@ -4341,6 +4373,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = KillTimer(Some(hwnd), DROP_RESULT_TIMER_ID);
                 let _ = KillTimer(Some(hwnd), HUD_HIDE_TIMER_ID);
                 let _ = KillTimer(Some(hwnd), HUD_RELEASE_TIMER_ID);
+                let _ = KillTimer(Some(hwnd), HUD_FLYOUT_TIMER_ID);
                 PostQuitMessage(0);
             }
             // Stop reporting outside clicks (no-op if never registered)
@@ -4359,7 +4392,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 state.stop_frames(hwnd);
                 state.tray.remove();
                 state.volume = None;
-                for watch in state.saver_watch.iter_mut().filter_map(Option::take) {
+                if let Some(hook) = state.flyout_hook.take() {
+                    crate::hud::stop_hiding_native_flyout(hook);
+                }
+                for watch in state
+                    .saver_watch
+                    .iter_mut()
+                    .chain(std::iter::once(&mut state.brightness_watch))
+                    .filter_map(Option::take)
+                {
                     unsafe {
                         let _ = windows::Win32::System::Power::UnregisterPowerSettingNotification(
                             watch,
@@ -4428,6 +4469,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         _ if msg == crate::tray::taskbar_created() => {
             with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
                 state.tray.restore(hwnd);
+                // The flyout's window is a new Explorer's now
+                if let Some(hook) = state.flyout_hook.take() {
+                    crate::hud::stop_hiding_native_flyout(hook);
+                }
+                state.flyout_hook = crate::hud::hide_native_flyout(hwnd, WM_APP_BRIGHTNESS);
             });
             LRESULT(0)
         }
@@ -4803,6 +4849,8 @@ fn run_window(ole: bool) -> Result<()> {
             momentum: crate::hud::Momentum::default(),
             volume: None,
             saver_watch: [None, None],
+            brightness_watch: None,
+            flyout_hook: None,
             updates: crate::update::UpdateState::default(),
             update_presence: Presence::default(),
             update_icon: Presence::default(),
@@ -4823,6 +4871,10 @@ fn run_window(ole: bool) -> Result<()> {
             crate::hud::take_volume_keys(hwnd);
             // Battery / Energy Saver: Oeca moves as if Reduced motion were on
             state.saver_watch = watch_power_saving(hwnd);
+            // Brightness keys (handled below Windows): the level shows in the
+            // notch, Windows' own flyout for it is hidden
+            state.brightness_watch = crate::hud::watch_brightness(hwnd);
+            state.flyout_hook = crate::hud::hide_native_flyout(hwnd, WM_APP_BRIGHTNESS);
             // Update availability, only if the user turned it on: once
             // startup has settled, then daily
             if state.settings.check_for_updates {

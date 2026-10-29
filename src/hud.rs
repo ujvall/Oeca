@@ -10,9 +10,13 @@
 //! another app already holds stay with that app; without an audio endpoint
 //! the keys are handed back to Windows.
 //!
-//! Brightness is not Oeca's: on laptops like the one this was built on the
-//! brightness keys never reach Windows as input (the firmware handles them),
-//! so they cannot be claimed and Windows keeps its own brightness flyout.
+//! Brightness: on laptops like the one this was built on the brightness keys
+//! never reach Windows as input (the firmware handles them), so they cannot
+//! be claimed. Windows reports the new level as a power setting and shows its
+//! own flyout (a small Explorer window); Oeca pairs the two (they come a few
+//! ms apart, in either order), shows the level in the notch with the sun for
+//! its icon, and hides the flyout the moment it appears. A flyout that is not
+//! brightness's (caps lock, a key at the end of the range) is shown again.
 //!
 //! Motion: everything moves on the notch's frame clock: presence and the
 //! notch's widening on the notch's own springs, the level bar on
@@ -20,9 +24,9 @@
 //! Every retarget continues from the current position and velocity.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Media::Audio::Endpoints::{
     IAudioEndpointVolume, IAudioEndpointVolumeCallback, IAudioEndpointVolumeCallback_Impl,
 };
@@ -32,18 +36,28 @@ use windows::Win32::Media::Audio::{
 use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
+use windows::Win32::System::Power::{
+    HPOWERNOTIFY, POWERBROADCAST_SETTING, RegisterPowerSettingNotification,
+};
+use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::{PTP_CALLBACK_INSTANCE, TrySubmitThreadpoolCallback};
+use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     HOT_KEY_MODIFIERS, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
     KEYEVENTF_KEYUP, RegisterHotKey, SendInput, UnregisterHotKey, VIRTUAL_KEY, VK_VOLUME_DOWN,
     VK_VOLUME_MUTE, VK_VOLUME_UP,
 };
-use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+use windows::Win32::UI::WindowsAndMessaging::{
+    DEVICE_NOTIFY_WINDOW_HANDLE, EVENT_OBJECT_SHOW, GetClassNameW, GetShellWindow, GetWindowRect,
+    GetWindowThreadProcessId, OBJID_WINDOW, PostMessageW, SW_HIDE, SW_SHOWNA, SetTimer, ShowWindow,
+    WINEVENT_OUTOFCONTEXT,
+};
 use windows::core::{GUID, Result, implement};
 
 use crate::config::{
     BASE_HUD_EXTRA_WIDTH, BASE_HUD_STRETCH_WIDTH, COLLAPSE_SPRING, HUD_DIGIT_SPRING,
-    HUD_LEVEL_SPRING, HUD_STRETCH_SPRING, NotchDimensions, SPACE_SPRING, Spring,
+    HUD_FLYOUT_TIMER_ID, HUD_LEVEL_SPRING, HUD_STRETCH_SPRING, NotchDimensions, SPACE_SPRING,
+    Spring,
 };
 use crate::timer::Presence;
 
@@ -67,6 +81,8 @@ pub struct HudView {
     /// (0 Energy Saver: Off, green; 1 On, yellow; gliding on a toggle).
     pub notice: f32,
     pub power_saving: f32,
+    /// The icon: 0 the speaker, 1 the sun (screen brightness), crossfading.
+    pub brightness: f32,
     pub muted: f32,
     pub presence: f32,
     /// The notch's stretch: 0 at rest, toward 1 stretched to the right (its
@@ -126,6 +142,10 @@ pub struct Hud {
     notice: Glide,
     power_saving: bool,
     power: Glide,
+    /// Showing the screen's brightness (else the volume), and the icon's
+    /// crossfade between the two.
+    brightness_on: bool,
+    brightness: Glide,
     /// The stretch toward an edge (-1 left .. 1 right, 0 at rest) and its
     /// target, and the side last stretched toward.
     stretch: Glide,
@@ -158,13 +178,37 @@ impl Hud {
     pub fn show(&mut self, level: f32, muted: bool, instant: bool) {
         let fresh = !self.shown && self.presence.level() <= 0.0;
         self.notice_on = false;
+        self.brightness_on = false;
         if fresh || instant {
             self.notice.snap(0.0);
+            self.brightness.snap(0.0);
         }
         self.shown = true;
         self.presence.set(true, instant);
         self.widen.set(true, instant);
         self.set_level(level, muted, instant || fresh);
+    }
+
+    /// Shows the screen's brightness `level` (0..1): the volume HUD with
+    /// the sun for its icon. Like a volume change: from nothing it appears
+    /// at the level; over the volume the icon crossfades; on screen the bar
+    /// glides on from where it is.
+    pub fn show_brightness(&mut self, level: f32, instant: bool) {
+        let fresh = !self.shown && self.presence.level() <= 0.0;
+        self.notice_on = false;
+        self.brightness_on = true;
+        if fresh || instant {
+            self.notice.snap(0.0);
+            self.brightness.snap(1.0);
+        }
+        self.shown = true;
+        self.presence.set(true, instant);
+        self.widen.set(true, instant);
+        self.set_level(level, false, instant || fresh);
+    }
+
+    fn brightness_target(&self) -> f32 {
+        f32::from(u8::from(self.brightness_on))
     }
 
     /// Shows the power-saving notice: Windows' power saving turned `on` (or
@@ -195,7 +239,8 @@ impl Hud {
 
     /// A level changed elsewhere while showing (no effect once hidden).
     pub fn update(&mut self, level: f32, muted: bool, instant: bool) {
-        if self.shown {
+        // The volume's changes do not move a brightness level
+        if self.shown && !self.brightness_on {
             self.set_level(level, muted, instant);
         }
     }
@@ -233,6 +278,7 @@ impl Hud {
         self.snap_level();
         self.notice.snap(self.notice_target());
         self.power.snap(self.power_target());
+        self.brightness.snap(self.brightness_target());
         self.stretch.snap(self.stretch_target);
     }
 
@@ -257,6 +303,7 @@ impl Hud {
             || (0..3).any(|k| self.digits[k].moving(targets[k]))
             || self.notice.moving(self.notice_target())
             || self.power.moving(self.power_target())
+            || self.brightness.moving(self.brightness_target())
             || self.stretch.moving(self.stretch_target)
     }
 
@@ -270,6 +317,8 @@ impl Hud {
         self.waves.step(self.waves_target(), dt_ms, SPACE_SPRING);
         self.notice.step(self.notice_target(), dt_ms, SPACE_SPRING);
         self.power.step(self.power_target(), dt_ms, SPACE_SPRING);
+        self.brightness
+            .step(self.brightness_target(), dt_ms, SPACE_SPRING);
         let targets = digit_targets(self.percent());
         for (wheel, target) in self.digits.iter_mut().zip(targets) {
             wheel.step(target, dt_ms, HUD_DIGIT_SPRING);
@@ -328,6 +377,7 @@ impl Hud {
             waves: self.waves.value.clamp(0.0, 3.0),
             notice: self.notice.value.clamp(0.0, 1.0),
             power_saving: self.power.value.clamp(0.0, 1.0),
+            brightness: self.brightness.value.clamp(0.0, 1.0),
             muted: self.mute.value.clamp(0.0, 1.0),
             presence: self.presence.level().clamp(0.0, 1.0),
             stretch: self.stretch_shown(),
@@ -623,6 +673,207 @@ pub fn release_volume_keys(hwnd: HWND) {
     for vk in VOLUME_KEYS {
         unsafe {
             let _ = UnregisterHotKey(Some(hwnd), i32::from(vk.0));
+        }
+    }
+}
+
+/// Windows' brightness power setting: its level (0..=100) on every change.
+const BRIGHTNESS_GUID: GUID = GUID::from_u128(0xaded5e82_b909_4619_9949_f5d71dac0bcb);
+/// The brightness change and Windows' flyout for it arrive this close
+/// together (a few ms apart, in either order).
+const FLYOUT_PAIR_MS: u64 = 100;
+const NEVER: u64 = u64::MAX;
+/// The last level reported (`u32::MAX` before the first).
+static BRIGHTNESS_LEVEL: AtomicU32 = AtomicU32::new(u32::MAX);
+/// When (tick count) the last change / flyout showed.
+static CHANGE_AT: AtomicU64 = AtomicU64::new(NEVER);
+static FLYOUT_AT: AtomicU64 = AtomicU64::new(NEVER);
+/// The flyout window last hidden, Oeca's window and the message for a pair.
+static FLYOUT_WINDOW: AtomicIsize = AtomicIsize::new(0);
+static OECA_WINDOW: AtomicIsize = AtomicIsize::new(0);
+static BRIGHTNESS_MESSAGE: AtomicU32 = AtomicU32::new(0);
+
+/// A flyout this soon after a change is the same keys' too: a fast or held
+/// key's later presses (a change is only reported when the level moves).
+const BURST_MS: u64 = 400;
+
+/// A brightness change and a flyout that close together belong to each other.
+fn paired(change: u64, flyout: u64) -> bool {
+    change != NEVER && flyout != NEVER && change.abs_diff(flyout) <= FLYOUT_PAIR_MS
+}
+
+/// The flyout shown at `flyout` is brightness's: next to a change, soon after
+/// one (a key pressed on, see `BURST_MS`), or with the level at an end of its
+/// range (a key pressed there changes nothing, so reports nothing).
+fn is_brightness_flyout(change: u64, flyout: u64, level: u32) -> bool {
+    let burst = change != NEVER && flyout >= change && flyout - change <= BURST_MS;
+    paired(change, flyout) || burst || level == 0 || level == 100
+}
+
+/// The brightness setting's registration (the same message window as the
+/// savers; each is told the current level at once, then on every change).
+pub fn watch_brightness(hwnd: HWND) -> Option<HPOWERNOTIFY> {
+    unsafe {
+        RegisterPowerSettingNotification(
+            HANDLE(hwnd.0),
+            &BRIGHTNESS_GUID,
+            DEVICE_NOTIFY_WINDOW_HANDLE,
+        )
+    }
+    .ok()
+}
+
+/// The level (0..=100) of a `PBT_POWERSETTINGCHANGE` for the brightness.
+///
+/// # Safety
+/// `lparam` is the `WM_POWERBROADCAST` / `PBT_POWERSETTINGCHANGE` one.
+pub unsafe fn brightness_report(lparam: LPARAM) -> Option<u8> {
+    let setting = lparam.0 as *const POWERBROADCAST_SETTING;
+    if setting.is_null() {
+        return None;
+    }
+    let s = unsafe { &*setting };
+    if s.PowerSetting != BRIGHTNESS_GUID || s.DataLength < 4 {
+        return None;
+    }
+    let value = unsafe { std::ptr::read_unaligned(s.Data.as_ptr().cast::<u32>()) };
+    Some(value.min(100) as u8)
+}
+
+/// A brightness level was reported. The first report is the level as it was
+/// (not a change), as is the same level again. A change next to Windows'
+/// flyout is the brightness keys: the HUD is posted (the level as wParam);
+/// one on its own (adaptive brightness, another app) shows nothing.
+pub fn brightness_reported(hwnd: HWND, level: u8) {
+    let before = BRIGHTNESS_LEVEL.swap(u32::from(level), Ordering::Relaxed);
+    if before == u32::MAX || before == u32::from(level) {
+        return;
+    }
+    let now = unsafe { GetTickCount64() };
+    CHANGE_AT.store(now, Ordering::Relaxed);
+    if paired(now, FLYOUT_AT.load(Ordering::Relaxed)) {
+        post_brightness(hwnd, level);
+    }
+}
+
+fn post_brightness(hwnd: HWND, level: u8) {
+    unsafe {
+        let _ = PostMessageW(
+            Some(hwnd),
+            BRIGHTNESS_MESSAGE.load(Ordering::Relaxed),
+            WPARAM(usize::from(level)),
+            LPARAM(0),
+        );
+    }
+}
+
+/// Explorer's flyout for the hardware keys: a small pill window of this
+/// class (about 170-210 x 61 px at 100%); Start, Quick Settings and the like
+/// are larger.
+fn is_flyout_class(class: &[u16]) -> bool {
+    class
+        .iter()
+        .copied()
+        .eq("XamlExplorerHostIslandWindow".encode_utf16())
+}
+
+fn is_flyout_shape(width: i32, height: i32) -> bool {
+    (1..=400).contains(&width) && (1..=150).contains(&height)
+}
+
+/// Hides Windows' own flyout the moment it shows: an event hook on Oeca's
+/// own thread (no polling; it runs before the next frame is composed, so at
+/// most a sliver of the flyout is ever seen) for Explorer's windows only, so
+/// no other app's windows or typing ever reach it. `message` is posted to
+/// `hwnd` with the level for a brightness change (see `brightness_reported`).
+/// None without a shell (Explorer not running): the hook is made again when
+/// Explorer announces itself.
+pub fn hide_native_flyout(hwnd: HWND, message: u32) -> Option<HWINEVENTHOOK> {
+    OECA_WINDOW.store(hwnd.0 as isize, Ordering::Relaxed);
+    BRIGHTNESS_MESSAGE.store(message, Ordering::Relaxed);
+    let mut explorer = 0;
+    unsafe { GetWindowThreadProcessId(GetShellWindow(), Some(&mut explorer)) };
+    if explorer == 0 {
+        return None;
+    }
+    let hook = unsafe {
+        SetWinEventHook(
+            EVENT_OBJECT_SHOW,
+            EVENT_OBJECT_SHOW,
+            None,
+            Some(flyout_shown),
+            explorer,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        )
+    };
+    (!hook.is_invalid()).then_some(hook)
+}
+
+pub fn stop_hiding_native_flyout(hook: HWINEVENTHOOK) {
+    unsafe {
+        let _ = UnhookWinEvent(hook);
+    }
+}
+
+unsafe extern "system" fn flyout_shown(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    _id_child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    if id_object != OBJID_WINDOW.0 || hwnd.is_invalid() {
+        return;
+    }
+    let mut class = [0u16; 64];
+    let n = unsafe { GetClassNameW(hwnd, &mut class) }.max(0) as usize;
+    let mut rect = RECT::default();
+    if !is_flyout_class(&class[..n])
+        || unsafe { GetWindowRect(hwnd, &mut rect) }.is_err()
+        || !is_flyout_shape(rect.right - rect.left, rect.bottom - rect.top)
+    {
+        return;
+    }
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+    let now = unsafe { GetTickCount64() };
+    FLYOUT_AT.store(now, Ordering::Relaxed);
+    FLYOUT_WINDOW.store(hwnd.0 as isize, Ordering::Relaxed);
+    let oeca = HWND(OECA_WINDOW.load(Ordering::Relaxed) as *mut _);
+    let level = BRIGHTNESS_LEVEL.load(Ordering::Relaxed);
+    if is_brightness_flyout(CHANGE_AT.load(Ordering::Relaxed), now, level) {
+        post_brightness(oeca, level as u8);
+    }
+    // A change may still follow it (the other order), else it was not
+    // brightness's after all (caps lock): `restore_unpaired_flyout` decides
+    unsafe {
+        SetTimer(
+            Some(oeca),
+            HUD_FLYOUT_TIMER_ID,
+            (FLYOUT_PAIR_MS + 20) as u32,
+            None,
+        );
+    }
+}
+
+/// The flyout hidden was not brightness's (see `is_brightness_flyout`): shown
+/// again.
+pub fn restore_unpaired_flyout() {
+    if is_brightness_flyout(
+        CHANGE_AT.load(Ordering::Relaxed),
+        FLYOUT_AT.load(Ordering::Relaxed),
+        BRIGHTNESS_LEVEL.load(Ordering::Relaxed),
+    ) {
+        return;
+    }
+    let window = FLYOUT_WINDOW.load(Ordering::Relaxed);
+    if window != 0 {
+        unsafe {
+            let _ = ShowWindow(HWND(window as *mut _), SW_SHOWNA);
         }
     }
 }
@@ -1672,6 +1923,102 @@ mod tests {
         assert_eq!(hud.view().presence, 0.0);
         assert_eq!(hud.extra_width(), 0.0);
         assert!(!hud.is_animating());
+    }
+
+    #[test]
+    fn test_brightness_crossfades_the_icon_and_keeps_the_bar_continuous() {
+        // Over the volume: the sun fades in, the bar glides on, no restart
+        let mut hud = shown(0.3);
+        assert_eq!(hud.view().brightness, 0.0);
+        hud.show_brightness(0.6, false);
+        hud.step(7.0);
+        let v = hud.view();
+        assert!(v.brightness > 0.0 && v.brightness < 1.0, "{}", v.brightness);
+        assert!(v.level > 0.3 && v.level < 0.6, "glides: {}", v.level);
+        run(&mut hud, 3000.0);
+        assert_eq!((hud.view().brightness, hud.view().percent), (1.0, 60));
+        // A volume change elsewhere never moves the brightness level
+        hud.update(0.1, false, false);
+        run(&mut hud, 3000.0);
+        assert_eq!(hud.view().percent, 60);
+        // The volume key takes the icon back
+        hud.show(0.4, false, false);
+        run(&mut hud, 3000.0);
+        assert_eq!((hud.view().brightness, hud.view().percent), (0.0, 40));
+    }
+
+    #[test]
+    fn test_brightness_from_nothing_and_without_motion_is_there_at_once() {
+        let mut hud = Hud::default();
+        hud.show_brightness(0.5, false);
+        let v = hud.view();
+        assert_eq!((v.brightness, v.level, v.percent), (1.0, 0.5, 50));
+        let mut hud = shown(0.3);
+        hud.show_brightness(0.8, true);
+        assert_eq!(hud.view().brightness, 1.0);
+        hud.settle();
+        assert!(!hud.is_animating());
+    }
+
+    #[test]
+    fn test_brightness_pairs_with_the_flyout_in_either_order() {
+        assert!(paired(1000, 1000));
+        assert!(paired(1000, 1000 + FLYOUT_PAIR_MS));
+        assert!(paired(1000 + FLYOUT_PAIR_MS, 1000));
+        assert!(!paired(1000, 1001 + FLYOUT_PAIR_MS));
+        // One of them never happened: nothing to pair with
+        assert!(!paired(NEVER, 1000));
+        assert!(!paired(1000, NEVER));
+        assert!(!paired(NEVER, NEVER));
+    }
+
+    #[test]
+    fn test_flyout_is_brightness_when_paired_in_a_burst_or_at_an_end() {
+        // Next to a change, or soon after one (a fast or held key)
+        assert!(is_brightness_flyout(1000, 1000, 70));
+        assert!(is_brightness_flyout(1000, 1000 + BURST_MS, 70));
+        assert!(!is_brightness_flyout(1000, 1001 + BURST_MS, 70));
+        // The flyout before its change (the other order): paired
+        assert!(is_brightness_flyout(1050, 1000, 70));
+        // Nothing before it: caps lock and the like are left alone
+        assert!(!is_brightness_flyout(NEVER, 1000, 70));
+        assert!(!is_brightness_flyout(NEVER, 1000, u32::MAX));
+        // At either end a key changes nothing, so it reports nothing
+        assert!(is_brightness_flyout(NEVER, 1000, 100));
+        assert!(is_brightness_flyout(500, 5000, 0));
+    }
+
+    #[test]
+    fn test_only_the_small_explorer_flyout_is_hidden() {
+        let class = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        assert!(is_flyout_class(&class("XamlExplorerHostIslandWindow")));
+        assert!(!is_flyout_class(&class("XamlExplorerHostIslandWindowX")));
+        assert!(!is_flyout_class(&class("Shell_TrayWnd")));
+        // The flyout seen: 169-211 x 61; the task switcher is screen-sized
+        assert!(is_flyout_shape(169, 61));
+        assert!(is_flyout_shape(211, 61));
+        assert!(!is_flyout_shape(1536, 864));
+        assert!(!is_flyout_shape(0, 0));
+    }
+
+    #[test]
+    fn test_brightness_report_reads_the_level_of_its_setting_only() {
+        // A POWERBROADCAST_SETTING: the GUID, the data's length, the data
+        let report = |guid: GUID, level: u32| {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&guid.data1.to_le_bytes());
+            bytes.extend_from_slice(&guid.data2.to_le_bytes());
+            bytes.extend_from_slice(&guid.data3.to_le_bytes());
+            bytes.extend_from_slice(&guid.data4);
+            bytes.extend_from_slice(&4u32.to_le_bytes());
+            bytes.extend_from_slice(&level.to_le_bytes());
+            bytes
+        };
+        let read = |bytes: &Vec<u8>| unsafe { brightness_report(LPARAM(bytes.as_ptr() as isize)) };
+        assert_eq!(read(&report(BRIGHTNESS_GUID, 70)), Some(70));
+        assert_eq!(read(&report(BRIGHTNESS_GUID, 400)), Some(100), "clamped");
+        assert_eq!(read(&report(GUID::from_u128(7), 70)), None);
+        assert_eq!(unsafe { brightness_report(LPARAM(0)) }, None);
     }
 
     #[test]
