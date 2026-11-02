@@ -72,7 +72,7 @@ Oeca is a free, open-source (MIT) single Rust executable: no runtime, UI framewo
 
 The installer and app are not code-signed yet, so Windows SmartScreen may ask you to confirm; see the [code signing policy](#code-signing-policy). Oeca adds nothing that runs at startup unless you turn on **Start on launch** in Settings.
 
-Uninstall from **Settings â†’ Apps â†’ Installed apps**. This removes the app, its shortcuts and its Start on launch entry, and keeps your data in `%LOCALAPPDATA%\Oeca`; delete that folder yourself to remove it. After a reinstall, Start on launch is off until you turn it on again.
+Uninstall from **Settings → Apps → Installed apps**. This removes the app, its shortcuts and its Start on launch entry, and keeps your data in `%LOCALAPPDATA%\Oeca`; delete that folder yourself to remove it. After a reinstall, Start on launch is off until you turn it on again.
 
 ## Build from source
 
@@ -101,29 +101,29 @@ The output is `target\installer\Oeca-Setup.exe`, and its version comes from `Car
 
 ```text
 Oeca/
-â”œâ”€â”€ src/
-â”‚   â”œâ”€â”€ main.rs                Entry point
-â”‚   â”œâ”€â”€ window.rs              Window, message loop, gestures, single instance, lifecycle
-â”‚   â”œâ”€â”€ renderer.rs            Direct2D and DirectWrite rendering
-â”‚   â”œâ”€â”€ layout.rs              DPI-scaled layout
-â”‚   â”œâ”€â”€ config.rs              Geometry, springs and colours
-â”‚   â”œâ”€â”€ space.rs               Spaces and the settings model
-â”‚   â”œâ”€â”€ media.rs               Media sessions, artwork and visualizer
-â”‚   â”œâ”€â”€ clock.rs               Clock
-â”‚   â”œâ”€â”€ timer.rs               Countdown timer
-â”‚   â”œâ”€â”€ clipboard.rs           Clipboard history
-â”‚   â”œâ”€â”€ clipboard_store.rs     Session-scoped history storage
-â”‚   â”œâ”€â”€ dragdrop.rs            File drag and drop, temporary window priority
-â”‚   â”œâ”€â”€ convert.rs             Image and audio conversion engine
-â”‚   â”œâ”€â”€ convert_batch.rs       Converter batch state and workers
-â”‚   â”œâ”€â”€ settings_window.rs     Settings window
-â”‚   â”œâ”€â”€ settings_store.rs      Settings file
-â”‚   â”œâ”€â”€ startup.rs             Start on launch
-â”‚   â””â”€â”€ tray.rs                Notification area icon and menu
-â”œâ”€â”€ assets/                    Icon, version resource and README images
-â”œâ”€â”€ installer/                 Inno Setup script and wizard images
-â”œâ”€â”€ vendor/avif-decode/        Vendored AVIF decoder (BSD-3-Clause)
-â””â”€â”€ build.rs                   Embeds the icon and version information
+├── src/
+│   ├── main.rs                Entry point
+│   ├── window.rs              Window, message loop, gestures, single instance, lifecycle
+│   ├── renderer.rs            Direct2D and DirectWrite rendering
+│   ├── layout.rs              DPI-scaled layout
+│   ├── config.rs              Geometry, springs and colours
+│   ├── space.rs               Spaces and the settings model
+│   ├── media.rs               Media sessions, artwork and visualizer
+│   ├── clock.rs               Clock
+│   ├── timer.rs               Countdown timer
+│   ├── clipboard.rs           Clipboard history
+│   ├── clipboard_store.rs     Session-scoped history storage
+│   ├── dragdrop.rs            File drag and drop, temporary window priority
+│   ├── convert.rs             Image and audio conversion engine
+│   ├── convert_batch.rs       Converter batch state and workers
+│   ├── settings_window.rs     Settings window
+│   ├── settings_store.rs      Settings file
+│   ├── startup.rs             Start on launch
+│   └── tray.rs                Notification area icon and menu
+├── assets/                    Icon, version resource and README images
+├── installer/                 Inno Setup script and wizard images
+├── vendor/avif-decode/        Vendored AVIF decoder (BSD-3-Clause)
+└── build.rs                   Embeds the icon and version information
 ```
 
 ## Privacy
