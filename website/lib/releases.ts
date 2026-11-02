@@ -26,6 +26,40 @@ export type Release = {
 
 export const RELEASES: Release[] = [
   {
+    version: "0.4.0",
+    tag: "v0.4.0",
+    publishedAt: "2026-11-02T08:28:44Z",
+    url: "https://github.com/ujvall/Oeca/releases/tag/v0.4.0",
+    installerUrl: "https://github.com/ujvall/Oeca/releases/download/v0.4.0/Oeca-Setup-0.4.0.exe",
+    summary: "An offline image and audio converter in the notch, a brightness display, and a refreshed look.",
+    sections: [
+      {
+        title: "Added",
+        items: [
+          "An offline file converter: drop images or audio onto the notch, choose Convert, pick an output format, then save the results beside the originals or in a folder you choose",
+          "Read PNG, JPEG, WebP, BMP, TIFF, GIF, AVIF, WAV, FLAC, MP3, Ogg and M4A; write PNG, JPEG, WebP, BMP, TIFF, WAV, FLAC and Ogg",
+          "A brightness display in the notch, in place of the Windows brightness flyout",
+          "With Always on top off, Oeca comes forward while you drag files in and stays in front until you convert or close the converter",
+        ],
+      },
+      {
+        title: "Improved",
+        items: [
+          "A cleaner converter, blurred rolling numbers in the notch displays, and refined collapsed-notch corners and visualizer bars",
+        ],
+      },
+      {
+        title: "Fixed",
+        items: [
+          "FLAC output now plays in strict players, large audio converts in low memory, and a damaged file no longer stalls a batch",
+        ],
+      },
+    ],
+    notes: [
+      "MP3, AAC and Opus can be opened but not created, and AVIF is read-only. Originals are never modified and nothing leaves your PC. The installer is not code-signed.",
+    ],
+  },
+  {
     version: "0.3.0",
     tag: "v0.3.0",
     publishedAt: "2026-10-17T11:16:59Z",

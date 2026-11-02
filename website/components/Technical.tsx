@@ -49,8 +49,8 @@ export function Technical() {
               Built the Windows way.
             </h2>
             <p className="t-lead mt-6 max-w-md">
-              Oeca is a single Rust executable. Its only dependencies are Microsoft&rsquo;s windows and
-              windows-core crates: no runtime, no UI framework, no web view.
+              Oeca is a single Rust executable: no runtime, no UI framework, no web view. The app uses
+              Microsoft&rsquo;s windows crates; the offline file converter adds pure-Rust codecs.
             </p>
             <ul
               aria-label="Technologies"

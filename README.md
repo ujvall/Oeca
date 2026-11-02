@@ -7,10 +7,10 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ujvall/Oeca/releases/download/v0.3.0/Oeca-Setup-0.3.0.exe"><img src="assets/readme/button-download.png" alt="Download for Windows" height="44"></a>
+  <a href="https://github.com/ujvall/Oeca/releases/download/v0.4.0/Oeca-Setup-0.4.0.exe"><img src="assets/readme/button-download.png" alt="Download for Windows" height="44"></a>
   <a href="https://github.com/ujvall/Oeca/releases"><img src="assets/readme/button-releases.png" alt="All releases" height="44"></a>
   <img src="assets/readme/chip-windows.png" alt="Windows 10 or later, 64-bit" height="44">
-  <img src="assets/readme/chip-version.png" alt="Version 0.3.0" height="44">
+  <img src="assets/readme/chip-version.png" alt="Version 0.4.0" height="44">
 </p>
 
 <br>
@@ -33,7 +33,17 @@
   <img src="assets/readme/card-native.png" alt="Native: one small Rust executable on Win32 and Direct2D, with no runtime and no web view." width="300">
 </p>
 
-Click an item in the Clipboard space to copy it again, or drag image files onto the notch to add them. A notification-area icon offers **Open**, **Settings** and **Quit**.
+Click an item in the Clipboard space to copy it again, or drag image files onto the left half of the drop page to add them. A notification-area icon offers **Open**, **Settings** and **Quit**.
+
+### Convert images and audio
+
+Drag files onto the notch and drop them on **Convert** (audio always goes there). A compact workspace lists each file with its format and size; tick the ones you want, pick an output format, and press **Convert**. Then **Save** each result, or **Save all**, beside the originals or in a folder you choose.
+
+- **Images:** open PNG, JPEG, WebP, BMP, TIFF, GIF and AVIF; write PNG, JPEG, WebP (lossless), BMP and TIFF. Transparency flattens onto a background you choose for JPEG, EXIF rotation is applied, and colour profiles are kept where the format allows.
+- **Audio:** open WAV, FLAC, MP3, Ogg Vorbis and M4A (AAC, ALAC); write WAV, FLAC and Ogg Vorbis. Tags carry over, and lossless sources keep their bit depth. MP3, AAC and Opus can be opened but not created.
+- **Bulk:** with several files selected, every output format of their kind stays on offer; a file already in that format is copied unchanged.
+- **Safe and offline:** everything runs on your PC, in the background. Originals are never modified, existing files are never overwritten (you get `name (2).ext`), and nothing is uploaded.
+- With Always on top off, Oeca comes forward while you drag files in and stays in front until you press Convert, collapse the notch or close the workspace.
 
 ## How it is built
 
@@ -46,7 +56,7 @@ Click an item in the Clipboard space to copy it again, or drag image files onto 
   <img src="assets/readme/chip-noruntime.png" alt="No runtime" height="36">
 </p>
 
-Oeca is a free, open-source (MIT) single Rust executable whose only dependencies are Microsoft's [`windows`](https://crates.io/crates/windows) and `windows-core` crates: no runtime, UI framework or web view.
+Oeca is a free, open-source (MIT) single Rust executable: no runtime, UI framework or web view. The app itself uses only Microsoft's [`windows`](https://crates.io/crates/windows) and `windows-core` crates. The converter adds pure-Rust codecs ([`image`](https://crates.io/crates/image), [Symphonia](https://github.com/pdeljanov/Symphonia), `flacenc`, and a vendored copy of `avif-decode` with `rav1d`) plus `vorbis_rs`, which bundles the C libogg and libvorbis. All of them are listed, with their licences, in [`THIRD-PARTY-NOTICES.txt`](THIRD-PARTY-NOTICES.txt).
 
 - **Window.** One layered, per-monitor-DPI-aware Win32 window. Pixels outside the notch shape pass clicks through to the windows below.
 - **Rendering.** Direct2D and DirectWrite draw into a premultiplied 32-bit bitmap that is composited with `UpdateLayeredWindow`. Brushes, text formats and bitmaps are cached per artwork and DPI.
@@ -56,7 +66,7 @@ Oeca is a free, open-source (MIT) single Rust executable whose only dependencies
 
 ## Install
 
-1. Download `Oeca-Setup.exe` from [Releases](https://github.com/ujvall/Oeca/releases).
+1. Download `Oeca-Setup-0.4.0.exe` from [Releases](https://github.com/ujvall/Oeca/releases).
 2. Run it. Oeca installs for your Windows account only, to `%LOCALAPPDATA%\Programs\Oeca`; no administrator rights are needed.
 3. Look for the notch at the top of your screen and the Oeca icon in the notification area.
 
@@ -103,13 +113,16 @@ Oeca/
 â”‚   â”œâ”€â”€ timer.rs               Countdown timer
 â”‚   â”œâ”€â”€ clipboard.rs           Clipboard history
 â”‚   â”œâ”€â”€ clipboard_store.rs     Session-scoped history storage
-â”‚   â”œâ”€â”€ dragdrop.rs            Image drag and drop
+â”‚   â”œâ”€â”€ dragdrop.rs            File drag and drop, temporary window priority
+â”‚   â”œâ”€â”€ convert.rs             Image and audio conversion engine
+â”‚   â”œâ”€â”€ convert_batch.rs       Converter batch state and workers
 â”‚   â”œâ”€â”€ settings_window.rs     Settings window
 â”‚   â”œâ”€â”€ settings_store.rs      Settings file
 â”‚   â”œâ”€â”€ startup.rs             Start on launch
 â”‚   â””â”€â”€ tray.rs                Notification area icon and menu
 â”œâ”€â”€ assets/                    Icon, version resource and README images
 â”œâ”€â”€ installer/                 Inno Setup script and wizard images
+â”œâ”€â”€ vendor/avif-decode/        Vendored AVIF decoder (BSD-3-Clause)
 â””â”€â”€ build.rs                   Embeds the icon and version information
 ```
 
@@ -119,7 +132,7 @@ Oeca makes no network requests unless you ask it to check for updates: from vers
 
 ## Code signing policy
 
-**Status: pending.** Oeca is applying for free code signing from [SignPath Foundation](https://signpath.org). Current releases, including v0.3.0, are not signed. Once the application is accepted, releases will be built by the GitHub Actions workflow in this repository, signed through SignPath and published here, with this notice: Free code signing provided by SignPath.io, certificate by SignPath Foundation.
+**Status: pending.** Oeca is applying for free code signing from [SignPath Foundation](https://signpath.org). Current releases, including v0.4.0, are not signed. Once the application is accepted, releases will be built by the GitHub Actions workflow in this repository, signed through SignPath and published here, with this notice: Free code signing provided by SignPath.io, certificate by SignPath Foundation.
 
 - Authors, Reviewers and Approvers: [Ujval Sai (@ujvall)](https://github.com/ujvall), currently the only maintainer.
 - Every signing request is approved manually by the maintainer, for releases built from this repository only.
