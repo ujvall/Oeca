@@ -45,6 +45,7 @@ use crate::config::{
 };
 use crate::config::{DROP_RESULT_MS, DROP_RESULT_TIMER_ID};
 use crate::config::{HUD_FLYOUT_TIMER_ID, HUD_HIDE_TIMER_ID, HUD_HOLD_MS, HUD_RELEASE_TIMER_ID};
+use crate::convert_batch::{self, Batch};
 use crate::dragdrop::{self, DragEvent, DragSession, DropTarget};
 use crate::hud::VolumeKey;
 use crate::layout::{MediaLayout, PanelHit, resolve_clipboard_layout};
@@ -374,6 +375,15 @@ struct WindowState {
     /// The drop being shown (or still decoding) was opened by its drag, so
     /// the notch closes once its result has been seen.
     drop_closes: bool,
+    /// Everything on show can also go to the clipboard (the drag is images
+    /// only), so the drop page has two zones.
+    drag_copyable: bool,
+    /// The notch is above ordinary windows for this drag only (Always on top off).
+    drag_lift: dragdrop::DragLift,
+    /// The Inbox's conversion batch (independent of the clipboard history).
+    batch: Batch,
+    /// A folder dialog is open (one at a time).
+    picking_folder: bool,
     /// User settings: restored from `settings.ini` at launch (defaults for a
     /// new user) and saved through `settings_store` on every change.
     settings: OecaSettings,
@@ -409,6 +419,7 @@ struct WindowState {
     /// The volume HUD, and the master volume (held only while the HUD
     /// shows).
     hud: crate::hud::Hud,
+    hud_z: HudZ,
     /// Volume-key momentum (input times only): a rapid held run into
     /// 0% / 100% presses that edge of the notch.
     momentum: crate::hud::Momentum,
@@ -506,6 +517,104 @@ fn foreground_kind(oeca: bool, topmost: bool, shell: bool, hwnd: HWND) -> Foregr
     }
 }
 
+/// Where the notch is while the HUD shows with Always on top off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum HudZ {
+    /// In its usual place (below the window in use).
+    #[default]
+    Idle,
+    /// Lifted above every window for the HUD.
+    Raised,
+    /// The HUD shows but the notch stays as it is: nothing covers it, or a
+    /// full-screen app runs.
+    Stay,
+}
+
+/// Whether the HUD may come above other windows given the shell's state: not
+/// over a full-screen app or game (a full-screen window, Direct3D exclusive
+/// mode, Presentation Settings), nor while away (screen saver, locked).
+fn hud_may_rise(state: windows::Win32::UI::Shell::QUERY_USER_NOTIFICATION_STATE) -> bool {
+    use windows::Win32::UI::Shell::{QUNS_ACCEPTS_NOTIFICATIONS, QUNS_APP, QUNS_QUIET_TIME};
+    matches!(
+        state,
+        QUNS_ACCEPTS_NOTIFICATIONS | QUNS_QUIET_TIME | QUNS_APP
+    )
+}
+
+/// A full-screen app or game is in front (unknown: assumed, so the notch
+/// never covers one).
+fn fullscreen_app_active() -> bool {
+    !unsafe { windows::Win32::UI::Shell::SHQueryUserNotificationState() }.is_ok_and(hud_may_rise)
+        || foreground_covers_monitor()
+}
+
+/// `window` (l, t, r, b) covers `monitor` entirely. A maximized window stops at
+/// the taskbar, so it does not.
+fn rect_covers(window: (i32, i32, i32, i32), monitor: (i32, i32, i32, i32)) -> bool {
+    window.0 <= monitor.0 && window.1 <= monitor.1 && window.2 >= monitor.2 && window.3 >= monitor.3
+}
+
+/// The foreground window (not Oeca, the desktop or the taskbar) covers its
+/// monitor: its visible frame (DWM's, without the invisible resize border)
+/// against the monitor's full bounds. Catches a borderless full-screen game
+/// the shell still calls an ordinary window.
+fn foreground_covers_monitor() -> bool {
+    use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect};
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.is_invalid() || is_shell_or_own(fg) {
+        return false;
+    }
+    let mut rect = windows::Win32::Foundation::RECT::default();
+    let framed = unsafe {
+        DwmGetWindowAttribute(
+            fg,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut rect as *mut _ as *mut _,
+            std::mem::size_of_val(&rect) as u32,
+        )
+    }
+    .is_ok();
+    if !framed && unsafe { GetWindowRect(fg, &mut rect) }.is_err() {
+        return false;
+    }
+    let monitor = unsafe { MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return false;
+    }
+    let m = info.rcMonitor;
+    rect_covers(
+        (rect.left, rect.top, rect.right, rect.bottom),
+        (m.left, m.top, m.right, m.bottom),
+    )
+}
+
+/// The shell's own windows (desktop, taskbar) or one of Oeca's.
+fn is_shell_or_own(hwnd: HWND) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetShellWindow, GetWindowThreadProcessId,
+    };
+    if hwnd == unsafe { GetShellWindow() } {
+        return true;
+    }
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    let mut class = [0u16; 32];
+    let n = unsafe { GetClassNameW(hwnd, &mut class) }.max(0) as usize;
+    pid == std::process::id()
+        || matches!(
+            String::from_utf16_lossy(&class[..n]).as_str(),
+            "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+        )
+}
+
 impl WindowState {
     /// Media composition of the settled expanded notch, if it is showing.
     fn active_media_layout(&self) -> Option<MediaLayout> {
@@ -514,6 +623,7 @@ impl WindowState {
             || self.media_content.is_none()
             || self.space == OecaSpace::Clipboard
             || self.settings_open
+            || self.renderer.convert_open()
         {
             return None;
         }
@@ -643,6 +753,7 @@ impl WindowState {
         if self.state != NotchState::Expanded
             || !width_only
             || self.renderer.drop_page()
+            || self.renderer.convert_open()
             || self.hud.is_shown()
         {
             return None;
@@ -708,7 +819,12 @@ impl WindowState {
     /// What the expanded notch shows: the drop page during an image drag,
     /// otherwise the active space.
     fn scene(&self) -> Scene {
-        Scene::current(self.renderer.drop_state(), self.settings_open, self.space)
+        Scene::current(
+            self.renderer.drop_state(),
+            self.renderer.convert_open(),
+            self.settings_open,
+            self.space,
+        )
     }
 
     /// The Settings page's accessible state (Some(settings) while open).
@@ -726,6 +842,8 @@ impl WindowState {
         self.persist_settings();
         // Timer presentations snap (and the done pulse stops) from now on
         self.refresh_timer_presence(hwnd);
+        // A HUD lift is re-decided under the new setting
+        self.sync_hud_z(hwnd);
         // The page's switch slides (control-feedback timer)
         self.kick_feedback(hwnd);
         self.redraw(hwnd);
@@ -1139,10 +1257,23 @@ impl WindowState {
             let before = state.scene();
             let action = state.drag.over(in_notch, expanded);
             let page = match (action.show, action.accept) {
-                (true, true) => DropPage::Ready,
+                (true, true) if state.drag_copyable => DropPage::Ready,
+                (true, true) => DropPage::ReadyConvert,
                 (true, false) => DropPage::Unsupported,
                 _ => DropPage::Off,
             };
+            // Which half of the two-zone page the pointer is over
+            let zone = if at.x < unsafe { GetSystemMetrics(SM_CXSCREEN) } / 2 {
+                dragdrop::DropZone::Copy
+            } else {
+                dragdrop::DropZone::Convert
+            };
+            if action.show && action.accept {
+                state.drag_raise(hwnd);
+            }
+            if state.renderer.set_drop_zone(zone) && page == DropPage::Ready {
+                state.redraw(hwnd);
+            }
             // The drop page at its own universal size (an expansion it
             // starts opens straight at it)
             if state.renderer.set_drop(page) && !action.expand {
@@ -1155,6 +1286,7 @@ impl WindowState {
             action.accept
         };
         let end = |state: &mut Self| {
+            state.drag_restore(hwnd);
             let collapse = state.drag.end() && state.expanded_or_expanding();
             let before = state.scene();
             let changed = state.renderer.set_drop(DropPage::Off);
@@ -1167,7 +1299,12 @@ impl WindowState {
             }
         };
         match event {
-            DragEvent::Enter { images, at } => {
+            DragEvent::Enter {
+                images,
+                copyable,
+                at,
+            } => {
+                self.drag_copyable = copyable;
                 self.grace(hwnd, GraceEvent::OecaInteraction);
                 // A drop result still on show gives way to the new drag,
                 // which then closes the notch the earlier drag opened
@@ -1185,8 +1322,29 @@ impl WindowState {
                     end(self);
                     return false;
                 }
+                // Audio, or the converter's half of the page: a conversion
+                // batch. The clipboard and its history are not touched
+                if !self.drag_copyable || self.renderer.drop_zone() == dragdrop::DropZone::Convert {
+                    // The drag's lift becomes the session's: it stays until the
+                    // workspace is done (`convert_refresh` ends it if nothing opened)
+                    self.drag_lift.open_session();
+                    let opened = self.drag.end() && self.expanded_or_expanding();
+                    self.drop_closes = false;
+                    let before = self.scene();
+                    self.renderer.set_drop(DropPage::Off);
+                    self.add_to_batch(hwnd, images, before);
+                    if self.batch.is_empty() && opened {
+                        // Nothing to convert after all: close what the drag opened
+                        self.reset_feedback(hwnd);
+                        let _ = start_or_reverse_animation(hwnd, self);
+                    }
+                    return true;
+                }
+                // The clipboard's half: images only
+                let images = dragdrop::supported_images(&images);
                 // The page stays up until the result replaces it; the
                 // expansion this drag made is closed after the result
+                self.drag_restore(hwnd);
                 self.drop_closes = self.drag.end() && self.expanded_or_expanding();
                 if !dragdrop::decode_async(hwnd, WM_APP_DROP_DECODED, images.clone()) {
                     // No worker thread: decode here (this thread has COM)
@@ -1194,6 +1352,266 @@ impl WindowState {
                 }
                 true
             }
+        }
+    }
+
+    // ---- The conversion workspace ---------------------------------------------
+
+    /// Pushes the batch to the renderer (a snapshot to draw, plus the
+    /// controls held "on": ticked rows and the chosen format).
+    fn convert_sync(&mut self) {
+        use crate::layout::ConvertHit as H;
+        let view = (!self.batch.is_empty()).then(|| self.batch.view());
+        let mut held = Vec::new();
+        if let Some(v) = &view {
+            for (i, r) in v.rows.iter().enumerate() {
+                if r.selected {
+                    held.push(PanelHit::Convert(H::Check(i)));
+                }
+            }
+            for (i, r) in v.rows.iter().enumerate() {
+                if r.removing {
+                    held.push(PanelHit::Convert(H::Gone(i)));
+                }
+            }
+            if let Some(at) = v
+                .target
+                .and_then(|t| v.formats.iter().position(|f| *f == t))
+            {
+                held.push(PanelHit::Convert(H::Chosen(at)));
+            }
+        }
+        self.renderer.set_convert(view);
+        self.renderer.feedback().set_clip_held(held);
+    }
+
+    /// After the batch changed (from showing `before`): redraw it, or, when
+    /// the workspace opened or closed, move the notch to the scene's size on
+    /// the existing space transition.
+    fn convert_refresh(&mut self, hwnd: HWND, before: Scene) {
+        self.convert_sync();
+        // The session's lift lasts as long as the workspace: gone with it,
+        // and re-checked against full-screen apps whenever it is used
+        if self.renderer.convert_open() {
+            self.session_reassess(hwnd);
+        } else {
+            self.session_end(hwnd);
+        }
+        if self.scene() != before {
+            self.reset_feedback(hwnd);
+            self.resize_to_target(hwnd, before);
+        } else {
+            self.kick_feedback(hwnd);
+            if self.state == NotchState::Expanded {
+                self.redraw(hwnd);
+            }
+        }
+    }
+
+    /// Dropped files join the batch and are inspected off the UI thread.
+    fn add_to_batch(&mut self, hwnd: HWND, files: Vec<std::path::PathBuf>, before: Scene) {
+        let added = self.batch.add(files);
+        if !added.is_empty() && !convert_batch::spawn_inspect(hwnd, WM_APP_CONVERT, added.clone()) {
+            // No worker thread: inspect here (headers only)
+            for (id, path) in added {
+                self.batch.inspected(id, crate::convert::inspect(&path));
+            }
+        }
+        self.convert_refresh(hwnd, before);
+    }
+
+    /// A worker reported (inspection, progress, a result, or its end).
+    fn convert_update(&mut self, hwnd: HWND, update: convert_batch::Update) {
+        use convert_batch::Update;
+        match update {
+            Update::Inspected(id, result) => self.batch.inspected(id, result),
+            Update::Progress(id, p) => self.batch.progress(id, p),
+            Update::Finished(id, result) => {
+                if let Some(stray) = self.batch.finished(id, result) {
+                    let _ = std::fs::remove_file(stray);
+                }
+            }
+            Update::Ended => self.batch.run_ended(),
+        }
+        let scene = self.scene();
+        self.convert_refresh(hwnd, scene);
+    }
+
+    /// The batch id behind row `i` of the rows on show.
+    fn convert_row_id(&self, i: usize) -> Option<convert_batch::ItemId> {
+        self.batch.items.get(self.batch.scroll + i).map(|it| it.id)
+    }
+
+    /// A click in the workspace.
+    fn convert_click(&mut self, hwnd: HWND, hit: crate::layout::ConvertHit) {
+        use crate::convert_batch::Primary;
+        use crate::layout::ConvertHit as H;
+        let before = self.scene();
+        match hit {
+            H::SelectAll => self.batch.toggle_all(),
+            H::Row(i) => {
+                if let Some(id) = self.convert_row_id(i) {
+                    self.batch.toggle(id);
+                }
+            }
+            H::Remove(i) => {
+                if let Some(id) = self.convert_row_id(i) {
+                    // The row fades out (feedback timer), then `convert_reap`
+                    // drops it; without motion it goes at once
+                    self.batch.begin_remove(id);
+                }
+            }
+            H::Save(i) => {
+                if let Some(id) = self.convert_row_id(i) {
+                    self.save_output(id);
+                }
+            }
+            H::Show(i) => {
+                if let Some(id) = self.convert_row_id(i)
+                    && let Some(convert_batch::Status::Saved(path)) =
+                        self.batch.get(id).map(|it| it.status.clone())
+                {
+                    convert_batch::show_in_folder(&path);
+                }
+            }
+            H::Format(i) => {
+                if let Some(f) = self.batch.formats().get(i).copied() {
+                    self.batch.choose(f);
+                }
+            }
+            H::Chip(i) => match (self.batch.target(), i) {
+                (Some(crate::convert::Format::Jpeg), 0) => self.batch.cycle_jpeg_quality(),
+                (Some(crate::convert::Format::Jpeg), _) => self.batch.cycle_background(),
+                (Some(crate::convert::Format::Ogg), _) => self.batch.cycle_vorbis_quality(),
+                _ => {}
+            },
+            H::Folder => self.pick_folder(hwnd),
+            H::Primary => match self.batch.primary() {
+                Primary::Convert => self.start_conversion(hwnd),
+                Primary::Cancel => self.batch.cancel_run(),
+                Primary::SaveAll => {
+                    for id in self.batch.unsaved_ids() {
+                        self.save_output(id);
+                    }
+                }
+                Primary::Done => self.discard_batch(),
+            },
+            H::Close => {
+                if self.batch.safe_to_close() {
+                    self.discard_batch();
+                } else {
+                    self.batch.confirming = true;
+                }
+            }
+            H::Keep => self.batch.confirming = false,
+            H::Discard => self.discard_batch(),
+            H::Check(_) | H::Chosen(_) | H::Gone(_) => {}
+        }
+        self.convert_sync();
+        self.convert_reap(hwnd);
+        self.convert_refresh(hwnd, before);
+    }
+
+    /// Drops rows that have finished fading (all at once under Reduced motion),
+    /// closing the workspace if that empties it.
+    fn convert_reap(&mut self, hwnd: HWND) {
+        use crate::layout::ConvertHit as H;
+        if !self.batch.items.iter().any(|i| i.removing) {
+            return;
+        }
+        let instant = !self.motion_enabled() || self.state != NotchState::Expanded;
+        let scroll = self.batch.scroll;
+        let positions: Vec<(convert_batch::ItemId, usize)> = self
+            .batch
+            .items
+            .iter()
+            .enumerate()
+            .map(|(n, it)| (it.id, n))
+            .collect();
+        let faded = |id| {
+            let Some(&(_, n)) = positions.iter().find(|(i, _)| *i == id) else {
+                return true;
+            };
+            let Some(row) = n
+                .checked_sub(scroll)
+                .filter(|r| *r < convert_batch::VISIBLE_ROWS)
+            else {
+                return true; // scrolled out of sight
+            };
+            instant
+                || self
+                    .renderer
+                    .feedback()
+                    .clip_levels(PanelHit::Convert(H::Gone(row)))
+                    .0
+                    >= 1.0
+        };
+        for staged in self.batch.reap(faded) {
+            let _ = std::fs::remove_file(staged);
+        }
+        if self.batch.is_empty() {
+            self.discard_batch();
+        }
+        self.convert_sync();
+        let _ = hwnd;
+    }
+
+    /// Queues the selected files for the worker thread.
+    fn start_conversion(&mut self, hwnd: HWND) {
+        if let Some(jobs) = self.batch.start() {
+            // Starting a conversion is the end of the browsing session
+            self.session_end(hwnd);
+            if !convert_batch::spawn_convert(
+                hwnd,
+                WM_APP_CONVERT,
+                jobs,
+                convert_batch::staging_dir(),
+            ) {
+                self.batch.run_ended();
+            }
+        }
+    }
+
+    /// Moves a converted file from the staging folder to where it is saved:
+    /// the chosen folder, else beside the original, under the original's name
+    /// (never over a file already there).
+    fn save_output(&mut self, id: convert_batch::ItemId) {
+        let Some(item) = self.batch.get(id) else {
+            return;
+        };
+        let convert_batch::Status::Done { staged, to, .. } = item.status.clone() else {
+            return;
+        };
+        let stem = item
+            .path
+            .file_stem()
+            .map_or_else(|| "converted".into(), |s| s.to_string_lossy().into_owned());
+        let Some(dir) = self.batch.save_dir(id) else {
+            return;
+        };
+        match crate::convert::publish(&staged, &dir, &stem, to.extension()) {
+            Ok(path) => self.batch.mark_saved(id, path),
+            Err(e) => {
+                let _ = std::fs::remove_file(&staged);
+                self.batch
+                    .fail(id, format!("Couldn't save to that folder: {}", e.kind()));
+            }
+        }
+    }
+
+    /// Forgets the batch: workers are told to stop, unsaved outputs go. The
+    /// original files are never touched.
+    fn discard_batch(&mut self) {
+        for staged in self.batch.clear() {
+            let _ = std::fs::remove_file(staged);
+        }
+        let _ = std::fs::remove_dir(convert_batch::staging_dir());
+    }
+
+    /// Asks for the output folder in a dialog on its own thread.
+    fn pick_folder(&mut self, hwnd: HWND) {
+        if !self.picking_folder && convert_batch::pick_folder_async(hwnd, WM_APP_FOLDER_PICKED) {
+            self.picking_folder = true;
         }
     }
 
@@ -1276,6 +1694,10 @@ impl WindowState {
         }
         let x = self.client_x(lparam);
         let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+        if self.renderer.convert_open() {
+            let l = crate::layout::resolve_convert_layout(&self.dimensions)?;
+            return l.hit(x, y, &self.renderer.convert_live());
+        }
         if self.settings_open {
             // Only the switches and the action row are live on the Settings page
             let l = resolve_settings_layout(&self.dimensions)?;
@@ -1430,6 +1852,7 @@ impl WindowState {
             || self.space != OecaSpace::Home
             || self.settings_open
             || self.renderer.drop_page()
+            || self.renderer.convert_open()
         {
             return None;
         }
@@ -1957,10 +2380,143 @@ impl WindowState {
         self.hud_changed(hwnd);
     }
 
+    /// With Always on top off the notch sits below the window in use. When a
+    /// window covers it and the HUD shows (volume, brightness, Energy Saver),
+    /// it comes above every window for the HUD alone (the clock and artwork
+    /// are gone for as long, at once), never over a full-screen app or game,
+    /// never activated; once the HUD is gone it goes back below the window in
+    /// use. Not covered, nothing changes: the notch behaves as ever. One
+    /// `SetWindowPos` each way, no frames or timers of its own.
+    fn sync_hud_z(&mut self, hwnd: HWND) {
+        if self.settings.always_on_top {
+            if self.hud_z == HudZ::Raised {
+                self.hud.hold_base(false);
+            }
+            self.hud_z = HudZ::Idle;
+            return;
+        }
+        let shown = self.hud.is_shown() || self.hud.view().presence > 0.0;
+        match (shown, self.hud_z) {
+            (true, HudZ::Idle) => {
+                if !self.notch_covered(hwnd) || fullscreen_app_active() {
+                    self.hud_z = HudZ::Stay;
+                } else {
+                    self.set_band(hwnd, HWND_TOPMOST);
+                    self.hud.hold_base(true);
+                    self.hud_z = HudZ::Raised;
+                }
+            }
+            (false, HudZ::Raised) => {
+                if !self.drag_lift.is_lifted() {
+                    self.set_band(hwnd, z_band(false));
+                }
+                self.hud.hold_base(false);
+                self.hud_z = HudZ::Idle;
+            }
+            (false, HudZ::Stay) => self.hud_z = HudZ::Idle,
+            _ => {}
+        }
+    }
+
+    /// Performs what `DragLift` decided: a no-activation `SetWindowPos`, the
+    /// same one the HUD lift uses. Lowering never touches Always on top (the
+    /// notch is then topmost already) or a HUD that still holds the band.
+    fn lift_apply(&self, hwnd: HWND, step: dragdrop::LiftStep) {
+        use dragdrop::LiftStep;
+        match step {
+            LiftStep::Raise => self.set_band(hwnd, HWND_TOPMOST),
+            LiftStep::Lower if !self.settings.always_on_top && self.hud_z != HudZ::Raised => {
+                self.set_band(hwnd, z_band(false));
+            }
+            LiftStep::Lower | LiftStep::Nothing => {}
+        }
+    }
+
+    /// Whether a full-screen app or game is in front (only asked while a lift
+    /// could follow from it; unknown counts as yes).
+    fn lift_fullscreen(&self) -> bool {
+        !self.settings.always_on_top
+            && self.drag_lift.needs_fullscreen_check()
+            && fullscreen_app_active()
+    }
+
+    /// A droppable file drag is over the notch: with Always on top off, the
+    /// notch comes above ordinary windows (never over a full-screen app or
+    /// game, and never when that cannot be told). A drop that opens the
+    /// converter turns this into a session lift; any other end undoes it.
+    fn drag_raise(&mut self, hwnd: HWND) {
+        let fullscreen = self.lift_fullscreen();
+        let step = self
+            .drag_lift
+            .begin_drag(self.settings.always_on_top, fullscreen);
+        self.lift_apply(hwnd, step);
+    }
+
+    /// A drag ended without a workspace to keep (leave, Escape, invalid drop,
+    /// a drop to the clipboard): undoes its lift. A session's lift stays.
+    fn drag_restore(&mut self, hwnd: HWND) {
+        let step = self.drag_lift.end_drag();
+        self.lift_apply(hwnd, step);
+    }
+
+    /// The converter session ended (Convert pressed, notch collapsed, the
+    /// workspace closed): back to the notch's normal place, whatever the
+    /// Always on top setting says.
+    fn session_end(&mut self, hwnd: HWND) {
+        let step = self.drag_lift.end_session();
+        self.lift_apply(hwnd, step);
+    }
+
+    /// The foreground may have changed (a click anywhere, any use of the
+    /// workspace): lowers for a full-screen app or game, raises again once it
+    /// is gone. Event-driven; nothing runs between events.
+    fn session_reassess(&mut self, hwnd: HWND) {
+        if self.drag_lift.phase() != dragdrop::LiftPhase::Session {
+            return;
+        }
+        let fullscreen = !self.settings.always_on_top && fullscreen_app_active();
+        let step = self
+            .drag_lift
+            .reassess(self.settings.always_on_top, fullscreen);
+        self.lift_apply(hwnd, step);
+    }
+
+    /// Another window is over the middle of the notch (what the screen shows
+    /// there is not the notch).
+    fn notch_covered(&self, hwnd: HWND) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor, WindowFromPoint};
+        let at = unsafe {
+            WindowFromPoint(POINT {
+                x: self.pos_x + self.dimensions.width / 2,
+                y: self.pos_y + self.dimensions.height / 2,
+            })
+        };
+        !at.is_invalid() && unsafe { GetAncestor(at, GA_ROOT) } != hwnd
+    }
+
+    /// Moves the notch (and the countdown bubble, which shares its band) to
+    /// `band`, keeping position, size and activation.
+    fn set_band(&self, hwnd: HWND, band: HWND) {
+        for window in std::iter::once(hwnd).chain(self.bubble) {
+            unsafe {
+                let _ = SetWindowPos(
+                    window,
+                    Some(band),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
+
     /// The HUD has a new target: it moves on the notch's frames (started if
     /// idle; running ones are simply retargeted, never restarted). Reduced
     /// motion: the end state is drawn now.
     fn hud_changed(&mut self, hwnd: HWND) {
+        self.sync_hud_z(hwnd);
         self.renderer.set_hud(self.hud.view());
         if self.hud.is_animating() {
             if self.last_frame_time.is_none() {
@@ -2302,6 +2858,11 @@ const WM_APP_TIMER_TICK: u32 = WM_APP + 41;
 
 /// Posted by a drop's decoding worker (lParam: its `Box<dragdrop::Decoded>`).
 const WM_APP_DROP_DECODED: u32 = WM_APP + 43;
+/// Posted by the conversion workers (lParam: a `Box<convert_batch::Update>`).
+const WM_APP_CONVERT: u32 = WM_APP + 55;
+/// Posted when the output folder dialog closes (lParam: a
+/// `Box<Option<PathBuf>>`).
+const WM_APP_FOLDER_PICKED: u32 = WM_APP + 56;
 
 /// Posted when a drop result has been on show long enough.
 const WM_APP_DROP_RESULT_DONE: u32 = WM_APP + 44;
@@ -2742,6 +3303,11 @@ fn start_or_reverse_animation(hwnd: HWND, state: &mut WindowState) -> Result<()>
         state.stop_drop_result(hwnd);
         state.renderer.set_drop(crate::dragdrop::DropPage::Off);
     }
+    // Collapsing (by hand, an outside click or the drag's end) ends a
+    // converter session's lift
+    if target_state == NotchState::Collapsed {
+        state.session_end(hwnd);
+    }
     // A scrub in progress ends without seeking
     state.end_scrub(hwnd, false);
     // Opening or closing ends a held key's stretch (it relaxes on the way)
@@ -3005,6 +3571,8 @@ fn animation_frame(hwnd: HWND, state: &mut WindowState) {
 
     // The volume HUD moves on the same frames
     let hud_active = state.hud.step(delta_ms);
+    // Dropping back below the window in use once the HUD is gone
+    state.sync_hud_z(hwnd);
     state.renderer.set_hud(state.hud.view());
     // ...and the timer panel's selector / scale
     let timer_moving = state.timer_motion.is_animating();
@@ -3443,6 +4011,46 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
 
+        WM_APP_CONVERT => {
+            // lParam owns a `Box<Update>` from a worker: taken back exactly
+            // once, applied, or freed if the window is gone; a busy state
+            // gets the same message again later
+            let ptr = lparam.0 as *mut convert_batch::Update;
+            let take = || unsafe { *Box::from_raw(ptr) };
+            match with_state(hwnd, |state| state.convert_update(hwnd, take())) {
+                Access::Ran(()) => {}
+                Access::Busy => unsafe {
+                    if PostMessageW(Some(hwnd), msg, wparam, lparam).is_err() {
+                        drop(take());
+                    }
+                },
+                Access::Missing => drop(take()),
+            }
+            LRESULT(0)
+        }
+
+        WM_APP_FOLDER_PICKED => {
+            let ptr = lparam.0 as *mut Option<std::path::PathBuf>;
+            let take = || unsafe { *Box::from_raw(ptr) };
+            match with_state(hwnd, |state| {
+                state.picking_folder = false;
+                if let Some(dir) = take() {
+                    state.batch.out_dir = Some(dir);
+                    let scene = state.scene();
+                    state.convert_refresh(hwnd, scene);
+                }
+            }) {
+                Access::Ran(()) => {}
+                Access::Busy => unsafe {
+                    if PostMessageW(Some(hwnd), msg, wparam, lparam).is_err() {
+                        drop(take());
+                    }
+                },
+                Access::Missing => drop(take()),
+            }
+            LRESULT(0)
+        }
+
         WM_APP_DROP_RESULT_DONE => {
             with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
                 state.end_drop_result(hwnd);
@@ -3515,6 +4123,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let (cx, cy) = state.renderer.content_offset();
                 pt.x -= cx as i32;
                 pt.y -= cy as i32;
+                // The workspace's file list scrolls a row per notch
+                if state.renderer.convert_open()
+                    && state.animation.is_none()
+                    && delta != 0
+                    && state.batch.scroll_by(-i32::from(delta.signum()))
+                {
+                    let scene = state.scene();
+                    state.convert_refresh(hwnd, scene);
+                    return;
+                }
                 let over = state
                     .timer_layout()
                     .is_some_and(|l| l.panel.contains(pt.x as f32, pt.y as f32));
@@ -3531,6 +4149,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_APP_GRACE => {
             with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
                 if let Some(event) = GraceEvent::ALL.get(wparam.0) {
+                    // A click elsewhere may have brought a full-screen app in front
+                    state.session_reassess(hwnd);
                     state.grace(hwnd, *event);
                 }
             });
@@ -3638,6 +4258,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // Control feedback and the Settings page's switches share
                     // this timer (both step every tick)
                     let feedback = state.renderer.feedback().step(dt);
+                    // Rows that have faded out leave the batch
+                    let scene = state.scene();
+                    if state.batch.items.iter().any(|i| i.removing) {
+                        state.convert_reap(hwnd);
+                        state.convert_refresh(hwnd, scene);
+                    }
                     let switches = state.renderer.step_switches(dt);
                     // ...transport glyphs and the artwork turn...
                     let media = state.renderer.step_media_motion(dt);
@@ -3801,7 +4427,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     | PanelHit::TimerPrimary
                     | PanelHit::TimerCancel
                     | PanelHit::TimerScale
-                    | PanelHit::TimerMode(_) => None,
+                    | PanelHit::TimerMode(_)
+                    | PanelHit::Convert(_) => None,
                 });
                 let changed = {
                     let mut feedback = state.renderer.feedback();
@@ -3956,6 +4583,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             return;
                         }
                         PanelHit::TimerScale => return,
+                        PanelHit::Convert(h) => {
+                            state.convert_click(hwnd, h);
+                            return;
+                        }
                         PanelHit::TimerMode(mode) => {
                             state.timer_mode(hwnd, mode);
                             return;
@@ -4362,6 +4993,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_DESTROY => {
             // The Settings window shuts down with Oeca
             settings_window::close();
+            // A running conversion stops; unsaved converted files go with it
+            let _ = with_state(hwnd, |state| state.discard_batch());
             unsafe {
                 let _ = KillTimer(Some(hwnd), ANIMATION_TIMER_ID);
                 let _ = KillTimer(Some(hwnd), CLOCK_TIMER_ID);
@@ -4829,6 +5462,14 @@ fn run_window(ole: bool) -> Result<()> {
             clip_store,
             drag: DragSession::default(),
             drop_closes: false,
+            drag_copyable: false,
+            drag_lift: dragdrop::DragLift::default(),
+            batch: {
+                // Staging folders crashed runs left behind
+                convert_batch::cleanup_stale_staging();
+                Batch::default()
+            },
+            picking_folder: false,
             settings,
             settings_store,
             settings_open: false,
@@ -4846,6 +5487,7 @@ fn run_window(ole: bool) -> Result<()> {
             scrub: None,
             tray: crate::tray::TrayIcon::default(),
             hud: crate::hud::Hud::default(),
+            hud_z: HudZ::default(),
             momentum: crate::hud::Momentum::default(),
             volume: None,
             saver_watch: [None, None],
@@ -5470,6 +6112,27 @@ mod tests {
     }
 
     #[test]
+    fn test_hud_rises_above_windows_except_over_full_screen_apps() {
+        use windows::Win32::UI::Shell::{
+            QUNS_ACCEPTS_NOTIFICATIONS, QUNS_APP, QUNS_BUSY, QUNS_NOT_PRESENT,
+            QUNS_PRESENTATION_MODE, QUNS_QUIET_TIME, QUNS_RUNNING_D3D_FULL_SCREEN,
+        };
+        for state in [QUNS_ACCEPTS_NOTIFICATIONS, QUNS_QUIET_TIME, QUNS_APP] {
+            assert!(hud_may_rise(state), "{state:?}");
+        }
+        // A full-screen window, a game in exclusive mode, a presentation,
+        // and nobody there (screen saver, locked): the notch stays down
+        for state in [
+            QUNS_BUSY,
+            QUNS_RUNNING_D3D_FULL_SCREEN,
+            QUNS_PRESENTATION_MODE,
+            QUNS_NOT_PRESENT,
+        ] {
+            assert!(!hud_may_rise(state), "{state:?}");
+        }
+    }
+
+    #[test]
     fn test_always_on_top_defaults_on_and_maps_to_z_order() {
         let mut settings = OecaSettings::default();
         assert!(
@@ -5598,14 +6261,14 @@ mod tests {
         for dpi in [96, 120, 144, 192] {
             let clipboard = expanded_size_dip(OecaSpace::Clipboard, dpi);
             for space in OecaSpace::ALL {
-                let open = Scene::current(crate::dragdrop::DropPage::Off, true, space);
+                let open = Scene::current(crate::dragdrop::DropPage::Off, false, true, space);
                 assert_eq!(
                     expanded_size_dip(open.size_space(), dpi),
                     clipboard,
                     "{space:?}"
                 );
                 // Back from Settings: the originating space's own size
-                let closed = Scene::current(crate::dragdrop::DropPage::Off, false, space);
+                let closed = Scene::current(crate::dragdrop::DropPage::Off, false, false, space);
                 assert_eq!(closed, Scene::Space(space));
                 assert_eq!(
                     expanded_size_dip(closed.size_space(), dpi),
@@ -6110,5 +6773,20 @@ mod tests {
         assert_eq!(scrub_position(7.0, 200_000), 200_000);
         assert_eq!(scrub_position(0.3, 0), 0);
         assert_eq!(scrub_position(f32::NAN.max(0.0), 1000), 0);
+    }
+    #[test]
+    fn test_full_screen_detection_by_monitor_bounds() {
+        let monitor = (0, 0, 1920, 1080);
+        // Exactly the monitor: a full-screen game or borderless window
+        assert!(rect_covers((0, 0, 1920, 1080), monitor));
+        assert!(
+            rect_covers((-8, -8, 1928, 1088), monitor),
+            "frame beyond the edges"
+        );
+        // Maximized stops at the taskbar; a normal window is smaller
+        assert!(!rect_covers((0, 0, 1920, 1032), monitor));
+        assert!(!rect_covers((100, 100, 1500, 900), monitor));
+        // On a second monitor, the first one's full-screen window doesn't count
+        assert!(!rect_covers((0, 0, 1920, 1080), (1920, 0, 3840, 1080)));
     }
 }

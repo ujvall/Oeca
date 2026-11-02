@@ -124,7 +124,7 @@ impl SpaceSelectorLayout {
         match space {
             OecaSpace::Home => self.home,
             OecaSpace::Music => self.music,
-            OecaSpace::Clipboard => self.clipboard,
+            OecaSpace::Clipboard | OecaSpace::Convert => self.clipboard,
         }
     }
 
@@ -168,6 +168,7 @@ pub fn resolve_space_selector_in(
         OecaSpace::Home => BASE_MEDIA_ARTWORK_INSET,
         OecaSpace::Music => BASE_MUSIC_SIDE_INSET,
         OecaSpace::Clipboard => BASE_CLIPBOARD_SIDE_INSET,
+        OecaSpace::Convert => crate::config::BASE_CONVERT_SIDE_INSET,
     };
     let left = (wall + px(inset)).round();
     let top = px(BASE_SPACE_SELECTOR_TOP);
@@ -212,7 +213,7 @@ pub fn blended_selector(
         let highlight = match scene {
             Scene::Settings => sel.settings,
             Scene::Space(s) => sel.bounds(s),
-            Scene::Drop | Scene::Dropped => sel.bounds(space),
+            Scene::Drop | Scene::Dropped | Scene::Convert => sel.bounds(space),
         };
         Some((sel, highlight))
     };
@@ -325,14 +326,50 @@ pub enum PanelHit {
     TimerCancel,
     TimerScale,
     TimerMode(crate::timer::Mode),
+    /// A control of the conversion workspace.
+    Convert(ConvertHit),
 }
 
 impl PanelHit {
     /// Icon buttons (they grow on hover/press); a row box, the timer's
-    /// scale or a mode pill is not one.
+    /// scale or a mode pill is not one. Conversion controls are lifted, not
+    /// grown, by the same hover/press levels, so they all count.
     pub fn is_button(self) -> bool {
         !matches!(self, Self::Row(_) | Self::TimerScale | Self::TimerMode(_))
     }
+}
+
+/// What a click in the conversion workspace lands on. Row indices are into the
+/// rows on show (0..3), not the batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvertHit {
+    /// The toolbar's check box and count: select all / deselect all.
+    SelectAll,
+    /// A file row's body or check box: toggles its selection.
+    Row(usize),
+    /// A row's trailing buttons: remove from the batch, save, show in folder.
+    Remove(usize),
+    Save(usize),
+    Show(usize),
+    /// An output-format pill (index into the offered formats).
+    Format(usize),
+    /// The primary button (Convert / Cancel / Save all / Done).
+    Primary,
+    /// A toolbar chip (quality, background).
+    Chip(usize),
+    /// The output folder button.
+    Folder,
+    /// The header's X: closes the batch (asking first if outputs are unsaved).
+    Close,
+    /// The discard question's buttons.
+    Keep,
+    Discard,
+    /// Feedback keys only (never hit): a ticked row's check, and the chosen
+    /// format pill, whose levels animate their fill.
+    Check(usize),
+    Chosen(usize),
+    /// A row on its way out (fading before it is removed).
+    Gone(usize),
 }
 
 /// Home's Focus / Break timer, in two columns. Left: the mode pills over
@@ -632,10 +669,17 @@ pub fn hud_digit_cells(text: RectF, cell: f32) -> [RectF; 3] {
     [at(0.0), at(1.0), at(2.0)]
 }
 
-/// The HUD in the collapsed notch: icon in the artwork's place, number in
-/// the visualizer's (as the countdown slot), the bar across the clock.
+/// The HUD in the collapsed notch: icon at the left of the content area,
+/// number in the visualizer's (as the countdown slot), the bar across the
+/// clock.
 pub fn collapsed_hud_layout(layout: &CollapsedLayout, scale: f32) -> HudLayout {
-    let icon = layout.artwork_bounds;
+    let content = layout.content_bounds;
+    let size = (crate::config::BASE_COLLAPSED_HUD_ICON_SIZE * scale)
+        .round()
+        .min(content.height());
+    let top = ((content.top + content.bottom - size) / 2.0).round();
+    let left = content.left.round();
+    let icon = RectF::new(left, top, left + size, top + size);
     hud_row(
         icon,
         (icon.height() * 0.9).round(),
@@ -820,6 +864,261 @@ impl ClipboardLayout {
                 .then_some(PanelHit::ConfirmClear)
         }
     }
+}
+
+/// The conversion workspace, top to bottom: the toolbar in the header band
+/// (select-all box and count at the left; option chips, folder and close at
+/// the right), three file rows, and the action bar (format pills, then the
+/// primary button at the right edge).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConvertLayout {
+    pub select: RectF,
+    pub check: RectF,
+    pub count: RectF,
+    pub chips: [RectF; 2],
+    pub folder: RectF,
+    pub close: RectF,
+    pub rows: [RectF; crate::convert_batch::VISIBLE_ROWS],
+    pub pills: [RectF; 5],
+    pub pills_area: RectF,
+    pub primary: RectF,
+    pub confirm_message: RectF,
+    pub confirm_note: RectF,
+    pub keep: RectF,
+    pub discard: RectF,
+    pub scale: f32,
+}
+
+/// A file row's parts. The trailing buttons are right-aligned: remove at the
+/// edge, then the Save pill or the Show button.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConvertRowParts {
+    pub row: RectF,
+    pub check: RectF,
+    pub icon: RectF,
+    pub name: RectF,
+    pub detail: RectF,
+    pub progress: RectF,
+    pub remove: RectF,
+    pub action: RectF,
+}
+
+/// What is live in the workspace right now (for hit-testing).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConvertLive {
+    /// Rows on show, and which of them have a Save / Show button.
+    pub rows: usize,
+    pub save: [bool; crate::convert_batch::VISIBLE_ROWS],
+    pub show: [bool; crate::convert_batch::VISIBLE_ROWS],
+    pub formats: usize,
+    pub chips: usize,
+    pub confirming: bool,
+}
+
+impl ConvertLayout {
+    pub fn row_parts(&self, i: usize) -> ConvertRowParts {
+        use crate::config::*;
+        let px = |v: f32| (v * self.scale).round();
+        let row = self.rows[i.min(self.rows.len() - 1)];
+        let mid = (row.top + row.bottom) / 2.0;
+        let square = |left: f32, size: f32| {
+            RectF::new(left, mid - size / 2.0, left + size, mid + size / 2.0)
+        };
+        let pad = px(4.0);
+        let check = square(row.left + pad, px(BASE_CONVERT_CHECK_SIZE));
+        let icon = square(check.right + px(8.0), px(BASE_CONVERT_FILE_ICON));
+        let b = px(BASE_CONVERT_ROW_BUTTON);
+        let remove = square(row.right - pad - b, b);
+        let action = RectF::new(
+            remove.left - px(4.0) - px(46.0),
+            mid - px(10.0),
+            remove.left - px(4.0),
+            mid + px(10.0),
+        );
+        let text_left = icon.right + px(8.0);
+        let text_right = action.left - px(6.0);
+        let line = px(15.0);
+        let name = RectF::new(text_left, mid - line - px(2.0), text_right, mid - px(2.0));
+        let detail = RectF::new(text_left, mid - px(1.0), text_right, mid + line - px(2.0));
+        // The progress line runs along the row's bottom edge, under the text
+        let bar = px(1.5).max(1.0);
+        let progress = RectF::new(
+            text_left,
+            row.bottom - px(3.0) - bar,
+            text_right,
+            row.bottom - px(3.0),
+        );
+        ConvertRowParts {
+            row,
+            check,
+            icon,
+            name,
+            detail,
+            progress,
+            remove,
+            action,
+        }
+    }
+
+    pub fn hit(&self, px: f32, py: f32, live: &ConvertLive) -> Option<PanelHit> {
+        use ConvertHit as H;
+        let h = |hit| Some(PanelHit::Convert(hit));
+        if self.close.contains(px, py) {
+            return h(H::Close);
+        }
+        if live.confirming {
+            return if self.keep.contains(px, py) {
+                h(H::Keep)
+            } else if self.discard.contains(px, py) {
+                h(H::Discard)
+            } else {
+                None
+            };
+        }
+        if self.folder.contains(px, py) {
+            return h(H::Folder);
+        }
+        if let Some(i) = (0..live.chips.min(2)).find(|&i| self.chips[i].contains(px, py)) {
+            return h(H::Chip(i));
+        }
+        if self.select.contains(px, py) {
+            return h(H::SelectAll);
+        }
+        if self.primary.contains(px, py) {
+            return h(H::Primary);
+        }
+        if let Some(i) =
+            (0..live.formats.min(self.pills.len())).find(|&i| self.pills[i].contains(px, py))
+        {
+            return h(H::Format(i));
+        }
+        for i in 0..live.rows.min(self.rows.len()) {
+            let p = self.row_parts(i);
+            if !p.row.contains(px, py) {
+                continue;
+            }
+            return if p.remove.contains(px, py) {
+                h(H::Remove(i))
+            } else if live.save[i] && p.action.contains(px, py) {
+                h(H::Save(i))
+            } else if live.show[i] && p.action.contains(px, py) {
+                h(H::Show(i))
+            } else {
+                h(H::Row(i))
+            };
+        }
+        None
+    }
+}
+
+/// Resolves the conversion workspace for its expanded dimensions.
+pub fn resolve_convert_layout(dimensions: &NotchDimensions) -> Option<ConvertLayout> {
+    use crate::config::*;
+    let ResolvedLayout::Expanded { components, .. } = resolve_layout(dimensions) else {
+        return None;
+    };
+    let band = resolve_space_selector_in(dimensions, OecaSpace::Convert)?.clipboard;
+    let px = |v: f32| (v * dimensions.scale).round();
+    let wall = dimensions.shadow_margin_x + dimensions.curvature.top_transition_radius;
+    let inset = px(BASE_CONVERT_SIDE_INSET);
+    let (left, right) = (
+        (wall + inset).round(),
+        (dimensions.width as f32 - wall - inset).round(),
+    );
+    // Toolbar, in the header band
+    let check_size = px(BASE_CONVERT_CHECK_SIZE);
+    let mid = (band.top + band.bottom) / 2.0;
+    let check = RectF::new(
+        left,
+        mid - check_size / 2.0,
+        left + check_size,
+        mid + check_size / 2.0,
+    );
+    let count = RectF::new(
+        check.right + px(8.0),
+        band.top,
+        left + px(132.0),
+        band.bottom,
+    );
+    let select = RectF::new(left - px(4.0), band.top, count.right, band.bottom);
+    let close = RectF::new(right - band.height(), band.top, right, band.bottom);
+    let folder = RectF::new(
+        close.left - px(4.0) - band.height(),
+        band.top,
+        close.left - px(4.0),
+        band.bottom,
+    );
+    let chip_w = px(BASE_CONVERT_CHIP_WIDTH);
+    let chip1 = RectF::new(
+        folder.left - px(6.0) - chip_w,
+        band.top,
+        folder.left - px(6.0),
+        band.bottom,
+    );
+    let chip0 = RectF::new(
+        chip1.left - px(4.0) - chip_w,
+        band.top,
+        chip1.left - px(4.0),
+        band.bottom,
+    );
+    // Rows
+    let top = components.content_bounds.top.round();
+    let (rh, rg) = (px(BASE_CONVERT_ROW_HEIGHT), px(BASE_CONVERT_ROW_GAP));
+    let rows = std::array::from_fn(|i| {
+        let t = top + i as f32 * (rh + rg);
+        RectF::new(left, t, right, t + rh)
+    });
+    let rows_bottom = rows[rows.len() - 1].bottom;
+    // Action bar
+    let bar_top = rows_bottom + px(BASE_CONVERT_BAR_GAP);
+    let bar_bottom = bar_top + px(BASE_CONVERT_BAR_HEIGHT);
+    let primary = RectF::new(
+        right - px(BASE_CONVERT_PRIMARY_WIDTH),
+        bar_top,
+        right,
+        bar_bottom,
+    );
+    let (pw, pg) = (px(BASE_CONVERT_PILL_WIDTH), px(BASE_CONVERT_PILL_GAP));
+    let pill_h = px(24.0);
+    let pill_top = bar_top + (px(BASE_CONVERT_BAR_HEIGHT) - pill_h) / 2.0;
+    let pills = std::array::from_fn(|i| {
+        let l = left + i as f32 * (pw + pg);
+        RectF::new(l, pill_top, l + pw, pill_top + pill_h)
+    });
+    let pills_area = RectF::new(left, bar_top, primary.left - px(8.0), bar_bottom);
+    // The discard question, centred over the rows
+    let area_h = rows_bottom - top;
+    let (line, note, gap, button) = (px(20.0), px(18.0), px(12.0), px(28.0));
+    let block_top = (top + (area_h - (line + note + gap + button)) / 2.0).round();
+    let confirm_message = RectF::new(left, block_top, right, block_top + line);
+    let confirm_note = RectF::new(
+        left,
+        confirm_message.bottom,
+        right,
+        confirm_message.bottom + note,
+    );
+    let (bw, bgap) = (px(92.0), px(8.0));
+    let cx = ((left + right) / 2.0).round();
+    let btop = confirm_note.bottom + gap;
+    let keep = RectF::new(cx - bgap / 2.0 - bw, btop, cx - bgap / 2.0, btop + button);
+    let discard = RectF::new(cx + bgap / 2.0, btop, cx + bgap / 2.0 + bw, btop + button);
+    Some(ConvertLayout {
+        select,
+        check,
+        count,
+        chips: [chip0, chip1],
+        folder,
+        close,
+        rows,
+        pills,
+        pills_area,
+        primary,
+        confirm_message,
+        confirm_note,
+        keep,
+        discard,
+        scale: dimensions.scale,
+    })
 }
 
 /// Resolves the Clipboard space for expanded dimensions (None when collapsed).
@@ -1135,6 +1434,7 @@ pub fn expanded_width(space: OecaSpace) -> f32 {
     match space {
         OecaSpace::Home => BASE_EXPANDED_WIDTH,
         OecaSpace::Clipboard => BASE_CLIPBOARD_WIDTH,
+        OecaSpace::Convert => crate::config::BASE_CONVERT_WIDTH,
         OecaSpace::Music => {
             // Side walls, the player column's inset on both sides, and the
             // widest row: the full-width scrubber (labels + track)
@@ -1163,6 +1463,13 @@ pub fn space_dimensions(state: NotchState, dpi: u32, space: OecaSpace) -> NotchD
             let dims = dims.with_width_dip(expanded_width(space));
             NotchDimensions {
                 height: clipboard_height_px(&dims),
+                ..dims
+            }
+        }
+        (NotchState::Expanded, OecaSpace::Convert) => {
+            let dims = dims.with_width_dip(expanded_width(space));
+            NotchDimensions {
+                height: convert_height_px(&dims),
                 ..dims
             }
         }
@@ -1202,6 +1509,22 @@ fn clipboard_height_px(d: &NotchDimensions) -> i32 {
         + (n - 1.0) * px(BASE_CLIPBOARD_ROW_GAP)
         + px(BASE_CLIPBOARD_BOTTOM_PAD);
     let header = px(crate::config::BASE_EXPANDED_HEADER_EXTRA);
+    let notch = d.curvature.top_transition_height + d.padding_v + header + rows;
+    (notch + d.shadow_margin_bottom).ceil() as i32
+}
+
+/// Conversion workspace height in pixels: three file rows and the action bar
+/// as they round at this DPI (see `resolve_convert_layout`).
+fn convert_height_px(d: &NotchDimensions) -> i32 {
+    use crate::config::*;
+    let px = |v: f32| (v * d.scale).round();
+    let n = crate::convert_batch::VISIBLE_ROWS as f32;
+    let rows = n * px(BASE_CONVERT_ROW_HEIGHT)
+        + (n - 1.0) * px(BASE_CONVERT_ROW_GAP)
+        + px(BASE_CONVERT_BAR_GAP)
+        + px(BASE_CONVERT_BAR_HEIGHT)
+        + px(BASE_CONVERT_BOTTOM_PAD);
+    let header = px(BASE_EXPANDED_HEADER_EXTRA);
     let notch = d.curvature.top_transition_height + d.padding_v + header + rows;
     (notch + d.shadow_margin_bottom).ceil() as i32
 }
@@ -1489,6 +1812,19 @@ pub fn expanded_height(space: OecaSpace) -> f32 {
                 + BASE_CLIPBOARD_BOTTOM_PAD
                 + BASE_EXPANDED_SHADOW_MARGIN_BOTTOM
         }
+        OecaSpace::Convert => {
+            use crate::config::*;
+            let n = crate::convert_batch::VISIBLE_ROWS as f32;
+            BASE_EXPANDED_TOP_TRANSITION_HEIGHT
+                + BASE_EXPANDED_HEADER_EXTRA
+                + BASE_EXPANDED_PADDING_V
+                + n * BASE_CONVERT_ROW_HEIGHT
+                + (n - 1.0) * BASE_CONVERT_ROW_GAP
+                + BASE_CONVERT_BAR_GAP
+                + BASE_CONVERT_BAR_HEIGHT
+                + BASE_CONVERT_BOTTOM_PAD
+                + BASE_EXPANDED_SHADOW_MARGIN_BOTTOM
+        }
         OecaSpace::Music => {
             BASE_EXPANDED_TOP_TRANSITION_HEIGHT
                 + crate::config::BASE_EXPANDED_HEADER_EXTRA
@@ -1529,10 +1865,11 @@ pub fn resolve_collapsed_layout(dimensions: &NotchDimensions) -> CollapsedLayout
     );
 
     let cy = (content_top + content_bottom) / 2.0;
-    let art = (crate::config::BASE_COLLAPSED_ARTWORK_SIZE * scale)
-        .round()
-        .min(content_bottom - content_top);
-    let (art_left, art_top) = (content_left.round(), (cy - art / 2.0).round());
+    // The cover nests in the notch's bottom-left corner: one gap to the wall
+    // (the shoulder's end), the top and the bottom, whole pixels
+    let gap = (crate::config::BASE_COLLAPSED_ARTWORK_GAP * scale).round();
+    let art = (h - 2.0 * gap).max(1.0);
+    let (art_left, art_top) = ((r_top + gap).round(), gap);
     CollapsedLayout {
         content_bounds,
         clock_bounds,
@@ -3472,6 +3809,90 @@ mod tests {
             // The overshoot past fully out still fits its window
             let over = timer_bubble_geometry(dpi, 1.05);
             assert!(over.center.0 + over.radius <= over.window.0 as f32, "{dpi}");
+        }
+    }
+    #[test]
+    fn test_convert_workspace_fits_and_every_control_is_hit_at_every_dpi() {
+        use crate::layout::ConvertHit as H;
+        for dpi in ALL_DPIS {
+            let d = space_dimensions(NotchState::Expanded, dpi, OecaSpace::Convert);
+            let panel = space_dimensions(NotchState::Expanded, dpi, OecaSpace::Clipboard);
+            assert!(d.width < panel.width, "narrower than the panel at {dpi}");
+            let l = resolve_convert_layout(&d).unwrap();
+            let body = RectF::new(
+                0.0,
+                0.0,
+                d.width as f32,
+                d.height as f32 - d.shadow_margin_bottom,
+            );
+            let mut all = vec![
+                l.select, l.close, l.folder, l.primary, l.chips[0], l.chips[1], l.keep, l.discard,
+            ];
+            all.extend(l.rows);
+            all.extend(l.pills);
+            for r in &all {
+                assert!(
+                    r.left >= body.left && r.right <= body.right,
+                    "{r:?} inside at {dpi}"
+                );
+                assert!(
+                    r.top >= 0.0 && r.bottom <= body.bottom,
+                    "{r:?} above the bottom at {dpi}"
+                );
+            }
+            for w in l.rows.windows(2) {
+                assert!(w[0].bottom <= w[1].top, "rows do not overlap at {dpi}");
+            }
+            assert!(
+                l.rows[2].bottom < l.primary.top,
+                "bar under the rows at {dpi}"
+            );
+            assert!(
+                l.pills[4].right <= l.primary.left,
+                "pills left of the primary at {dpi}"
+            );
+            let c = |r: RectF| ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
+            let live = ConvertLive {
+                rows: 3,
+                save: [true, false, false],
+                show: [false, true, false],
+                formats: 4,
+                chips: 2,
+                confirming: false,
+            };
+            let hit = |r: RectF| {
+                let (x, y) = c(r);
+                l.hit(x, y, &live)
+            };
+            let h = |x| Some(PanelHit::Convert(x));
+            assert_eq!(hit(l.close), h(H::Close));
+            assert_eq!(hit(l.folder), h(H::Folder));
+            assert_eq!(hit(l.primary), h(H::Primary));
+            assert_eq!(hit(l.chips[1]), h(H::Chip(1)));
+            assert_eq!(hit(l.select), h(H::SelectAll));
+            assert_eq!(hit(l.pills[3]), h(H::Format(3)));
+            assert_eq!(hit(l.pills[4]), None, "only offered formats are live");
+            assert_eq!(hit(l.row_parts(0).action), h(H::Save(0)));
+            assert_eq!(hit(l.row_parts(1).action), h(H::Show(1)));
+            assert_eq!(
+                hit(l.row_parts(2).action),
+                h(H::Row(2)),
+                "no button, no hit"
+            );
+            assert_eq!(hit(l.row_parts(1).remove), h(H::Remove(1)));
+            assert_eq!(hit(l.row_parts(2).name), h(H::Row(2)));
+            // The discard question: only its buttons (and the X) are live
+            let ask = ConvertLive {
+                confirming: true,
+                ..live
+            };
+            let (x, y) = c(l.keep);
+            assert_eq!(l.hit(x, y, &ask), h(H::Keep));
+            let (x, y) = c(l.rows[0]);
+            assert_eq!(l.hit(x, y, &ask), None);
+            // Text of a row never reaches under its buttons
+            let p = l.row_parts(0);
+            assert!(p.name.right <= p.action.left && p.action.right <= p.remove.left);
         }
     }
 }

@@ -4,6 +4,8 @@ mod clipboard;
 mod clipboard_store;
 mod clock;
 mod config;
+mod convert;
+mod convert_batch;
 mod dragdrop;
 mod hud;
 mod layout;

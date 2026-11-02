@@ -365,10 +365,13 @@ pub struct VizGradient {
 
 /// A second colour joins the gradient only with at least this share of the
 /// dominant one, and only this many hue bins (10 degrees each) apart: far
-/// enough to read as two colours, not so far (near-complementary) that the
-/// blend between them would pass through a muddy middle.
+/// enough to read as two colours, yet close enough (analogous, up to 90
+/// degrees) that the blend between them stays among hues the artwork has.
+/// Farther apart, the short way round the hue wheel runs through colours
+/// that are nowhere in the cover (orange and blue blend through pink and
+/// purple), so the dominant colour alone makes the gradient.
 const GRADIENT_SECOND_SHARE: f32 = 0.25;
-const GRADIENT_HUE_BINS: (usize, usize) = (3, 15);
+const GRADIENT_HUE_BINS: (usize, usize) = (3, 9);
 
 /// Samples darker than this (HSV value) are shadows, without usable colour.
 const PALETTE_MIN_VALUE: f32 = 0.2;
@@ -654,7 +657,7 @@ pub fn format_clock(ms: i64, negative: bool, out: &mut [u16; 12]) -> usize {
 
 // ---- Visualizer --------------------------------------------------------------
 
-pub const VISUALIZER_BARS: usize = 4;
+pub const VISUALIZER_BARS: usize = 5;
 
 /// Bars are shown only while the session is actually playing.
 pub fn shows_visualizer(playback: PlaybackState) -> bool {
@@ -712,6 +715,7 @@ impl Visualizer {
             [(1.57, 2.3), (3.19, 0.4)],
             [(0.97, 4.1), (2.39, 2.8)],
             [(1.41, 1.2), (2.93, 5.0)],
+            [(1.23, 3.3), (2.61, 0.7)],
         ];
         let eased = self.level * self.level * (3.0 - 2.0 * self.level);
         WAVES.map(|[(f1, p1), (f2, p2)]| {
@@ -944,6 +948,9 @@ pub struct ControlFeedback {
     clip_pressed: Option<PanelHit>,
     /// Row under the pointer: its `Row(i)` hover level fades its buttons in.
     clip_row: Option<usize>,
+    /// Controls held "on" (a ticked row, the chosen format): their hover level
+    /// eases to full and stays, whether or not the pointer is over them.
+    clip_held: Vec<PanelHit>,
     clip: Vec<(PanelHit, f32, f32)>,
 }
 
@@ -959,6 +966,7 @@ impl Default for ControlFeedback {
             clip_hovered: None,
             clip_pressed: None,
             clip_row: None,
+            clip_held: Vec::new(),
             clip: Vec::new(),
         }
     }
@@ -1039,13 +1047,21 @@ impl ControlFeedback {
         std::mem::replace(&mut self.clip_row, row) != row
     }
 
-    /// Everything currently targeted: hovered button, pressed button, hovered row.
-    fn clip_targeted(&self) -> [Option<PanelHit>; 3] {
-        [
+    /// Controls held on; true if the set changed.
+    pub fn set_clip_held(&mut self, held: Vec<PanelHit>) -> bool {
+        std::mem::replace(&mut self.clip_held, held) != self.clip_held
+    }
+
+    /// Everything currently targeted: hovered button, pressed button, hovered
+    /// row, and the controls held on.
+    fn clip_targeted(&self) -> Vec<Option<PanelHit>> {
+        let mut all = vec![
             self.clip_hovered,
             self.clip_pressed,
             self.clip_row.map(PanelHit::Row),
-        ]
+        ];
+        all.extend(self.clip_held.iter().copied().map(Some));
+        all
     }
 
     /// Mouse-down on a clipboard icon button.
@@ -1070,7 +1086,8 @@ impl ControlFeedback {
         (
             f32::from(u8::from(
                 self.clip_hovered == Some(button)
-                    || self.clip_row.map(PanelHit::Row) == Some(button),
+                    || self.clip_row.map(PanelHit::Row) == Some(button)
+                    || self.clip_held.contains(&button),
             )),
             f32::from(u8::from(self.clip_pressed == Some(button))),
         )
@@ -1118,7 +1135,7 @@ impl ControlFeedback {
         }
         self.track_fade = approach(self.track_fade, 1.0, MEDIA_TRACK_FADE_MS);
         let targeted = self.clip_targeted();
-        for b in targeted.into_iter().flatten() {
+        for b in targeted.iter().flatten().copied() {
             if !self.clip.iter().any(|e| e.0 == b) {
                 self.clip.push((b, 0.0, 0.0));
             }
@@ -1140,7 +1157,9 @@ impl ControlFeedback {
 
     /// Clears everything immediately (media hidden, notch toggling).
     pub fn reset(&mut self) {
+        let held = std::mem::take(&mut self.clip_held);
         *self = Self::default();
+        self.clip_held = held;
     }
 
     /// Reduced motion: hover levels (control brightening, a clipboard tile's
@@ -1150,7 +1169,7 @@ impl ControlFeedback {
             self.hover[i] = self.targets(i).0;
         }
         let targeted = self.clip_targeted();
-        for b in targeted.into_iter().flatten() {
+        for b in targeted.iter().flatten().copied() {
             if !self.clip.iter().any(|e| e.0 == b) {
                 self.clip.push((b, 0.0, 0.0));
             }
@@ -3331,6 +3350,38 @@ mod tests {
         });
         let g = visualizer_gradient(&minor).unwrap();
         assert!(hue_near(hsv_of(g.top).0, hsv_of(g.bottom).0, 0.03), "{g:?}");
+    }
+
+    #[test]
+    fn test_gradient_never_runs_through_hues_the_cover_lacks() {
+        // Mostly red-orange with a patch of blue (a fiery cover under a
+        // cool sky): the blend of the two would run through pink and
+        // purple, which the cover has none of: the red-orange alone
+        let art = cover_of(120, 120, |_, y| {
+            if y < 96 {
+                ([235, 90, 30], 255)
+            } else {
+                ([60, 80, 150], 255)
+            }
+        });
+        let g = visualizer_gradient(&art).unwrap();
+        for c in [g.top, g.bottom] {
+            let (h, _, _) = hsv_of(c);
+            assert!(hue_near(h, 0.06, 0.05), "orange, not pink or purple: {c:?}");
+        }
+        // Analogous colours (up to 90 degrees apart) still blend
+        let near = cover_of(64, 64, |x, _| {
+            if x < 36 {
+                ([225, 40, 50], 255)
+            } else {
+                ([245, 200, 40], 255)
+            }
+        });
+        let g = visualizer_gradient(&near).unwrap();
+        assert!(
+            !hue_near(hsv_of(g.top).0, hsv_of(g.bottom).0, 0.03),
+            "{g:?}"
+        );
     }
 
     #[test]

@@ -42,7 +42,7 @@ use crate::config::{
     AccentChoice, BASE_SETTINGS_CHEVRON_SIZE, BASE_SETTINGS_TOGGLE_KNOB_INSET, rgb_color,
 };
 use crate::config::{
-    BASE_DROP_ICON_SIZE, BASE_DROP_MESSAGE_GAP, BASE_DROP_MESSAGE_LINE, BASE_DROP_OUTLINE_INSET,
+    BASE_DROP_MESSAGE_GAP, BASE_DROP_MESSAGE_LINE, BASE_DROP_OUTLINE_INSET,
     BASE_DROP_OUTLINE_RADIUS, BASE_DROP_OUTLINE_WIDTH, BASE_DROP_RESULT_ICON_SIZE, COLOR_DROP_ICON,
     COLOR_DROP_OUTLINE, DROP_OUTLINE_DASHES,
 };
@@ -201,6 +201,11 @@ pub struct Renderer {
     /// last drop's outcome (kept while its result fades out).
     drop: Cell<crate::dragdrop::DropPage>,
     drop_outcome: Cell<crate::dragdrop::DropOutcome>,
+    /// The half of the two-zone drop page the pointer is over.
+    drop_zone: Cell<crate::dragdrop::DropZone>,
+    /// The conversion workspace (Some while a batch is open): a snapshot of
+    /// the batch, set by the window on every change.
+    convert: RefCell<Option<crate::convert_batch::View>>,
     /// The running animation's content blend and opacity (None when settled).
     transition: Cell<Option<Transition>>,
     /// Settings page open / settings values (mirror `WindowState`, which sets
@@ -620,7 +625,7 @@ struct VizBlend {
 const VIZ_BLEND_MS: f32 = 450.0;
 /// The bar group's silhouette: each bar's share of the full height, so the
 /// group reads as a balanced little waveform (tallest just left of centre).
-const VIZ_ENVELOPE: [f32; 4] = [0.72, 1.0, 0.88, 0.64];
+const VIZ_ENVELOPE: [f32; 5] = [0.66, 0.92, 1.0, 0.84, 0.6];
 /// How much darker each bar is at its very ends than at its middle (easing
 /// in from the middle, so the middle reads brightest and richest).
 const VIZ_END_DARKEN: f32 = 0.26;
@@ -859,7 +864,16 @@ struct MediaFormats {
 }
 
 /// The drop page's hint for files that are not images Oeca can add.
-const DROP_UNSUPPORTED_LABEL: &str = "Only images can be added";
+const DROP_UNSUPPORTED_LABEL: &str = "Drop images or audio files";
+
+/// Under the discard question.
+const CONVERT_DISCARD_NOTE: &str = "Converted files that aren't saved are lost";
+
+/// The drop page's labels: the clipboard half, the converter half of the
+/// two-zone page, and the converter-only page.
+const DROP_COPY_LABEL: &str = "Add to clipboard";
+const DROP_CONVERT_ZONE_LABEL: &str = "Convert";
+const DROP_CONVERT_LABEL: &str = "Drop to convert";
 
 /// Music space empty state (no media session): a quiet label, never metadata.
 const MUSIC_EMPTY_LABEL: &str = "Nothing playing";
@@ -1821,7 +1835,12 @@ impl Renderer {
     /// opacity.
     fn scene_view(&self) -> Transition {
         self.transition.get().unwrap_or_else(|| {
-            let scene = Scene::current(self.drop.get(), self.settings_open.get(), self.space.get());
+            let scene = Scene::current(
+                self.drop.get(),
+                self.convert_open(),
+                self.settings_open.get(),
+                self.space.get(),
+            );
             Transition {
                 from: scene,
                 to: scene,
@@ -1844,6 +1863,51 @@ impl Renderer {
     /// Sets what the drop page shows; true if it changed (caller redraws).
     pub fn set_drop(&self, page: crate::dragdrop::DropPage) -> bool {
         self.drop.replace(page) != page
+    }
+
+    /// The conversion workspace has a batch to show.
+    pub fn convert_open(&self) -> bool {
+        self.convert.borrow().is_some()
+    }
+
+    /// Sets (or, with None, closes) the conversion workspace; true if the
+    /// picture changed.
+    pub fn set_convert(&self, view: Option<crate::convert_batch::View>) -> bool {
+        let mut slot = self.convert.borrow_mut();
+        if *slot == view {
+            return false;
+        }
+        *slot = view;
+        true
+    }
+
+    /// What the workspace's controls are right now (for hit-testing).
+    pub fn convert_live(&self) -> crate::layout::ConvertLive {
+        let view = self.convert.borrow();
+        let Some(v) = view.as_ref() else {
+            return Default::default();
+        };
+        let mut live = crate::layout::ConvertLive {
+            rows: v.rows.len(),
+            formats: v.formats.len().min(5),
+            chips: v.chips.len().min(2),
+            confirming: v.confirming,
+            ..Default::default()
+        };
+        for (i, r) in v.rows.iter().enumerate() {
+            live.save[i] = r.save;
+            live.show[i] = r.show;
+        }
+        live
+    }
+
+    /// The half of the drop page under the pointer; true if it changed.
+    pub fn set_drop_zone(&self, zone: crate::dragdrop::DropZone) -> bool {
+        self.drop_zone.replace(zone) != zone
+    }
+
+    pub fn drop_zone(&self) -> crate::dragdrop::DropZone {
+        self.drop_zone.get()
     }
 
     /// Shows a drop's outcome (`DropPage::Result`); true if anything changed.
@@ -1977,6 +2041,8 @@ impl Renderer {
             seek_hold: Cell::new(None),
             drop: Cell::new(crate::dragdrop::DropPage::Off),
             drop_outcome: Cell::new(crate::dragdrop::DropOutcome::Copied),
+            drop_zone: Cell::new(crate::dragdrop::DropZone::Copy),
+            convert: RefCell::new(None),
             transition: Cell::new(None),
             settings_open: Cell::new(false),
             settings: Cell::new(OecaSettings::default()),
@@ -2797,14 +2863,24 @@ impl Renderer {
         dimensions: &NotchDimensions,
         formatted_time: &str,
     ) -> Result<()> {
-        let clip_rect = layout.content_bounds.to_d2d_rect();
+        // The content area, and the cover's corner nest just outside it
+        let content = layout.content_bounds;
+        let clip_rect = RectF::new(
+            content.left.min(layout.artwork_bounds.left),
+            content.top,
+            content.right,
+            content.bottom,
+        )
+        .to_d2d_rect();
         unsafe {
             rt.PushAxisAlignedClip(&clip_rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         }
-        // The volume HUD takes the row's place while it shows
-        let hud = self.hud.get().presence;
-        if hud < 1.0 {
-            self.with_layer(rt, None, 1.0 - hud, || {
+        // The volume HUD takes the row's place while it shows; lifted above
+        // other windows the row stays away altogether
+        let hud = self.hud.get();
+        let (hud, row_alpha) = (hud.presence, (1.0 - hud.presence) * (1.0 - hud.base_hold));
+        if row_alpha > 0.0 {
+            self.with_layer(rt, None, row_alpha, || {
                 self.draw_collapsed_items(rt, layout, dimensions, formatted_time)
             })?;
         }
@@ -3390,7 +3466,7 @@ impl Renderer {
         let segments = match space {
             OecaSpace::Home => HOUSE_BLANK,
             OecaSpace::Music => MUSIC_ALT,
-            OecaSpace::Clipboard => CLIPBOARD,
+            OecaSpace::Clipboard | OecaSpace::Convert => CLIPBOARD,
         };
         self.draw_glyph(rt, segments, cx, cy, u, brush)
     }
@@ -3440,6 +3516,7 @@ impl Renderer {
     /// notch) and clipped to the current silhouette, so while the notch opens
     /// or resizes it is revealed in place: the dashes never re-flow or crawl.
     fn draw_drop_page(&self, rt: &ID2D1RenderTarget, dimensions: &NotchDimensions) -> Result<()> {
+        use crate::dragdrop::{DropPage, DropZone};
         let target = drop_page_dimensions(dimensions.dpi);
         let px = |v: f32| (v * target.scale).round();
         let wall = target.shadow_margin_x + target.curvature.top_transition_radius;
@@ -3458,36 +3535,465 @@ impl Renderer {
         if outline.width() <= 0.0 || outline.height() <= 0.0 {
             return Ok(());
         }
-        let profile = CornerProfile::new(
-            px(BASE_DROP_OUTLINE_RADIUS),
-            1.0,
-            outline.width().min(outline.height()) / 2.0,
-        );
-        let path = self.smooth_rect_path(outline, profile.span, profile.handle)?;
+        let page = self.drop.get();
+        let unsupported = page == DropPage::Unsupported;
+        // Images: two zones (clipboard | convert); anything else: one
+        let zones: Vec<(RectF, bool)> = if page == DropPage::Ready {
+            let gap = px(8.0);
+            let mid = (outline.left + outline.right) / 2.0;
+            let active = self.drop_zone.get();
+            vec![
+                (
+                    RectF::new(outline.left, outline.top, mid - gap / 2.0, outline.bottom),
+                    active == DropZone::Copy,
+                ),
+                (
+                    RectF::new(mid + gap / 2.0, outline.top, outline.right, outline.bottom),
+                    active == DropZone::Convert,
+                ),
+            ]
+        } else {
+            vec![(outline, true)]
+        };
         let silhouette = self.create_notch_geometry(dimensions)?;
-        let unsupported = self.drop.get() == crate::dragdrop::DropPage::Unsupported;
         self.with_layer(rt, Some(&silhouette), 1.0, || unsafe {
             let dashes = rt.CreateSolidColorBrush(&COLOR_DROP_OUTLINE, None)?;
-            rt.DrawGeometry(&path, &dashes, width, &self.drop_stroke);
-            let (cx, cy) = (
-                (outline.left + outline.right) / 2.0,
-                (outline.top + outline.bottom) / 2.0,
-            );
-            if !unsupported {
-                let icon = rt.CreateSolidColorBrush(&COLOR_DROP_ICON, None)?;
-                return self.draw_glyph(rt, INBOX, cx, cy, px(BASE_DROP_ICON_SIZE), &icon);
+            let tint = rt.CreateSolidColorBrush(&COLOR_SPACE_PILL_SELECTED, None)?;
+            for (i, &(zone, active)) in zones.iter().enumerate() {
+                let profile = CornerProfile::new(
+                    px(BASE_DROP_OUTLINE_RADIUS),
+                    1.0,
+                    zone.width().min(zone.height()) / 2.0,
+                );
+                let path = self.smooth_rect_path(zone, profile.span, profile.handle)?;
+                // The zone under the pointer is lit; its twin recedes
+                if zones.len() > 1 && active {
+                    tint.SetOpacity(0.7);
+                    rt.FillGeometry(&path, &tint, None);
+                }
+                dashes.SetOpacity(if active { 1.0 } else { 0.45 });
+                rt.DrawGeometry(&path, &dashes, width, &self.drop_stroke);
+                if unsupported {
+                    let icon = rt.CreateSolidColorBrush(&COLOR_TEXT_TERTIARY, None)?;
+                    return self.draw_drop_message(
+                        rt,
+                        &target,
+                        zone,
+                        INBOX,
+                        &icon,
+                        DROP_UNSUPPORTED_LABEL,
+                        &COLOR_TEXT_TERTIARY,
+                    );
+                }
+                if zones.len() == 1 {
+                    // Audio (or a mix): the converter takes it all
+                    let icon = rt.CreateSolidColorBrush(&COLOR_DROP_ICON, None)?;
+                    return self.draw_drop_message(
+                        rt,
+                        &target,
+                        zone,
+                        INBOX,
+                        &icon,
+                        DROP_CONVERT_LABEL,
+                        &COLOR_TEXT_SECONDARY,
+                    );
+                }
+                let (glyph, label) = if i == 0 {
+                    (CLIPBOARD, DROP_COPY_LABEL)
+                } else {
+                    (PICTURE, DROP_CONVERT_ZONE_LABEL)
+                };
+                let icon = rt.CreateSolidColorBrush(
+                    &if active {
+                        COLOR_DROP_ICON
+                    } else {
+                        COLOR_TEXT_TERTIARY
+                    },
+                    None,
+                )?;
+                self.draw_drop_message(
+                    rt,
+                    &target,
+                    zone,
+                    glyph,
+                    &icon,
+                    label,
+                    if active {
+                        &COLOR_TEXT_PRIMARY
+                    } else {
+                        &COLOR_TEXT_TERTIARY
+                    },
+                )?;
             }
-            let icon = rt.CreateSolidColorBrush(&COLOR_TEXT_TERTIARY, None)?;
-            self.draw_drop_message(
-                rt,
-                &target,
-                outline,
-                INBOX,
-                &icon,
-                DROP_UNSUPPORTED_LABEL,
-                &COLOR_TEXT_TERTIARY,
-            )
+            Ok(())
         })
+    }
+
+    /// The conversion workspace at its settled layout, centred in the window:
+    /// the toolbar in the header band, the file rows (or the discard question),
+    /// and the action bar. Every control lifts with the shared hover / press
+    /// levels (`PanelHit::Convert`); ticks and the chosen format animate through
+    /// the feedback keys `Check` / `Chosen`.
+    fn draw_convert(&self, rt: &ID2D1RenderTarget, dims: &NotchDimensions) -> Result<()> {
+        use crate::convert_batch::{Primary, RowKind};
+        use crate::layout::ConvertHit as H;
+        let view = self.convert.borrow();
+        let Some(v) = view.as_ref() else {
+            return Ok(());
+        };
+        let settled = space_dimensions(
+            crate::config::NotchState::Expanded,
+            dims.dpi,
+            OecaSpace::Convert,
+        );
+        let Some(l) = crate::layout::resolve_convert_layout(&settled) else {
+            return Ok(());
+        };
+        let dx = ((dims.width - settled.width) as f32 / 2.0).round();
+        if dx != 0.0 {
+            self.set_offset(rt, dx);
+        }
+        let formats = self.media_formats(&settled)?;
+        let px = |x: f32| (x * settled.scale).round();
+        let level = |h: H| self.feedback.borrow().clip_levels(PanelHit::Convert(h));
+        let lift = |h: H| {
+            let (hover, press) = level(h);
+            (hover + press).min(1.0)
+        };
+        let utf16 = |s: &str| -> Vec<u16> { s.encode_utf16().collect() };
+        let rounded = |r: RectF, radius: f32| D2D1_ROUNDED_RECT {
+            rect: r.to_d2d_rect(),
+            radiusX: radius,
+            radiusY: radius,
+        };
+        let line_w = px(crate::config::BASE_CLIPBOARD_ROW_OUTLINE).max(1.0);
+        let inner = |r: RectF| {
+            let h = line_w / 2.0;
+            RectF::new(r.left + h, r.top + h, r.right - h, r.bottom - h)
+        };
+        let result = unsafe {
+            let outline = rt.CreateSolidColorBrush(&COLOR_CLIPBOARD_ROW, None)?;
+            let primary = rt.CreateSolidColorBrush(&COLOR_TEXT_PRIMARY, None)?;
+            let secondary = rt.CreateSolidColorBrush(&COLOR_TEXT_SECONDARY, None)?;
+            let tertiary = rt.CreateSolidColorBrush(&COLOR_TEXT_TERTIARY, None)?;
+            let fill = rt.CreateSolidColorBrush(&COLOR_SPACE_PILL_SELECTED, None)?;
+            let track = rt.CreateSolidColorBrush(&COLOR_MEDIA_TRACK_UNPLAYED, None)?;
+            let text =
+                |s: &[u16],
+                 f: &IDWriteTextFormat,
+                 r: RectF,
+                 b: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush| {
+                    rt.DrawText(
+                        s,
+                        f,
+                        &r.to_d2d_rect(),
+                        b,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    )
+                };
+            // An outlined pill (lifted by hover / press); `filled`: solid
+            let pill = |r: RectF, filled: f32, lift: f32| {
+                let radius = r.height() / 2.0;
+                let f = filled.max(0.55 * lift);
+                if f > 0.0 {
+                    fill.SetOpacity(f);
+                    rt.FillRoundedRectangle(&rounded(r, radius), &fill);
+                }
+                if filled < 1.0 {
+                    outline.SetOpacity(1.0 - 0.8 * filled);
+                    let i = inner(r);
+                    rt.DrawRoundedRectangle(&rounded(i, i.height() / 2.0), &outline, line_w, None);
+                    outline.SetOpacity(1.0);
+                }
+            };
+            let center = |r: RectF| ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
+
+            // -- Toolbar --
+            let (ccx, ccy) = center(l.check);
+            let box_r = l.check;
+            let any = v.selected > 0;
+            let tick = if v.all_selected { 1.0 } else { 0.0 };
+            let box_alpha = if v.any_selectable || v.all_selected {
+                1.0
+            } else {
+                0.4
+            };
+            outline.SetOpacity(box_alpha);
+            let ib = inner(box_r);
+            rt.DrawRoundedRectangle(&rounded(ib, px(4.5)), &outline, line_w, None);
+            outline.SetOpacity(1.0);
+            if tick > 0.0 {
+                fill.SetOpacity(1.0);
+                rt.FillRoundedRectangle(&rounded(box_r, px(4.5)), &fill);
+                self.draw_glyph(rt, CHECK, ccx, ccy, px(11.0), &primary)?;
+            } else if any {
+                // Some selected: a dash
+                let dash = RectF::new(ccx - px(3.5), ccy - line_w, ccx + px(3.5), ccy + line_w);
+                secondary.SetOpacity(1.0);
+                rt.FillRoundedRectangle(&rounded(dash, line_w), &secondary);
+            }
+            let hover_all = lift(H::SelectAll);
+            let label_brush = if hover_all > 0.2 {
+                &primary
+            } else {
+                &secondary
+            };
+            text(
+                &utf16(&v.count_label),
+                &formats.source,
+                l.count,
+                label_brush,
+            );
+            // Option chips (quality, background), folder, close
+            for (i, chip) in v.chips.iter().enumerate().take(2) {
+                let r = l.chips[i];
+                let rr = RectF::new(r.left, r.top + px(1.0), r.right, r.bottom - px(1.0));
+                pill(rr, 0.0, lift(H::Chip(i)));
+                text(&utf16(chip), &formats.empty, rr, &secondary);
+            }
+            let fl = lift(H::Folder);
+            let (fx, fy) = center(l.folder);
+            self.draw_glyph(rt, FOLDER, fx, fy, px(14.0) * (1.0 + 0.16 * fl), &secondary)?;
+            let cl = lift(H::Close);
+            let (xx, xy) = center(l.close);
+            self.draw_cross(rt, xx, xy, px(9.0) * (1.0 + 0.16 * cl), &secondary)?;
+
+            // -- Rows, or the discard question --
+            if v.confirming {
+                text(
+                    &utf16(&v.confirm_message),
+                    &formats.empty,
+                    l.confirm_message,
+                    &primary,
+                );
+                text(
+                    &utf16(CONVERT_DISCARD_NOTE),
+                    &formats.empty,
+                    l.confirm_note,
+                    &tertiary,
+                );
+                for (r, label, hit, filled) in [
+                    (l.keep, "Keep", H::Keep, true),
+                    (l.discard, "Discard", H::Discard, false),
+                ] {
+                    pill(r, if filled { 1.0 } else { 0.0 }, lift(hit));
+                    text(&utf16(label), &formats.empty, r, &primary);
+                }
+            } else if v.rows.is_empty() {
+                let (ex, ey) = center(l.rows[0]);
+                self.draw_glyph(rt, INBOX, ex, ey + px(4.0), px(22.0), &tertiary)?;
+                text(
+                    &utf16("Drop files to convert"),
+                    &formats.empty,
+                    RectF::new(
+                        l.rows[1].left,
+                        l.rows[1].top + px(8.0),
+                        l.rows[1].right,
+                        l.rows[1].bottom + px(8.0),
+                    ),
+                    &tertiary,
+                );
+            }
+            for (i, row) in v
+                .rows
+                .iter()
+                .enumerate()
+                .take(if v.confirming { 0 } else { 3 })
+            {
+                let fade = 1.0 - level(H::Gone(i)).0;
+                let draw_row = || -> Result<()> {
+                    let p = l.row_parts(i);
+                    let (check_level, _) = level(H::Check(i));
+                    let (hover, press) = level(H::Row(i));
+                    // Row surface: ticked rows fill in, hover adds a touch
+                    let body = rounded(inner(p.row), px(10.0));
+                    let lit = (0.34 * check_level + 0.26 * hover + 0.2 * press).min(0.7);
+                    if lit > 0.0 {
+                        fill.SetOpacity(lit);
+                        rt.FillRoundedRectangle(&rounded(p.row, px(10.0)), &fill);
+                    }
+                    outline.SetOpacity(0.55 + 0.45 * check_level);
+                    rt.DrawRoundedRectangle(&body, &outline, line_w, None);
+                    outline.SetOpacity(1.0);
+                    // Check box, or the outcome's glyph
+                    let (bx, by) = center(p.check);
+                    match row.kind {
+                        RowKind::Done | RowKind::Saved => {
+                            self.draw_glyph(rt, DONE, bx, by, px(15.0), &primary)?;
+                        }
+                        RowKind::Failed => {
+                            self.draw_glyph(rt, ALERT, bx, by, px(15.0), &tertiary)?;
+                        }
+                        RowKind::Busy => {
+                            self.draw_glyph(rt, UPDATE_ARROW, bx, by, px(12.0), &secondary)?;
+                        }
+                        RowKind::Normal => {
+                            let ib = inner(p.check);
+                            outline.SetOpacity(if row.selectable { 1.0 } else { 0.4 });
+                            rt.DrawRoundedRectangle(&rounded(ib, px(4.5)), &outline, line_w, None);
+                            outline.SetOpacity(1.0);
+                            if check_level > 0.0 {
+                                fill.SetOpacity(check_level);
+                                rt.FillRoundedRectangle(&rounded(p.check, px(4.5)), &fill);
+                                primary.SetOpacity(check_level);
+                                self.draw_glyph(rt, CHECK, bx, by, px(11.0), &primary)?;
+                                primary.SetOpacity(1.0);
+                            }
+                        }
+                    }
+                    // File glyph, name, detail
+                    let (ix, iy) = center(p.icon);
+                    let glyph = if row.family == Some(crate::convert::Family::Audio) {
+                        MUSIC_ALT
+                    } else {
+                        PICTURE
+                    };
+                    let dim = row.kind == RowKind::Failed;
+                    // The glyph sits on a soft tile: a file's type reads at a glance
+                    let tile = px(24.0);
+                    let tile_rect = RectF::new(
+                        ix - tile / 2.0,
+                        iy - tile / 2.0,
+                        ix + tile / 2.0,
+                        iy + tile / 2.0,
+                    );
+                    fill.SetOpacity(if dim { 0.18 } else { 0.32 });
+                    rt.FillRoundedRectangle(&rounded(tile_rect, px(7.0)), &fill);
+                    self.draw_glyph(
+                        rt,
+                        glyph,
+                        ix,
+                        iy,
+                        px(14.0),
+                        if dim { &tertiary } else { &primary },
+                    )?;
+                    text(
+                        &utf16(&row.name),
+                        &formats.artist,
+                        p.name,
+                        if dim { &secondary } else { &primary },
+                    );
+                    text(&utf16(&row.detail), &formats.source, p.detail, &tertiary);
+                    if let Some(progress) = row.progress {
+                        rt.FillRoundedRectangle(
+                            &rounded(p.progress, p.progress.height() / 2.0),
+                            &track,
+                        );
+                        let mut done = p.progress;
+                        done.right = done.left + done.width() * progress.clamp(0.0, 1.0);
+                        if done.width() > 0.0 {
+                            rt.FillRoundedRectangle(&rounded(done, done.height() / 2.0), &primary);
+                        }
+                    }
+                    // Trailing: Save or Show, then remove
+                    if row.save {
+                        let sl = lift(H::Save(i));
+                        pill(p.action, 0.0, sl);
+                        text(&utf16("Save"), &formats.empty, p.action, &primary);
+                    } else if row.show {
+                        let (sx, sy) = center(p.action);
+                        let sl = lift(H::Show(i));
+                        self.draw_glyph(
+                            rt,
+                            FOLDER,
+                            sx + p.action.width() / 2.0 - px(11.0),
+                            sy,
+                            px(14.0) * (1.0 + 0.16 * sl),
+                            &secondary,
+                        )?;
+                    }
+                    let rl = lift(H::Remove(i));
+                    if hover > 0.0 || press > 0.0 || rl > 0.0 {
+                        let (rx, ry) = center(p.remove);
+                        tertiary.SetOpacity((0.45 + 0.55 * rl).min(1.0) * hover.max(rl));
+                        self.draw_cross(rt, rx, ry, px(8.0) * (1.0 + 0.2 * rl), &tertiary)?;
+                        tertiary.SetOpacity(1.0);
+                    }
+                    Ok(())
+                };
+                if fade < 1.0 {
+                    self.with_layer(rt, None, fade, draw_row)?;
+                } else {
+                    draw_row()?;
+                }
+            }
+            if !v.confirming && v.total > crate::convert_batch::VISIBLE_ROWS {
+                // A thin scroll bar at the rows' right edge
+                let area = RectF::new(
+                    l.rows[0].right - px(3.0),
+                    l.rows[0].top + px(6.0),
+                    l.rows[0].right - px(1.0),
+                    l.rows[2].bottom - px(6.0),
+                );
+                let share = crate::convert_batch::VISIBLE_ROWS as f32 / v.total as f32;
+                let h = (area.height() * share).max(px(10.0));
+                let top = area.top
+                    + (area.height() - h) * v.scroll as f32
+                        / (v.total - crate::convert_batch::VISIBLE_ROWS) as f32;
+                track.SetOpacity(0.5);
+                rt.FillRoundedRectangle(&rounded(area, px(1.0)), &track);
+                track.SetOpacity(1.0);
+                secondary.SetOpacity(0.7);
+                rt.FillRoundedRectangle(
+                    &rounded(RectF::new(area.left, top, area.right, top + h), px(1.0)),
+                    &secondary,
+                );
+                secondary.SetOpacity(1.0);
+            }
+
+            // -- Action bar (dimmed while the discard question is open) --
+            let bar = || -> Result<()> {
+                if let (true, Some(hint)) = (v.formats.is_empty(), v.hint) {
+                    text(&utf16(hint), &formats.source, l.pills_area, &tertiary);
+                }
+                for (i, f) in v.formats.iter().enumerate().take(5) {
+                    let r = l.pills[i];
+                    let (chosen, _) = level(H::Chosen(i));
+                    pill(r, chosen, lift(H::Format(i)));
+                    text(
+                        &utf16(f.label()),
+                        &formats.empty,
+                        r,
+                        if v.target == Some(*f) {
+                            &primary
+                        } else {
+                            &secondary
+                        },
+                    );
+                }
+                let pl = lift(H::Primary);
+                let solid = v.primary != Primary::Cancel && v.primary != Primary::Done;
+                if solid {
+                    // Light fill, dark label: the single call to action
+                    let radius = l.primary.height() / 2.0;
+                    primary.SetOpacity(0.9 + 0.1 * pl);
+                    rt.FillRoundedRectangle(&rounded(l.primary, radius), &primary);
+                    primary.SetOpacity(1.0);
+                    let ink = rt.CreateSolidColorBrush(&NOTCH_BG_COLOR, None)?;
+                    text(&utf16(&v.primary_label), &formats.empty, l.primary, &ink);
+                } else {
+                    pill(l.primary, 0.0, pl);
+                    text(
+                        &utf16(&v.primary_label),
+                        &formats.empty,
+                        l.primary,
+                        &primary,
+                    );
+                }
+                Ok(())
+            };
+            if v.confirming {
+                self.with_layer(rt, None, 0.35, bar)?;
+            } else {
+                bar()?;
+            }
+            Ok(())
+        };
+        if dx != 0.0 {
+            self.set_offset(rt, 0.0);
+        }
+        result
     }
 
     /// A drop's result, on the drop page's surface: a check and "Item copied
@@ -3667,7 +4173,8 @@ impl Renderer {
                     0.0
                 }
             };
-            let selector_alpha = 1.0 - weight(Scene::Drop) - weight(Scene::Dropped);
+            let selector_alpha =
+                1.0 - weight(Scene::Drop) - weight(Scene::Dropped) - weight(Scene::Convert);
             if selector_alpha > 0.0 {
                 let mix = if blending { t.mix } else { 1.0 };
                 self.draw_selector_blended(rt, dims, t.from, t.to, mix, selector_alpha)?;
@@ -3709,6 +4216,7 @@ impl Renderer {
         let (space, settings) = match scene {
             Scene::Drop => return self.draw_drop_page(rt, dims),
             Scene::Dropped => return self.draw_drop_result(rt, dims),
+            Scene::Convert => return self.draw_convert(rt, dims),
             Scene::Settings => (PANEL_SPACE, true),
             Scene::Space(space) => (space, false),
         };
@@ -6874,6 +7382,71 @@ const ALERT: &[IconSeg] = &[
     IconSeg::C(0.0433, 0.3235, 0.0784, 0.2884, 0.0784, 0.2451),
     IconSeg::Z,
 ];
+/// Picture: a rounded frame with a sun and a ridge; an image file in the conversion workspace.
+const PICTURE: &[IconSeg] = &[
+    IconSeg::M(-0.3043, -0.4348),
+    IconSeg::L(0.3043, -0.4348),
+    IconSeg::C(0.4124, -0.4348, 0.5000, -0.3472, 0.5000, -0.2391),
+    IconSeg::L(0.5000, 0.2391),
+    IconSeg::C(0.5000, 0.3472, 0.4124, 0.4348, 0.3043, 0.4348),
+    IconSeg::L(-0.3043, 0.4348),
+    IconSeg::C(-0.4124, 0.4348, -0.5000, 0.3472, -0.5000, 0.2391),
+    IconSeg::L(-0.5000, -0.2391),
+    IconSeg::C(-0.5000, -0.3472, -0.4124, -0.4348, -0.3043, -0.4348),
+    IconSeg::Z,
+    IconSeg::M(-0.0815, -0.1304),
+    IconSeg::C(-0.0815, -0.1875, -0.1278, -0.2337, -0.1848, -0.2337),
+    IconSeg::C(-0.2418, -0.2337, -0.2880, -0.1875, -0.2880, -0.1304),
+    IconSeg::C(-0.2880, -0.0734, -0.2418, -0.0272, -0.1848, -0.0272),
+    IconSeg::C(-0.1278, -0.0272, -0.0815, -0.0734, -0.0815, -0.1304),
+    IconSeg::Z,
+    IconSeg::M(0.3216, 0.2440),
+    IconSeg::L(0.2175, 0.1179),
+    IconSeg::C(0.1938, 0.0892, 0.1509, 0.0862, 0.1233, 0.1112),
+    IconSeg::L(0.0927, 0.1391),
+    IconSeg::C(0.0712, 0.1586, 0.0382, 0.1578, 0.0177, 0.1373),
+    IconSeg::L(-0.0508, 0.0687),
+    IconSeg::C(-0.0766, 0.0429, -0.1186, 0.0433, -0.1439, 0.0696),
+    IconSeg::L(-0.3095, 0.2416),
+    IconSeg::C(-0.3361, 0.2692, -0.3165, 0.3152, -0.2782, 0.3152),
+    IconSeg::L(0.2881, 0.3152),
+    IconSeg::C(0.3249, 0.3152, 0.3451, 0.2724, 0.3216, 0.2440),
+    IconSeg::Z,
+];
+/// Folder: a rounded folder with a tab; the conversion workspace's output folder.
+const FOLDER: &[IconSeg] = &[
+    IconSeg::M(-0.3696, -0.3859),
+    IconSeg::L(-0.1822, -0.3859),
+    IconSeg::C(-0.1631, -0.3859, -0.1450, -0.3776, -0.1327, -0.3631),
+    IconSeg::L(-0.0413, -0.2565),
+    IconSeg::C(-0.0289, -0.2420, -0.0108, -0.2337, 0.0083, -0.2337),
+    IconSeg::L(0.3696, -0.2337),
+    IconSeg::C(0.4416, -0.2337, 0.5000, -0.1753, 0.5000, -0.1033),
+    IconSeg::L(0.5000, 0.2554),
+    IconSeg::C(0.5000, 0.3275, 0.4416, 0.3859, 0.3696, 0.3859),
+    IconSeg::L(-0.3696, 0.3859),
+    IconSeg::C(-0.4416, 0.3859, -0.5000, 0.3275, -0.5000, 0.2554),
+    IconSeg::L(-0.5000, -0.2554),
+    IconSeg::C(-0.5000, -0.3275, -0.4416, -0.3859, -0.3696, -0.3859),
+    IconSeg::Z,
+];
+/// Check: a rounded check mark; a ticked box in the conversion workspace.
+const CHECK: &[IconSeg] = &[
+    IconSeg::M(-0.3277, -0.0179),
+    IconSeg::L(-0.1875, 0.1223),
+    IconSeg::C(-0.1679, 0.1418, -0.1359, 0.1408, -0.1176, 0.1200),
+    IconSeg::L(0.3218, -0.3792),
+    IconSeg::C(0.3560, -0.4182, 0.4154, -0.4220, 0.4544, -0.3877),
+    IconSeg::L(0.4573, -0.3852),
+    IconSeg::C(0.4962, -0.3509, 0.5000, -0.2915, 0.4657, -0.2525),
+    IconSeg::L(-0.1087, 0.4002),
+    IconSeg::C(-0.1270, 0.4210, -0.1590, 0.4220, -0.1786, 0.4024),
+    IconSeg::L(-0.4633, 0.1177),
+    IconSeg::C(-0.5000, 0.0810, -0.5000, 0.0215, -0.4633, -0.0152),
+    IconSeg::L(-0.4606, -0.0179),
+    IconSeg::C(-0.4239, -0.0546, -0.3644, -0.0546, -0.3277, -0.0179),
+    IconSeg::Z,
+];
 
 #[cfg(test)]
 mod tests {
@@ -8060,7 +8633,7 @@ mod tests {
         let dims = NotchDimensions::from_state_and_dpi(NotchState::Collapsed, 96);
         assert_eq!(dims.width, 220);
         assert_eq!(dims.height, 32);
-        assert_eq!(dims.curvature.bottom_radius, 14.0);
+        assert_eq!(dims.curvature.bottom_radius, 9.0);
         assert_eq!(dims.curvature.top_transition_radius, 6.0);
         assert_eq!(dims.curvature.top_transition_height, 6.0);
 
@@ -12191,10 +12764,62 @@ mod tests {
     }
 
     #[test]
+    fn test_images_get_two_drop_zones_and_the_one_under_the_pointer_is_lit() {
+        use crate::dragdrop::{DropPage, DropZone};
+        let renderer = Renderer::new().expect("renderer");
+        assert!(renderer.set_drop(DropPage::Ready));
+        for dpi in ALL_DPIS {
+            let dims = drop_page_dimensions(dpi);
+            let (w, body) = (
+                dims.width as f32,
+                dims.height as f32 - dims.shadow_margin_bottom,
+            );
+            let s = dims.scale;
+            let zone_icon = |left: bool| {
+                let cx = if left { w * 0.27 } else { w * 0.73 };
+                RectF::new(
+                    cx - 10.0 * s,
+                    body / 2.0 - 12.0 * s,
+                    cx + 10.0 * s,
+                    body / 2.0 - 2.0 * s,
+                )
+            };
+            let mut lit = [[0u32; 2]; 2];
+            for (i, zone) in [DropZone::Copy, DropZone::Convert].into_iter().enumerate() {
+                renderer.set_drop_zone(zone);
+                let (px, stride) = render_custom_frame(&renderer, &dims, |rt| {
+                    renderer.draw_drop_page(rt, &dims).unwrap()
+                });
+                for (j, left) in [true, false].into_iter().enumerate() {
+                    let r = zone_icon(left);
+                    let mut sum = 0u32;
+                    for y in r.top as usize..r.bottom as usize {
+                        for x in r.left as usize..r.right as usize {
+                            sum += px[y * stride + x] & 0xFF;
+                        }
+                    }
+                    lit[i][j] = sum;
+                }
+                // The centre between the zones stays empty
+                let mid = (w / 2.0) as usize;
+                assert!(
+                    px[(body / 2.0) as usize * stride + mid] & 0xFF < 40,
+                    "gap at {dpi}"
+                );
+            }
+            // Each zone's glyph is brighter when its zone is the active one
+            assert!(lit[0][0] > lit[1][0], "copy zone lit at {dpi}");
+            assert!(lit[1][1] > lit[0][1], "convert zone lit at {dpi}");
+        }
+    }
+
+    #[test]
     fn test_drop_page_icon_and_dashed_outline_replace_content() {
         let renderer = Renderer::new().expect("renderer");
         use crate::dragdrop::DropPage;
-        assert!(renderer.set_drop(DropPage::Ready) && !renderer.set_drop(DropPage::Ready));
+        assert!(
+            renderer.set_drop(DropPage::ReadyConvert) && !renderer.set_drop(DropPage::ReadyConvert)
+        );
         for dpi in ALL_DPIS {
             let dims = drop_page_dimensions(dpi);
             let (px, stride) = render_custom_frame(&renderer, &dims, |rt| {
@@ -13219,25 +13844,28 @@ mod tests {
             let (w, h) = (dims.width, dims.height);
             let l = resolve_collapsed_layout(&dims);
             let a = l.artwork_bounds;
-            // Geometry: a whole-pixel square, centred, at the content's left
-            // end, clear of the bottom corner curve and of the bars / slot
+            // Geometry: a whole-pixel square nested in the notch's bottom-left
+            // corner: one gap to the wall (the shoulder's end), the top and
+            // the bottom
             assert_eq!(a.width(), a.height(), "square at {dpi}");
-            assert_eq!(a.width(), (18.0 * dims.scale).round(), "size at {dpi}");
             assert!(
                 [a.left, a.top, a.right, a.bottom]
                     .iter()
                     .all(|v| v.fract() == 0.0)
             );
-            let c = l.content_bounds;
-            assert!(a.left >= c.left.floor() && a.right <= c.right);
-            assert!(a.top >= c.top && a.bottom <= c.bottom, "inside at {dpi}");
-            let mid = (c.top + c.bottom) / 2.0;
-            assert!(
-                ((a.top + a.bottom) / 2.0 - mid).abs() <= 0.5,
-                "centred at {dpi}"
-            );
             let cv = &dims.curvature;
-            assert!(a.left >= (cv.top_transition_radius + cv.bottom_radius).floor());
+            let gap = (crate::config::BASE_COLLAPSED_ARTWORK_GAP * dims.scale).round();
+            assert_eq!(a.top, gap, "top gap at {dpi}");
+            assert_eq!(h as f32 - a.bottom, gap, "bottom gap at {dpi}");
+            assert_eq!(
+                a.left - cv.top_transition_radius.round(),
+                gap,
+                "wall gap at {dpi}"
+            );
+            assert_eq!(a.width(), h as f32 - 2.0 * gap, "size at {dpi}");
+            // Corners softer than the concentric ones, short of a circle
+            let r_art = (crate::config::BASE_COLLAPSED_ARTWORK_RADIUS * dims.scale).round();
+            assert!(r_art > 0.0 && r_art < a.width() / 2.0, "radius at {dpi}");
             let slot = crate::layout::timer_slot_rect(&l, dims.scale);
             assert!(a.right < l.visualizer_bounds.left && a.right < slot.left);
             assert_eq!((dims.width, dims.height), (w, h), "notch size unchanged");
@@ -13403,5 +14031,83 @@ mod tests {
             "pulse dims: {full} -> {dim}"
         );
         renderer.set_timer(TimerView::default());
+    }
+    #[test]
+    fn test_convert_workspace_draws_rows_bar_and_question_at_every_dpi() {
+        use crate::convert::{Done, Format, Info};
+        use crate::convert_batch::Batch;
+        let renderer = Renderer::new().expect("renderer");
+        let mut b = Batch::default();
+        let added = b.add(vec![
+            "C:/in/photo.png".into(),
+            "C:/in/song.wav".into(),
+            "C:/in/bad.xyz".into(),
+        ]);
+        let info = |f| Info {
+            format: f,
+            bytes: 4096,
+            detail: "10 x 10".into(),
+        };
+        b.inspected(added[0].0, Ok(info(Format::Png)));
+        b.inspected(added[1].0, Ok(info(Format::Wav)));
+        b.inspected(added[2].0, Err(crate::convert::ConvertError::Unsupported));
+        assert!(renderer.set_convert(Some(b.view())));
+        assert!(
+            !renderer.set_convert(Some(b.view())),
+            "an unchanged batch is not a change"
+        );
+        assert!(renderer.convert_open());
+        for dpi in ALL_DPIS {
+            let dims =
+                space_dimensions(crate::config::NotchState::Expanded, dpi, OecaSpace::Convert);
+            let l = crate::layout::resolve_convert_layout(&dims).unwrap();
+            let (px, stride) = render_custom_frame(&renderer, &dims, |rt| {
+                renderer.draw_convert(rt, &dims).unwrap()
+            });
+            let lit = |r: RectF| lit_in(&px, stride, r, 60);
+            for i in 0..3 {
+                let p = l.row_parts(i);
+                assert!(lit(p.name), "row {i} name at {dpi}");
+                assert!(lit(p.icon), "row {i} file glyph at {dpi}");
+            }
+            assert!(lit(l.count), "count label at {dpi}");
+            assert!(lit(l.close) && lit(l.folder), "toolbar buttons at {dpi}");
+            assert!(lit(l.primary), "primary at {dpi}");
+        }
+        // Converting shows progress; the discard question replaces the rows
+        b.toggle(added[1].0);
+        b.choose(Format::Jpeg);
+        let _ = b.start().unwrap();
+        b.progress(added[0].0, 0.5);
+        renderer.set_convert(Some(b.view()));
+        let dims = space_dimensions(crate::config::NotchState::Expanded, 96, OecaSpace::Convert);
+        let l = crate::layout::resolve_convert_layout(&dims).unwrap();
+        let (px, stride) = render_custom_frame(&renderer, &dims, |rt| {
+            renderer.draw_convert(rt, &dims).unwrap()
+        });
+        let bar = l.row_parts(0).progress;
+        let half = RectF::new(bar.left, bar.top, bar.left + bar.width() / 2.0, bar.bottom);
+        assert!(lit_in(&px, stride, half, 150), "progress");
+        b.finished(
+            added[0].0,
+            Ok(Done {
+                output: "C:/s/photo.jpg".into(),
+                bytes: 9,
+                format: Format::Jpeg,
+                note: None,
+            }),
+        );
+        b.run_ended();
+        b.confirming = true;
+        renderer.set_convert(Some(b.view()));
+        let (px, stride) = render_custom_frame(&renderer, &dims, |rt| {
+            renderer.draw_convert(rt, &dims).unwrap()
+        });
+        assert!(lit_in(&px, stride, l.confirm_message, 150) && lit_in(&px, stride, l.keep, 60));
+        assert!(
+            !lit_in(&px, stride, l.row_parts(0).icon, 60),
+            "rows hidden while asking"
+        );
+        assert!(renderer.set_convert(None) && !renderer.convert_open());
     }
 }

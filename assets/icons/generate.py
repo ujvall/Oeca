@@ -328,6 +328,25 @@ def alert():
             + circle(12, 17.0, 1.6, True))
 
 
+def picture():
+    # A rounded frame with a sun and a ridge of hills cut out
+    return (rrect(2.8, 4.0, 18.4, 16.0, 3.6) + circle(8.6, 9.6, 1.9, hole=True)
+            + rounded_polygon([(5.0, 17.8), (10.2, 12.4), (13.0, 15.2), (15.2, 13.2), (19.0, 17.8)],
+                              [0.8, 1.2, 1.0, 1.2, 0.8], hole=True))
+
+
+def folder():
+    # A folder with a tab on its back edge
+    return rounded_polygon([(2.8, 5.4), (9.2, 5.4), (11.6, 8.2), (21.2, 8.2), (21.2, 19.6), (2.8, 19.6)],
+                           [2.4, 1.2, 1.2, 2.4, 2.4, 2.4])
+
+
+def check():
+    # A check mark with round ends
+    pts, radii = stroke([(5.4, 12.8), (10.0, 17.4), (18.8, 7.4)], 2.8)
+    return rounded_polygon(pts, radii)
+
+
 ICONS = [
     ("HOUSE_BLANK", "Home: a soft-roofed house with an arched door; the Home space.", home, False),
     ("MUSIC_ALT", "Music: two beamed notes; the Music space.", music, True),
@@ -340,6 +359,9 @@ ICONS = [
     ("INBOX", "Tray: an open tray with a dipped front; the drop page glyph.", tray, False),
     ("DONE", "Done: a check cut from a disc; a drop's success.", done, False),
     ("ALERT", "Alert: an exclamation mark cut from a disc; a drop that failed.", alert, False),
+    ("PICTURE", "Picture: a rounded frame with a sun and a ridge; an image file in the conversion workspace.", picture, False),
+    ("FOLDER", "Folder: a rounded folder with a tab; the conversion workspace's output folder.", folder, False),
+    ("CHECK", "Check: a rounded check mark; a ticked box in the conversion workspace.", check, False),
 ]
 
 

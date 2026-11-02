@@ -12,6 +12,9 @@ pub enum OecaSpace {
     Music,
     /// The in-memory clipboard history (Phase 5.2).
     Clipboard,
+    /// Sizes the conversion workspace (`Scene::Convert`). Never selectable and
+    /// not in `ALL`: it has no pill and is never the active space.
+    Convert,
 }
 
 /// What the expanded notch shows: a space, or the drop page while files are
@@ -22,6 +25,8 @@ pub enum Scene {
     /// The Settings page, over the active space (which stays selected).
     Settings,
     Drop,
+    /// The conversion workspace: a dropped batch of image / audio files.
+    Convert,
     /// A drop's result ("Item copied to clipboard", or why not), on the drop
     /// page's surface.
     Dropped,
@@ -101,17 +106,28 @@ impl Scene {
         match self {
             Self::Space(space) => space,
             Self::Settings | Self::Drop | Self::Dropped => PANEL_SPACE,
+            Self::Convert => OecaSpace::Convert,
         }
     }
 
     /// What the expanded notch shows: a drag's drop page (or its result)
     /// first, then an open Settings page, otherwise the active space.
-    pub fn current(drop: crate::dragdrop::DropPage, settings_open: bool, space: OecaSpace) -> Self {
+    pub fn current(
+        drop: crate::dragdrop::DropPage,
+        convert_open: bool,
+        settings_open: bool,
+        space: OecaSpace,
+    ) -> Self {
         use crate::dragdrop::DropPage;
-        if matches!(drop, DropPage::Ready | DropPage::Unsupported) {
+        if matches!(
+            drop,
+            DropPage::Ready | DropPage::ReadyConvert | DropPage::Unsupported
+        ) {
             Self::Drop
         } else if drop == DropPage::Result {
             Self::Dropped
+        } else if convert_open {
+            Self::Convert
         } else if settings_open {
             Self::Settings
         } else {
@@ -140,6 +156,7 @@ impl OecaSpace {
             Self::Home => "Home",
             Self::Music => "Music",
             Self::Clipboard => "Clipboard",
+            Self::Convert => "Convert",
         }
     }
 
@@ -183,15 +200,15 @@ mod tests {
     fn test_settings_and_drop_take_the_clipboard_size_from_any_space() {
         for space in OecaSpace::ALL {
             assert_eq!(
-                Scene::current(crate::dragdrop::DropPage::Off, true, space).size_space(),
+                Scene::current(crate::dragdrop::DropPage::Off, false, true, space).size_space(),
                 OecaSpace::Clipboard
             );
             assert_eq!(
-                Scene::current(crate::dragdrop::DropPage::Ready, false, space).size_space(),
+                Scene::current(crate::dragdrop::DropPage::Ready, false, false, space).size_space(),
                 OecaSpace::Clipboard
             );
             assert_eq!(
-                Scene::current(crate::dragdrop::DropPage::Off, false, space).size_space(),
+                Scene::current(crate::dragdrop::DropPage::Off, false, false, space).size_space(),
                 space
             );
         }
@@ -204,24 +221,48 @@ mod tests {
     fn test_scene_priority_and_settings_keep_the_space() {
         for space in OecaSpace::ALL {
             assert_eq!(
-                Scene::current(crate::dragdrop::DropPage::Off, false, space),
+                Scene::current(crate::dragdrop::DropPage::Off, false, false, space),
                 Scene::Space(space)
             );
             assert_eq!(
-                Scene::current(crate::dragdrop::DropPage::Off, true, space),
+                Scene::current(crate::dragdrop::DropPage::Off, false, true, space),
                 Scene::Settings
             );
             assert_eq!(
-                Scene::current(crate::dragdrop::DropPage::Ready, true, space),
+                Scene::current(crate::dragdrop::DropPage::Ready, false, true, space),
                 Scene::Drop,
                 "drag wins"
             );
             // Closing Settings returns to the space that was active
             assert_eq!(
-                Scene::current(crate::dragdrop::DropPage::Off, false, space),
+                Scene::current(crate::dragdrop::DropPage::Off, false, false, space),
                 Scene::Space(space)
             );
         }
+    }
+
+    #[test]
+    fn test_conversion_workspace_sits_between_the_drop_page_and_settings() {
+        use crate::dragdrop::DropPage;
+        for space in OecaSpace::ALL {
+            let at = |drop, convert, settings| Scene::current(drop, convert, settings, space);
+            assert_eq!(at(DropPage::Off, true, false), Scene::Convert);
+            assert_eq!(
+                at(DropPage::Off, true, true),
+                Scene::Convert,
+                "over Settings"
+            );
+            assert_eq!(
+                at(DropPage::Ready, true, false),
+                Scene::Drop,
+                "a new drag wins"
+            );
+            assert_eq!(at(DropPage::ReadyConvert, true, false), Scene::Drop);
+            assert_eq!(at(DropPage::Result, true, false), Scene::Dropped);
+            assert_eq!(at(DropPage::Off, false, false), Scene::Space(space));
+        }
+        assert_eq!(Scene::Convert.size_space(), OecaSpace::Convert);
+        assert!(!OecaSpace::ALL.contains(&OecaSpace::Convert));
     }
 
     #[test]
@@ -239,6 +280,7 @@ mod tests {
             OecaSpace::Home => 0,
             OecaSpace::Music => 1,
             OecaSpace::Clipboard => 2,
+            OecaSpace::Convert => 3,
         };
         assert_eq!(OecaSpace::ALL.len(), 3);
         assert_eq!(OecaSpace::ALL.map(index), [0, 1, 2]);

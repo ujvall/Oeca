@@ -16,7 +16,9 @@ pub const BASE_DPI: f32 = 96.0;
 // Collapsed reference dimensions (Phase 1 baseline preserved, smoothed shoulder)
 pub const BASE_COLLAPSED_WIDTH: f32 = 220.0;
 pub const BASE_COLLAPSED_HEIGHT: f32 = 32.0;
-pub const BASE_COLLAPSED_BOTTOM_CORNER_RADIUS: f32 = 14.0;
+/// The collapsed notch's bottom corners: a little under a third of its
+/// height (the expanded notch has its own, `BASE_EXPANDED_BOTTOM_CORNER_RADIUS`).
+pub const BASE_COLLAPSED_BOTTOM_CORNER_RADIUS: f32 = 9.0;
 pub const BASE_COLLAPSED_TOP_TRANSITION_RADIUS: f32 = 6.0;
 pub const BASE_COLLAPSED_TOP_TRANSITION_HEIGHT: f32 = 6.0;
 
@@ -557,8 +559,10 @@ pub const HUD_DIGIT_SPRING: Spring = Spring {
     response: 0.26,
 };
 /// A digit wheel turning this fast (values / s) shows its full motion blur;
-/// slower, proportionally less; at rest none.
-pub const HUD_DIGIT_BLUR_SPEED: f32 = 25.0;
+/// slower, proportionally less; at rest none. A one-digit roll on
+/// `HUD_DIGIT_SPRING` peaks at about 9 values / s: each step of the number
+/// shows the (restrained) blur, as does a quicker run of them.
+pub const HUD_DIGIT_BLUR_SPEED: f32 = 9.0;
 pub const HUD_STRETCH_SPRING: Spring = Spring {
     zeta: 0.8,
     response: 0.34,
@@ -589,8 +593,8 @@ pub const MEDIA_LIVE_FRAME_MS: u32 = 33;
 pub const MEDIA_SCRUBBER_FRAME_MS: u32 = 250;
 
 /// Playback visualizer: thin rounded bars (DIP at 96 DPI).
-pub const BASE_VISUALIZER_BAR_WIDTH: f32 = 2.0;
-pub const BASE_VISUALIZER_BAR_GAP: f32 = 2.0;
+pub const BASE_VISUALIZER_BAR_WIDTH: f32 = 1.6;
+pub const BASE_VISUALIZER_BAR_GAP: f32 = 1.6;
 pub const BASE_VISUALIZER_HEIGHT: f32 = 12.0;
 /// Resting bar height as a fraction of the full height.
 pub const VISUALIZER_MIN_HEIGHT: f32 = 0.25;
@@ -598,10 +602,19 @@ pub const VISUALIZER_MIN_HEIGHT: f32 = 0.25;
 pub const VISUALIZER_FADE_MS: f32 = 220.0;
 
 /// Collapsed notch album art (DIP at 96 DPI): a small rounded square at the
-/// left end of the content area, mirroring the visualizer at the right end,
-/// vertically centred in the 32 px notch (7 px above and below).
-pub const BASE_COLLAPSED_ARTWORK_SIZE: f32 = 18.0;
-pub const BASE_COLLAPSED_ARTWORK_RADIUS: f32 = 4.5;
+/// left end of the notch, mirroring the visualizer at the right end, nested
+/// in the notch's bottom-left corner: one gap to the left wall, the top and
+/// the bottom, so it is as tall as the notch less two gaps. Its corners are
+/// rounder than the notch's corner less that gap (3, the concentric one),
+/// softer than the notch's own.
+pub const BASE_COLLAPSED_ARTWORK_GAP: f32 = 6.0;
+pub const BASE_COLLAPSED_ARTWORK_SIZE: f32 =
+    BASE_COLLAPSED_HEIGHT - 2.0 * BASE_COLLAPSED_ARTWORK_GAP;
+pub const BASE_COLLAPSED_ARTWORK_RADIUS: f32 = 5.0;
+/// The HUD's icon box in the collapsed notch (DIP at 96 DPI): at the left of
+/// the content area, vertically centred; the HUD's own, whatever the cover
+/// does.
+pub const BASE_COLLAPSED_HUD_ICON_SIZE: f32 = 18.0;
 /// Space between the title and the expanded visualizer.
 pub const BASE_MEDIA_VISUALIZER_GAP: f32 = 8.0;
 
@@ -705,6 +718,27 @@ pub const BASE_DROP_ICON_SIZE: f32 = 34.0;
 pub const BASE_DROP_RESULT_ICON_SIZE: f32 = 30.0;
 pub const BASE_DROP_MESSAGE_GAP: f32 = 10.0;
 pub const BASE_DROP_MESSAGE_LINE: f32 = 18.0;
+
+/// Conversion workspace (a dropped batch of files, DIP): narrower than the
+/// panel, three two-line file rows under a toolbar in the header band, and an
+/// action bar (format pills and the primary button) under them.
+pub const BASE_CONVERT_WIDTH: f32 = 400.0;
+pub const BASE_CONVERT_SIDE_INSET: f32 = 16.0;
+pub const BASE_CONVERT_ROW_HEIGHT: f32 = 36.0;
+pub const BASE_CONVERT_ROW_GAP: f32 = 2.0;
+pub const BASE_CONVERT_BAR_GAP: f32 = 8.0;
+pub const BASE_CONVERT_BAR_HEIGHT: f32 = 30.0;
+pub const BASE_CONVERT_BOTTOM_PAD: f32 = 12.0;
+/// A row's check box, its file glyph, and the round buttons at its end.
+pub const BASE_CONVERT_CHECK_SIZE: f32 = 16.0;
+pub const BASE_CONVERT_FILE_ICON: f32 = 16.0;
+pub const BASE_CONVERT_ROW_BUTTON: f32 = 22.0;
+/// Format pills and the primary button (DIP wide).
+pub const BASE_CONVERT_PILL_WIDTH: f32 = 38.0;
+pub const BASE_CONVERT_PILL_GAP: f32 = 4.0;
+pub const BASE_CONVERT_PRIMARY_WIDTH: f32 = 96.0;
+/// A toolbar chip (quality, background) and a round toolbar button.
+pub const BASE_CONVERT_CHIP_WIDTH: f32 = 54.0;
 
 /// Inline scrubber in the controls row: `[controls]  0:49 ━━━●── -2:08`.
 pub const BASE_MEDIA_TIMELINE_LEAD: f32 = 4.0;
@@ -2050,8 +2084,8 @@ mod tests {
         let dims_100 = NotchDimensions::from_dpi(96);
         assert_eq!(dims_100.width, 220);
         assert_eq!(dims_100.height, 32);
-        assert!((dims_100.corner_radius - 14.0).abs() < 1e-4);
-        assert!((dims_100.curvature.bottom_radius - 14.0).abs() < 1e-4);
+        assert!((dims_100.corner_radius - 9.0).abs() < 1e-4);
+        assert!((dims_100.curvature.bottom_radius - 9.0).abs() < 1e-4);
         assert!((dims_100.curvature.top_transition_radius - 6.0).abs() < 1e-4);
         assert!((dims_100.border_width - 1.0).abs() < 1e-4);
         assert_eq!(dims_100.padding_h, 14.0);
@@ -2063,8 +2097,8 @@ mod tests {
         let dims_125 = NotchDimensions::from_dpi(120);
         assert_eq!(dims_125.width, 275);
         assert_eq!(dims_125.height, 40);
-        assert!((dims_125.corner_radius - 17.5).abs() < 1e-4);
-        assert!((dims_125.curvature.bottom_radius - 17.5).abs() < 1e-4);
+        assert!((dims_125.corner_radius - 11.25).abs() < 1e-4);
+        assert!((dims_125.curvature.bottom_radius - 11.25).abs() < 1e-4);
         assert!((dims_125.curvature.top_transition_radius - 7.5).abs() < 1e-4);
         assert!((dims_125.border_width - 1.25).abs() < 1e-4);
 
@@ -2072,7 +2106,7 @@ mod tests {
         let dims_150 = NotchDimensions::from_dpi(144);
         assert_eq!(dims_150.width, 330);
         assert_eq!(dims_150.height, 48);
-        assert!((dims_150.corner_radius - 21.0).abs() < 1e-4);
+        assert!((dims_150.corner_radius - 13.5).abs() < 1e-4);
         assert!((dims_150.curvature.top_transition_radius - 9.0).abs() < 1e-4);
         assert!((dims_150.border_width - 1.5).abs() < 1e-4);
 
@@ -2080,7 +2114,7 @@ mod tests {
         let dims_175 = NotchDimensions::from_dpi(168);
         assert_eq!(dims_175.width, 385);
         assert_eq!(dims_175.height, 56);
-        assert!((dims_175.corner_radius - 24.5).abs() < 1e-4);
+        assert!((dims_175.corner_radius - 15.75).abs() < 1e-4);
         assert!((dims_175.curvature.top_transition_radius - 10.5).abs() < 1e-4);
         assert!((dims_175.border_width - 1.75).abs() < 1e-4);
 
@@ -2088,7 +2122,7 @@ mod tests {
         let dims_200 = NotchDimensions::from_dpi(192);
         assert_eq!(dims_200.width, 440);
         assert_eq!(dims_200.height, 64);
-        assert!((dims_200.corner_radius - 28.0).abs() < 1e-4);
+        assert!((dims_200.corner_radius - 18.0).abs() < 1e-4);
         assert!((dims_200.curvature.top_transition_radius - 12.0).abs() < 1e-4);
         assert!((dims_200.border_width - 2.0).abs() < 1e-4);
 
@@ -2097,14 +2131,14 @@ mod tests {
         let expected_scale: f32 = 137.0 / 96.0;
         assert_eq!(dims_137.width, (220.0f32 * expected_scale).round() as i32);
         assert_eq!(dims_137.height, (32.0f32 * expected_scale).round() as i32);
-        assert!((dims_137.corner_radius - (14.0 * expected_scale)).abs() < 1e-4);
+        assert!((dims_137.corner_radius - (9.0 * expected_scale)).abs() < 1e-4);
         assert!((dims_137.curvature.top_transition_radius - (6.0 * expected_scale)).abs() < 1e-4);
 
         // High DPI: 288 DPI (300% 4K display scaling)
         let dims_288 = NotchDimensions::from_dpi(288);
         assert_eq!(dims_288.width, 660);
         assert_eq!(dims_288.height, 96);
-        assert!((dims_288.corner_radius - 42.0).abs() < 1e-4);
+        assert!((dims_288.corner_radius - 27.0).abs() < 1e-4);
         assert!((dims_288.curvature.top_transition_radius - 18.0).abs() < 1e-4);
         assert!((dims_288.border_width - 3.0).abs() < 1e-4);
 
@@ -2129,14 +2163,30 @@ mod tests {
     }
 
     #[test]
+    fn test_collapsed_cover_nests_in_the_notch_corner_with_soft_corners() {
+        // One gap all round: the cover is the notch's height less two gaps
+        assert_eq!(
+            BASE_COLLAPSED_ARTWORK_SIZE + 2.0 * BASE_COLLAPSED_ARTWORK_GAP,
+            BASE_COLLAPSED_HEIGHT
+        );
+        // Its corners are rounder than the concentric ones (they would run
+        // parallel to the notch's)
+        let concentric = BASE_COLLAPSED_BOTTOM_CORNER_RADIUS - BASE_COLLAPSED_ARTWORK_GAP;
+        assert_eq!(concentric, 3.0);
+        assert_eq!(BASE_COLLAPSED_ARTWORK_RADIUS, 5.0);
+        // Expanded geometry is not part of it
+        assert_eq!(BASE_EXPANDED_BOTTOM_CORNER_RADIUS, 18.0);
+    }
+
+    #[test]
     fn test_hardware_curvature_model() {
         let dims = NotchDimensions::from_dpi(96);
-        assert_eq!(dims.bottom_corner_radius(), 14.0);
+        assert_eq!(dims.bottom_corner_radius(), 9.0);
         assert_eq!(dims.top_transition_radius(), 6.0);
         assert!(dims.is_symmetric());
 
         let dims_200 = NotchDimensions::from_dpi(192);
-        assert_eq!(dims_200.bottom_corner_radius(), 28.0);
+        assert_eq!(dims_200.bottom_corner_radius(), 18.0);
         assert_eq!(dims_200.top_transition_radius(), 12.0);
         assert!(dims_200.is_symmetric());
     }

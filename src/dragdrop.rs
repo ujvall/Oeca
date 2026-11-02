@@ -39,6 +39,11 @@ const SUPPORTED_EXTENSIONS: [&str; 9] = [
     "png", "jpg", "jpeg", "jfif", "bmp", "gif", "tif", "tiff", "webp",
 ];
 
+/// Audio file types the conversion workspace accepts by name. Opus and ADTS
+/// AAC are listed so a dropped one gets a row that says why it can't convert,
+/// rather than vanishing; the content is checked when the batch inspects it.
+const AUDIO_EXTENSIONS: [&str; 8] = ["wav", "flac", "mp3", "ogg", "oga", "m4a", "opus", "aac"];
+
 /// At most this many dropped paths are considered (bounded work per drop).
 const MAX_DROPPED_FILES: u32 = 32;
 
@@ -53,6 +58,29 @@ pub fn is_supported_image(path: &Path) -> bool {
             .iter()
             .any(|s| e.eq_ignore_ascii_case(s))
     })
+}
+
+/// An audio file by name (case-insensitive).
+pub fn is_audio(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| AUDIO_EXTENSIONS.iter().any(|s| e.eq_ignore_ascii_case(s)))
+}
+
+/// AVIF by name: the converter decodes it, but the clipboard path (WIC) can't.
+pub fn is_avif(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("avif"))
+}
+
+/// The paths the conversion workspace can take (images, AVIF and audio), in order.
+pub fn convertible(paths: &[PathBuf]) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .filter(|p| is_supported_image(p) || is_avif(p) || is_audio(p))
+        .cloned()
+        .collect()
 }
 
 /// The supported image paths among the dragged ones, in order.
@@ -82,12 +110,25 @@ pub enum DropError {
 pub enum DropPage {
     #[default]
     Off,
-    /// Supported images over the notch: drop to add them.
+    /// Supported images over the notch: drop on the left to add them to the
+    /// clipboard, on the right to convert them.
     Ready,
+    /// Files only the converter takes (audio, or audio with images): drop
+    /// anywhere to convert.
+    ReadyConvert,
     /// Files over the notch that are not images Oeca can add.
     Unsupported,
     /// After a drop: its outcome (`DropOutcome`), shown for a moment.
     Result,
+}
+
+/// Which half of a two-zone drop page the pointer is over (images can go to
+/// the clipboard or to the converter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DropZone {
+    #[default]
+    Copy,
+    Convert,
 }
 
 /// How a drop ended (shown on the drop page's result).
@@ -310,15 +351,158 @@ impl DragSession {
     }
 }
 
+// ---- Temporary window priority ------------------------------------------------
+
+/// Why Oeca is (or is not) lifted above ordinary windows. Only with Always on
+/// top off: with it on the window is already topmost, and the saved setting is
+/// never touched either way.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum LiftPhase {
+    /// No temporary priority needed.
+    #[default]
+    Off,
+    /// An external file drag is over the notch.
+    Drag,
+    /// The converter workspace a drop opened is in use: priority stays for the
+    /// whole session, however the drag itself ended.
+    Session,
+}
+
+/// What the window must do to follow a state change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiftStep {
+    Nothing,
+    /// Come above ordinary windows (without activating).
+    Raise,
+    /// Back to the notch's normal place.
+    Lower,
+}
+
+/// The temporary-priority state machine. Pure: `WindowState` feeds it facts
+/// (Always on top, whether a full-screen app or game is in front) and performs
+/// the `LiftStep` it returns. Every way a drag or session can end maps to one
+/// call, so the lift is always undone exactly once and never accumulates.
+///
+/// A full-screen app or game always wins: during a session the lift is
+/// lowered while one is in front (`reassess`) and raised again once it is not.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DragLift {
+    phase: LiftPhase,
+    /// The window is above ordinary windows because of this state.
+    raised: bool,
+}
+
+impl DragLift {
+    pub fn phase(&self) -> LiftPhase {
+        self.phase
+    }
+
+    pub fn is_lifted(&self) -> bool {
+        self.raised
+    }
+
+    /// Whether `begin_drag` needs to know about full-screen apps: not while a
+    /// drag or session already holds the lift.
+    pub fn needs_fullscreen_check(&self) -> bool {
+        self.phase == LiftPhase::Off || (self.phase == LiftPhase::Session && !self.raised)
+    }
+
+    /// A droppable drag is over the notch.
+    pub fn begin_drag(&mut self, always_on_top: bool, fullscreen: bool) -> LiftStep {
+        if always_on_top {
+            return LiftStep::Nothing;
+        }
+        match self.phase {
+            LiftPhase::Off if !fullscreen => {
+                self.phase = LiftPhase::Drag;
+                self.raised = true;
+                LiftStep::Raise
+            }
+            LiftPhase::Off | LiftPhase::Drag => LiftStep::Nothing,
+            LiftPhase::Session => self.follow(fullscreen),
+        }
+    }
+
+    /// The drop opened (or reached) the converter workspace: the drag's lift
+    /// becomes the session's, so the drag ending changes nothing.
+    pub fn open_session(&mut self) {
+        if self.phase == LiftPhase::Drag {
+            self.phase = LiftPhase::Session;
+        }
+    }
+
+    /// A drag ended without opening a workspace (leave, Escape, an invalid
+    /// drop, a drop to the clipboard): undoes the drag's own lift. A running
+    /// session keeps its lift.
+    pub fn end_drag(&mut self) -> LiftStep {
+        if self.phase != LiftPhase::Drag {
+            return LiftStep::Nothing;
+        }
+        self.finish()
+    }
+
+    /// The session ended (Convert pressed, the notch collapsed, the workspace
+    /// closed or otherwise gone).
+    pub fn end_session(&mut self) -> LiftStep {
+        if self.phase == LiftPhase::Off {
+            return LiftStep::Nothing;
+        }
+        self.finish()
+    }
+
+    /// The foreground may have changed: during a session, lower for a
+    /// full-screen app or game, raise again when it is gone.
+    pub fn reassess(&mut self, always_on_top: bool, fullscreen: bool) -> LiftStep {
+        if always_on_top || self.phase != LiftPhase::Session {
+            return LiftStep::Nothing;
+        }
+        self.follow(fullscreen)
+    }
+
+    fn follow(&mut self, fullscreen: bool) -> LiftStep {
+        match (self.raised, fullscreen) {
+            (true, true) => {
+                self.raised = false;
+                LiftStep::Lower
+            }
+            (false, false) => {
+                self.raised = true;
+                LiftStep::Raise
+            }
+            _ => LiftStep::Nothing,
+        }
+    }
+
+    fn finish(&mut self) -> LiftStep {
+        self.phase = LiftPhase::Off;
+        if std::mem::take(&mut self.raised) {
+            LiftStep::Lower
+        } else {
+            LiftStep::Nothing
+        }
+    }
+}
+
 // ---- OLE drop target ------------------------------------------------------
 
 /// Drag events delivered to the window (UI thread).
 #[derive(Debug)]
 pub enum DragEvent {
-    Enter { images: bool, at: POINT },
-    Over { at: POINT },
+    /// `images`: something here can be dropped (an image or audio file);
+    /// `copyable`: all of it can also go to the clipboard (images only).
+    Enter {
+        images: bool,
+        copyable: bool,
+        at: POINT,
+    },
+    Over {
+        at: POINT,
+    },
     Leave,
-    Drop { images: Vec<PathBuf>, at: POINT },
+    Drop {
+        images: Vec<PathBuf>,
+        at: POINT,
+    },
 }
 
 /// The window's handler: returns true to accept (copy effect).
@@ -368,13 +552,15 @@ impl IDropTarget_Impl for DropTarget_Impl {
         effect: *mut DROPEFFECT,
     ) -> Result<()> {
         // File names only: nothing is opened while dragging
-        let images = data
+        let files = data
             .ok()
-            .is_ok_and(|d| !supported_images(&dropped_paths(d)).is_empty());
+            .map(|d| convertible(&dropped_paths(d)))
+            .unwrap_or_default();
         let accept = (self.handler)(
             self.hwnd,
             DragEvent::Enter {
-                images,
+                images: !files.is_empty(),
+                copyable: !files.is_empty() && files.iter().all(|f| is_supported_image(f)),
                 at: point(pt),
             },
         );
@@ -407,7 +593,7 @@ impl IDropTarget_Impl for DropTarget_Impl {
     ) -> Result<()> {
         let images = data
             .ok()
-            .map(|d| supported_images(&dropped_paths(d)))
+            .map(|d| convertible(&dropped_paths(d)))
             .unwrap_or_default();
         let accept = (self.handler)(
             self.hwnd,
@@ -829,5 +1015,96 @@ mod tests {
             assert!(!o.succeeded());
             assert_ne!(o.message(), DropOutcome::Copied.message());
         }
+    }
+    #[test]
+    fn test_lift_lifecycle_drag_then_session_then_release() {
+        use LiftPhase::*;
+        use LiftStep::*;
+        let mut l = DragLift::default();
+        // A drag lifts once; a successful drop keeps the lift for the session
+        assert_eq!(l.begin_drag(false, false), Raise);
+        assert_eq!(
+            l.begin_drag(false, false),
+            Nothing,
+            "moves never lift again"
+        );
+        l.open_session();
+        assert_eq!((l.phase(), l.is_lifted()), (Session, true));
+        // The OLE drag ending (a late leave, another cancelled drag) changes nothing
+        assert_eq!(l.end_drag(), Nothing);
+        assert!(l.is_lifted());
+        // Browsing, selecting, repeated drops: no flicker, no second lift
+        for _ in 0..5 {
+            assert_eq!(l.reassess(false, false), Nothing);
+            assert_eq!(l.begin_drag(false, false), Nothing);
+            l.open_session();
+            assert_eq!(l.end_drag(), Nothing);
+        }
+        // Convert, collapse, X and the like: one release, then nothing to undo
+        assert_eq!(l.end_session(), Lower);
+        assert_eq!((l.phase(), l.is_lifted()), (Off, false));
+        assert_eq!(l.end_session(), Nothing);
+    }
+
+    #[test]
+    fn test_cancelled_and_invalid_drags_never_leave_a_lift() {
+        use LiftStep::*;
+        let mut l = DragLift::default();
+        // Leave / Escape
+        assert_eq!(l.begin_drag(false, false), Raise);
+        assert_eq!(l.end_drag(), Lower);
+        assert!(!l.is_lifted() && l.end_drag() == Nothing);
+        // An invalid or clipboard drop ends as a drag too (no session opened)
+        assert_eq!(l.begin_drag(false, false), Raise);
+        assert_eq!(l.end_drag(), Lower);
+        // A drop that opened nothing (empty batch) ends the session at once
+        assert_eq!(l.begin_drag(false, false), Raise);
+        l.open_session();
+        assert_eq!(l.end_session(), Lower);
+        assert!(!l.is_lifted());
+    }
+
+    #[test]
+    fn test_always_on_top_is_never_lifted_or_lowered_by_the_lift() {
+        use LiftStep::*;
+        let mut l = DragLift::default();
+        assert_eq!(l.begin_drag(true, false), Nothing);
+        l.open_session();
+        assert_eq!((l.phase(), l.is_lifted()), (LiftPhase::Off, false));
+        assert_eq!(l.end_drag(), Nothing);
+        assert_eq!(l.end_session(), Nothing);
+        // Turned on in the middle of a session: reassessing leaves it alone
+        assert_eq!(l.begin_drag(false, false), Raise);
+        l.open_session();
+        assert_eq!(l.reassess(true, true), Nothing);
+        assert_eq!(l.end_session(), Lower);
+    }
+
+    #[test]
+    fn test_full_screen_apps_win_before_and_during_a_session() {
+        use LiftStep::*;
+        let mut l = DragLift::default();
+        // In front when the drag arrives (or can't be ruled out): no lift, no session lift
+        assert_eq!(l.begin_drag(false, true), Nothing);
+        l.open_session();
+        assert!(!l.is_lifted() && l.end_session() == Nothing);
+        // A game starts during an open session: lowered; it ends: raised again
+        assert_eq!(l.begin_drag(false, false), Raise);
+        l.open_session();
+        assert_eq!(l.reassess(false, true), Lower);
+        assert!(!l.is_lifted());
+        assert_eq!(l.reassess(false, true), Nothing, "already lowered");
+        assert!(l.needs_fullscreen_check());
+        assert_eq!(l.reassess(false, false), Raise);
+        assert!(l.is_lifted() && !l.needs_fullscreen_check());
+        // The session ends while a full-screen app is in front: nothing to undo
+        assert_eq!(l.reassess(false, true), Lower);
+        assert_eq!(l.end_session(), Nothing);
+        // A new drag in a suspended session resumes only when it is safe
+        assert_eq!(l.begin_drag(false, false), Raise);
+        l.open_session();
+        l.reassess(false, true);
+        assert_eq!(l.begin_drag(false, true), Nothing);
+        assert_eq!(l.begin_drag(false, false), Raise);
     }
 }

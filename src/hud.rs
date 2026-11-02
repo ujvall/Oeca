@@ -83,6 +83,9 @@ pub struct HudView {
     pub power_saving: f32,
     /// The icon: 0 the speaker, 1 the sun (screen brightness), crossfading.
     pub brightness: f32,
+    /// 1 while the notch's own row (clock, artwork) is held back, the notch
+    /// being lifted above other windows for the HUD; else 0.
+    pub base_hold: f32,
     pub muted: f32,
     pub presence: f32,
     /// The notch's stretch: 0 at rest, toward 1 stretched to the right (its
@@ -146,6 +149,8 @@ pub struct Hud {
     /// crossfade between the two.
     brightness_on: bool,
     brightness: Glide,
+    /// The notch's own row held back (see `HudView::base_hold`).
+    base_held: bool,
     /// The stretch toward an edge (-1 left .. 1 right, 0 at rest) and its
     /// target, and the side last stretched toward.
     stretch: Glide,
@@ -170,6 +175,17 @@ impl Hud {
 
     fn percent(&self) -> u32 {
         (self.target * 100.0).round() as u32
+    }
+
+    /// The number's wheel targets: the volume's (see `digit_targets`), or the
+    /// brightness's, whose steps are tens: its ones wheel only follows its own
+    /// digit (it stays put from 70 to 80) instead of rolling a full turn.
+    fn wheel_targets(&self) -> [f32; 3] {
+        if self.brightness_on {
+            brightness_digit_targets(self.percent())
+        } else {
+            digit_targets(self.percent())
+        }
     }
 
     /// Shows the actual `level` (0..1). A HUD appearing from nothing starts
@@ -209,6 +225,13 @@ impl Hud {
 
     fn brightness_target(&self) -> f32 {
         f32::from(u8::from(self.brightness_on))
+    }
+
+    /// Holds the notch's own row back (or lets it return), at once: while
+    /// the notch is lifted above other windows only the HUD shows, never the
+    /// clock or artwork crossfading in and out over them.
+    pub fn hold_base(&mut self, held: bool) {
+        self.base_held = held;
     }
 
     /// Shows the power-saving notice: Windows' power saving turned `on` (or
@@ -264,7 +287,7 @@ impl Hud {
         self.level.snap(self.target);
         self.mute.snap(self.mute_target());
         self.waves.snap(self.waves_target());
-        let targets = digit_targets(self.percent());
+        let targets = self.wheel_targets();
         for (wheel, target) in self.digits.iter_mut().zip(targets) {
             wheel.snap(target);
         }
@@ -294,7 +317,7 @@ impl Hud {
     }
 
     pub fn is_animating(&self) -> bool {
-        let targets = digit_targets(self.percent());
+        let targets = self.wheel_targets();
         self.presence.is_animating()
             || self.widen.is_animating()
             || self.level.moving(self.target)
@@ -319,7 +342,7 @@ impl Hud {
         self.power.step(self.power_target(), dt_ms, SPACE_SPRING);
         self.brightness
             .step(self.brightness_target(), dt_ms, SPACE_SPRING);
-        let targets = digit_targets(self.percent());
+        let targets = self.wheel_targets();
         for (wheel, target) in self.digits.iter_mut().zip(targets) {
             wheel.step(target, dt_ms, HUD_DIGIT_SPRING);
         }
@@ -378,6 +401,7 @@ impl Hud {
             notice: self.notice.value.clamp(0.0, 1.0),
             power_saving: self.power.value.clamp(0.0, 1.0),
             brightness: self.brightness.value.clamp(0.0, 1.0),
+            base_hold: f32::from(u8::from(self.base_held)),
             muted: self.mute.value.clamp(0.0, 1.0),
             presence: self.presence.level().clamp(0.0, 1.0),
             stretch: self.stretch_shown(),
@@ -410,6 +434,14 @@ pub fn power_notice_fill(on: bool) -> [f32; 3] {
 /// state is no change.
 pub fn power_notice_due(source_seen_before: bool, was_on: bool, now_on: bool) -> bool {
     source_seen_before && was_on != now_on
+}
+
+/// The brightness number's wheel targets for `percent`: hundreds and tens as
+/// running counts, the ones wheel at its digit alone (0..=9, no carry), so
+/// brightness stepping by tens leaves it still at 0.
+pub fn brightness_digit_targets(percent: u32) -> [f32; 3] {
+    let p = percent.min(100);
+    [(p / 100) as f32, (p / 10) as f32, (p % 10) as f32]
 }
 
 /// The number's wheel targets for `percent` (0..=100): hundreds, tens and
@@ -1958,6 +1990,88 @@ mod tests {
         assert_eq!(hud.view().brightness, 1.0);
         hud.settle();
         assert!(!hud.is_animating());
+    }
+
+    #[test]
+    fn test_brightness_ones_wheel_stays_put_across_steps_of_ten() {
+        assert_eq!(brightness_digit_targets(70), [0.0, 7.0, 0.0]);
+        assert_eq!(brightness_digit_targets(100), [1.0, 10.0, 0.0]);
+        assert_eq!(brightness_digit_targets(0), [0.0, 0.0, 0.0]);
+        // A level that is not a multiple of ten shows its own ones digit
+        assert_eq!(brightness_digit_targets(37), [0.0, 3.0, 7.0]);
+        let mut hud = Hud::default();
+        hud.show_brightness(0.7, false);
+        run(&mut hud, 3000.0);
+        // Up through every step: the tens wheel turns, the ones wheel never
+        for percent in [80, 90, 100, 90, 80, 70, 60] {
+            hud.show_brightness(percent as f32 / 100.0, false);
+            let mut t = 0.0;
+            while t < 3000.0 {
+                let more = hud.step(1000.0 / 144.0);
+                let v = hud.view();
+                assert_eq!(v.digits[2], 0.0, "ones wheel moved at {percent}%");
+                assert_eq!(v.digit_speed[2], 0.0);
+                if !more {
+                    break;
+                }
+                t += 1000.0 / 144.0;
+            }
+            assert_eq!(hud.view().digits[1], (percent / 10) as f32, "{percent}%");
+        }
+        // The volume's number is unchanged: its ones wheel rolls
+        hud.show(0.7, false, false);
+        run(&mut hud, 3000.0);
+        assert_eq!(hud.view().digits, digit_targets(70));
+    }
+
+    #[test]
+    fn test_lifted_notch_holds_its_own_row_back_through_the_hud() {
+        // The row's alpha as the renderer takes it
+        let row = |hud: &Hud| (1.0 - hud.view().presence) * (1.0 - hud.view().base_hold);
+        let mut hud = Hud::default();
+        assert_eq!(row(&hud), 1.0, "at rest the row shows");
+        // Lifted for the HUD: the row is gone at once, with nothing to animate
+        hud.hold_base(true);
+        assert_eq!(row(&hud), 0.0);
+        assert!(!hud.is_animating());
+        hud.show(0.5, false, false);
+        let mut t = 0.0;
+        while t < 3000.0 && hud.step(1000.0 / 144.0) {
+            assert_eq!(row(&hud), 0.0, "the row leaked while the HUD came in");
+            t += 1000.0 / 144.0;
+        }
+        // The HUD leaves: the row stays away the whole fade-out
+        hud.hide(false);
+        let mut t = 0.0;
+        while t < 3000.0 && hud.step(1000.0 / 144.0) {
+            assert_eq!(row(&hud), 0.0, "the row leaked while the HUD left");
+            t += 1000.0 / 144.0;
+        }
+        assert_eq!(hud.view().presence, 0.0);
+        // Dropped back: the row is simply there again, no fade, no frames
+        hud.hold_base(false);
+        assert_eq!((row(&hud), hud.is_animating()), (1.0, false));
+        // Never lifted (nothing covers the notch): the base behaviour, the
+        // row crossfading with the HUD, is untouched
+        let mut hud = Hud::default();
+        hud.show(0.5, false, false);
+        hud.step(7.0);
+        let v = hud.view();
+        assert!(v.presence > 0.0 && v.presence < 1.0 && v.base_hold == 0.0);
+    }
+
+    #[test]
+    fn test_a_one_digit_roll_reaches_the_motion_blur() {
+        // The tens wheel turning one value (a step of ten, or 9 -> 10 of the
+        // volume) peaks near the speed that shows the blur in full
+        let mut wheel = Glide::default();
+        let mut peak: f32 = 0.0;
+        for _ in 0..200 {
+            wheel.step(1.0, 1000.0 / 144.0, HUD_DIGIT_SPRING);
+            peak = peak.max(wheel.vel.abs());
+        }
+        let blur = peak / crate::config::HUD_DIGIT_BLUR_SPEED;
+        assert!(blur > 0.8, "a one-digit roll blurs only {blur}");
     }
 
     #[test]
