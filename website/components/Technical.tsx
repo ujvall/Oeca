@@ -41,23 +41,19 @@ const STACK = ["Rust 2024", "Win32", "Direct2D", "DirectWrite", "Windows media c
 
 export function Technical() {
   return (
-    <section id="built" className="rule" aria-labelledby="built-title">
-      <div className="shell">
-      <div className="frame grid gap-14 px-5 py-24 sm:px-8 md:py-32 lg:grid-cols-12 lg:gap-10">
+    <section id="built" className="section" aria-labelledby="built-title">
+      <div className="shell grid gap-14 lg:grid-cols-12 lg:gap-10">
         <div className="lg:col-span-5">
-          <div className="lg:sticky lg:top-28">
+          <div data-reveal className="lg:sticky lg:top-28">
             <p className="t-label">Under the hood</p>
-            <h2 id="built-title" className="t-title mt-5 max-w-[12ch]">
+            <h2 id="built-title" className="t-title mt-4 max-w-[12ch]">
               Built the Windows way
             </h2>
             <p className="t-lead mt-6 max-w-md">
               Oeca is a single Rust executable: no runtime, no UI framework, no web view. The app uses
               Microsoft&rsquo;s windows crates; the offline file converter adds pure-Rust codecs.
             </p>
-            <ul
-              aria-label="Technologies"
-              className="mt-8 flex flex-wrap gap-2"
-            >
+            <ul aria-label="Technologies" className="mt-8 flex flex-wrap gap-2">
               {STACK.map((s) => (
                 <li
                   key={s}
@@ -75,8 +71,8 @@ export function Technical() {
 
         <ul className="grid gap-10 lg:col-span-6 lg:col-start-7">
           {FACTS.map((f) => (
-            <li key={f.title} className="flex gap-5">
-              <span className="squircle">
+            <li key={f.title} data-reveal className="group flex gap-5">
+              <span className="squircle transition-colors duration-200 group-hover:text-accent">
                 <f.icon size={18} aria-hidden />
               </span>
               <div>
@@ -86,7 +82,6 @@ export function Technical() {
             </li>
           ))}
         </ul>
-      </div>
       </div>
     </section>
   );

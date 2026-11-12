@@ -3,9 +3,8 @@ import { LICENSE_URL, RELEASES_URL, REPO_URL } from "@/lib/site";
 
 export function Footer() {
   return (
-    <footer className="rule">
-      <div className="shell">
-      <div className="frame flex flex-col gap-8 px-5 py-10 sm:px-8 md:flex-row md:items-start md:justify-between">
+    <footer className="border-t border-line">
+      <div className="shell flex flex-col gap-8 py-10 md:flex-row md:items-start md:justify-between">
         <div>
           <div className="flex items-center gap-2.5">
             <Image src="/media/oeca-icon-64.png" alt="" width={22} height={22} className="size-[22px]" />
@@ -55,7 +54,6 @@ export function Footer() {
             </li>
           </ul>
         </nav>
-      </div>
       </div>
     </footer>
   );

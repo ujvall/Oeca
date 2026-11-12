@@ -1,0 +1,65 @@
+"use client";
+
+import { useEffect } from "react";
+import Lenis from "lenis";
+import "lenis/dist/lenis.css";
+import { MOTION_OK, ScrollTrigger, gsap } from "@/lib/gsap";
+
+/** Page-wide motion: Lenis smooth scrolling driven by GSAP's ticker, smooth
+ *  same-page anchor jumps, and a blur-in reveal for every `[data-reveal]`.
+ *  Under reduced motion none of it runs: native scrolling, nothing hidden. */
+export function Motion() {
+  useEffect(() => {
+    const mm = gsap.matchMedia();
+
+    mm.add(MOTION_OK, () => {
+      const lenis = new Lenis({ lerp: 0.1, wheelMultiplier: 0.9 });
+      lenis.on("scroll", ScrollTrigger.update);
+      const tick = (t: number) => lenis.raf(t * 1000);
+      gsap.ticker.add(tick);
+      gsap.ticker.lagSmoothing(0);
+
+      // Same-page anchors glide instead of jumping; the nav's height is kept clear.
+      const onClick = (e: MouseEvent) => {
+        const a = (e.target as Element).closest<HTMLAnchorElement>("a[href*='#']");
+        if (!a || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey) return;
+        const url = new URL(a.href);
+        if (url.pathname !== location.pathname || !url.hash) return;
+        const target = document.querySelector<HTMLElement>(url.hash);
+        if (!target) return;
+        e.preventDefault();
+        history.pushState(null, "", url.hash);
+        lenis.scrollTo(target, { offset: -72, duration: 1.1 });
+      };
+      document.addEventListener("click", onClick);
+
+      // Content arrives out of focus and settles: blur, a short rise, opacity.
+      const items = gsap.utils.toArray<HTMLElement>("[data-reveal]");
+      gsap.set(items, { autoAlpha: 0, y: 24, filter: "blur(12px)" });
+      ScrollTrigger.batch(items, {
+        start: "top 90%",
+        once: true,
+        onEnter: (batch) =>
+          gsap.to(batch, {
+            autoAlpha: 1,
+            y: 0,
+            filter: "blur(0px)",
+            duration: 0.9,
+            stagger: 0.08,
+            ease: "power3.out",
+            clearProps: "filter,transform",
+          }),
+      });
+
+      return () => {
+        document.removeEventListener("click", onClick);
+        gsap.ticker.remove(tick);
+        lenis.destroy();
+      };
+    });
+
+    return () => mm.revert();
+  }, []);
+
+  return null;
+}
