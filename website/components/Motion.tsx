@@ -44,7 +44,7 @@ export function Motion() {
       const intro = gsap.utils.toArray<HTMLElement>("[data-intro]");
       gsap.fromTo(
         intro,
-        { autoAlpha: 0, y: 16, filter: "blur(10px)" },
+        { autoAlpha: 0, y: 16, filter: "blur(8px)", willChange: "transform, opacity, filter" },
         {
           autoAlpha: 1,
           y: 0,
@@ -58,27 +58,34 @@ export function Motion() {
           },
           onComplete: () => {
             document.documentElement.classList.remove("motion");
-            gsap.set(intro, { clearProps: "opacity,visibility,transform,filter" });
+            gsap.set(intro, { clearProps: "opacity,visibility,transform,filter,willChange" });
           },
         },
       );
 
       // Content arrives out of focus and settles: blur, a short rise, opacity.
+      // Hidden items wait on opacity alone (a resting blur filter costs paint);
+      // each one gets its own layer only while it animates, so the blur runs
+      // on the compositor instead of repainting under the scroll.
       const items = gsap.utils.toArray<HTMLElement>("[data-reveal]");
-      gsap.set(items, { autoAlpha: 0, y: 24, filter: "blur(12px)" });
+      gsap.set(items, { autoAlpha: 0 });
       ScrollTrigger.batch(items, {
-        start: "top 90%",
+        start: "top 92%",
         once: true,
         onEnter: (batch) =>
-          gsap.to(batch, {
-            autoAlpha: 1,
-            y: 0,
-            filter: "blur(0px)",
-            duration: 0.9,
-            stagger: 0.08,
-            ease: "power3.out",
-            clearProps: "filter,transform",
-          }),
+          gsap.fromTo(
+            batch,
+            { y: 20, filter: "blur(6px)", willChange: "transform, opacity, filter" },
+            {
+              autoAlpha: 1,
+              y: 0,
+              filter: "blur(0px)",
+              duration: 0.7,
+              stagger: 0.06,
+              ease: "power3.out",
+              clearProps: "filter,transform,willChange",
+            },
+          ),
       });
 
       return () => {
