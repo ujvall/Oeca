@@ -1,57 +1,28 @@
-import Image from "next/image";
 import { LICENSE_URL, RELEASES_URL, REPO_URL } from "@/lib/site";
+
+const LINKS = [
+  { href: REPO_URL, label: "GitHub" },
+  { href: "/changelog/", label: "Changelog" },
+  { href: RELEASES_URL, label: "Releases" },
+  { href: "/privacy/", label: "Privacy" },
+  { href: "/code-signing/", label: "Code signing" },
+  { href: LICENSE_URL, label: "License" },
+];
 
 export function Footer() {
   return (
     <footer className="border-t border-line">
-      <div className="shell flex flex-col gap-8 py-10 md:flex-row md:items-start md:justify-between">
-        <div>
-          <div className="flex items-center gap-2.5">
-            <Image src="/media/oeca-icon-64.png" alt="" width={22} height={22} className="size-[22px]" />
-            <span className="text-[1.0625rem] font-semibold tracking-[-0.02em]">Oeca</span>
-          </div>
-          <p className="t-caption mt-4 max-w-md">
-            &copy; 2026 Ujval Sai. Oeca is free and open-source software under the MIT License.
-            Third-party materials keep their own licences: the site and wordmark are set in General Sans by
-            the Indian Type Foundry, via Fontshare, with Geist Mono by Vercel, via Google Fonts, and the in-app icons in these captures of Oeca 0.1.0 are{" "}
-            <a className="link" href="https://www.flaticon.com/uicons">
-              designed by UIcons from Flaticon
-            </a>
-            .
-          </p>
-        </div>
+      <div className="shell flex flex-col gap-6 py-10 md:flex-row md:items-center md:justify-between">
+        <p className="t-caption">&copy; 2026 Ujval Sai. Free and open source under the MIT License.</p>
         <nav aria-label="Footer">
-          <ul className="flex flex-wrap gap-x-6 gap-y-3 text-[0.875rem] text-muted">
-            <li>
-              <a className="transition-colors hover:text-paper" href={REPO_URL}>
-                GitHub
-              </a>
-            </li>
-            <li>
-              <a className="transition-colors hover:text-paper" href="/changelog/">
-                Changelog
-              </a>
-            </li>
-            <li>
-              <a className="transition-colors hover:text-paper" href={RELEASES_URL}>
-                Releases
-              </a>
-            </li>
-            <li>
-              <a className="transition-colors hover:text-paper" href={LICENSE_URL}>
-                MIT License
-              </a>
-            </li>
-            <li>
-              <a className="transition-colors hover:text-paper" href="/privacy/">
-                Privacy policy
-              </a>
-            </li>
-            <li>
-              <a className="transition-colors hover:text-paper" href="/code-signing/">
-                Code signing policy
-              </a>
-            </li>
+          <ul className="flex flex-wrap gap-x-6 gap-y-2 text-[0.875rem] text-muted">
+            {LINKS.map((l) => (
+              <li key={l.label}>
+                <a className="transition-colors hover:text-paper" href={l.href}>
+                  {l.label}
+                </a>
+              </li>
+            ))}
           </ul>
         </nav>
       </div>
