@@ -1,7 +1,6 @@
 "use client";
 
 import { useRef, useState } from "react";
-import { ArrowUpRight, DownloadSimple } from "@phosphor-icons/react";
 import { formatDate, releaseId, type Release, type Upcoming } from "@/lib/releases";
 import { ScrollTrigger, gsap, useGSAP } from "@/lib/gsap";
 
@@ -122,13 +121,11 @@ function ReleaseEntry({ release: r, latest }: { release: Release; latest: boolea
       <div className="mt-10 flex flex-col gap-3 sm:flex-row md:ml-[calc(8rem+1.5rem)]">
         {r.installerUrl && (
           <a className="btn btn-primary btn-sm" href={r.installerUrl}>
-            <DownloadSimple size={16} weight="bold" aria-hidden />
             Download {r.version}
           </a>
         )}
         <a className="btn btn-ghost btn-sm" href={r.url}>
           Release on GitHub
-          <ArrowUpRight size={14} weight="bold" aria-hidden />
         </a>
       </div>
     </article>

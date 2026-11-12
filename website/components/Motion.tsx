@@ -5,6 +5,12 @@ import Lenis from "lenis";
 import "lenis/dist/lenis.css";
 import { MOTION_OK, ScrollTrigger, gsap } from "@/lib/gsap";
 
+declare global {
+  interface Window {
+    __oecaIntro?: boolean;
+  }
+}
+
 /** Page-wide motion: Lenis smooth scrolling driven by GSAP's ticker, smooth
  *  same-page anchor jumps, and a blur-in reveal for every `[data-reveal]`.
  *  Under reduced motion none of it runs: native scrolling, nothing hidden. */
@@ -32,6 +38,30 @@ export function Motion() {
         lenis.scrollTo(target, { offset: -72, duration: 1.1 });
       };
       document.addEventListener("click", onClick);
+
+      // The hero settles on load: hidden before first paint by the gate in
+      // layout.tsx, then the same blur-in as the rest of the page.
+      const intro = gsap.utils.toArray<HTMLElement>("[data-intro]");
+      gsap.fromTo(
+        intro,
+        { autoAlpha: 0, y: 16, filter: "blur(10px)" },
+        {
+          autoAlpha: 1,
+          y: 0,
+          filter: "blur(0px)",
+          duration: 1,
+          delay: 0.05,
+          stagger: 0.08,
+          ease: "power3.out",
+          onStart: () => {
+            window.__oecaIntro = true;
+          },
+          onComplete: () => {
+            document.documentElement.classList.remove("motion");
+            gsap.set(intro, { clearProps: "opacity,visibility,transform,filter" });
+          },
+        },
+      );
 
       // Content arrives out of focus and settles: blur, a short rise, opacity.
       const items = gsap.utils.toArray<HTMLElement>("[data-reveal]");

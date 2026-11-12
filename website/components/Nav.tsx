@@ -3,16 +3,15 @@
 import Image from "next/image";
 import { usePathname } from "next/navigation";
 import { useRef } from "react";
-import { GithubLogo } from "@phosphor-icons/react";
 import { REPO_URL } from "@/lib/site";
 import { ScrollTrigger, useGSAP } from "@/lib/gsap";
 
 // Section links point at the home page, so they work from every route. Plain
-// anchors: two static pages need no client router or RSC prefetching.
+// anchors: static pages need no client router or RSC prefetching.
 const LINKS = [
-  { href: "/#spaces", label: "Spaces", wide: true },
-  { href: "/#built", label: "Under the hood", wide: true },
+  { href: "/#features", label: "Features", wide: true },
   { href: "/changelog/", label: "Changelog", wide: false },
+  { href: REPO_URL, label: "GitHub", wide: true },
 ];
 
 export function Nav() {
@@ -35,13 +34,13 @@ export function Nav() {
   return (
     <header
       ref={ref}
-      className="group fixed inset-x-0 top-0 z-40 border-b border-transparent bg-ink/70 backdrop-blur-md transition-[background-color,border-color] duration-300 [&.is-scrolled]:border-line [&.is-scrolled]:bg-ink/90"
+      className="fixed inset-x-0 top-0 z-40 border-b border-transparent transition-[background-color,border-color] duration-300 [&.is-scrolled]:border-line [&.is-scrolled]:bg-ink/85 [&.is-scrolled]:backdrop-blur-md"
     >
-      <nav aria-label="Main" className="shell flex h-16 items-center gap-4 sm:gap-6">
+      <nav aria-label="Main" className="shell flex h-16 items-center gap-6">
         {/* eslint-disable-next-line @next/next/no-html-link-for-pages -- full page loads by design (see LINKS) */}
         <a href="/" className="-m-2 flex items-center gap-2.5 rounded-lg p-2" aria-label="Oeca home">
-          <Image src="/media/oeca-icon-64.png" alt="" width={26} height={26} className="size-[26px]" />
-          <span className="text-[1.125rem] font-semibold tracking-[-0.02em]">Oeca</span>
+          <Image src="/media/oeca-icon-64.png" alt="" width={24} height={24} className="size-6" />
+          <span className="text-[1.0625rem] font-semibold tracking-[-0.03em]">Oeca</span>
         </a>
 
         <ul className="ml-auto flex items-center gap-6 text-[0.875rem] text-muted">
@@ -61,19 +60,10 @@ export function Nav() {
           })}
         </ul>
 
-        <div className="flex items-center gap-2">
-          <a
-            href={REPO_URL}
-            className="grid size-9 place-items-center rounded-lg text-muted transition-colors hover:bg-white/5 hover:text-paper"
-            aria-label="Oeca on GitHub"
-          >
-            <GithubLogo size={18} weight="regular" aria-hidden />
-          </a>
-          {/* eslint-disable-next-line @next/next/no-html-link-for-pages -- full page loads by design (see LINKS) */}
-          <a href="/#download" className="btn btn-primary btn-sm">
-            Download
-          </a>
-        </div>
+        {/* eslint-disable-next-line @next/next/no-html-link-for-pages -- full page loads by design (see LINKS) */}
+        <a href="/#download" className="btn btn-primary btn-sm">
+          Download
+        </a>
       </nav>
     </header>
   );
