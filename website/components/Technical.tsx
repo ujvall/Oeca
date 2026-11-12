@@ -41,12 +41,14 @@ const STACK = ["Rust 2024", "Win32", "Direct2D", "DirectWrite", "Windows media c
 
 export function Technical() {
   return (
-    <section id="built" className="pt-32 md:pt-44" aria-labelledby="built-title">
-      <div className="shell grid gap-14 lg:grid-cols-12 lg:gap-10">
+    <section id="built" className="rule" aria-labelledby="built-title">
+      <div className="shell">
+      <div className="frame grid gap-14 px-5 py-24 sm:px-8 md:py-32 lg:grid-cols-12 lg:gap-10">
         <div className="lg:col-span-5">
           <div className="lg:sticky lg:top-28">
-            <h2 id="built-title" className="t-title max-w-[12ch]">
-              Built the Windows way.
+            <p className="t-label">Under the hood</p>
+            <h2 id="built-title" className="t-title mt-5 max-w-[12ch]">
+              Built the Windows way
             </h2>
             <p className="t-lead mt-6 max-w-md">
               Oeca is a single Rust executable: no runtime, no UI framework, no web view. The app uses
@@ -54,10 +56,15 @@ export function Technical() {
             </p>
             <ul
               aria-label="Technologies"
-              className="mt-8 flex flex-wrap gap-x-5 gap-y-2 text-[0.9375rem] text-paper"
+              className="mt-8 flex flex-wrap gap-2"
             >
               {STACK.map((s) => (
-                <li key={s}>{s}</li>
+                <li
+                  key={s}
+                  className="t-mono rounded-md px-2 py-1 text-paper/80 shadow-[inset_0_0_0_1px_var(--color-line-strong)]"
+                >
+                  {s}
+                </li>
               ))}
             </ul>
             <a href={REPO_URL} className="link mt-8 inline-block text-[0.9375rem]">
@@ -66,19 +73,20 @@ export function Technical() {
           </div>
         </div>
 
-        <ul className="grid gap-11 lg:col-span-6 lg:col-start-7">
+        <ul className="grid gap-10 lg:col-span-6 lg:col-start-7">
           {FACTS.map((f) => (
             <li key={f.title} className="flex gap-5">
               <span className="squircle">
-                <f.icon size={20} aria-hidden />
+                <f.icon size={18} aria-hidden />
               </span>
               <div>
-                <h3 className="t-heading text-[1.1875rem]">{f.title}</h3>
+                <h3 className="t-heading text-[1.125rem]">{f.title}</h3>
                 <p className="t-body mt-2">{f.body}</p>
               </div>
             </li>
           ))}
         </ul>
+      </div>
       </div>
     </section>
   );

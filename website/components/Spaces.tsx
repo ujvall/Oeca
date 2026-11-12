@@ -17,7 +17,7 @@ const SPACES: Space[] = [
     label: "Home",
     icon: House,
     shot: SHOTS.homeTimer,
-    title: "Everything at once.",
+    title: "Everything at once",
     body: "What’s playing with its controls, a countdown, and the time and date. Set the timer by dragging along its scale, from five seconds to twelve hours, and pause it whenever you like.",
   },
   {
@@ -25,7 +25,7 @@ const SPACES: Space[] = [
     label: "Music",
     icon: MusicNotes,
     shot: SHOTS.music,
-    title: "Whatever is playing.",
+    title: "Whatever is playing",
     body: "Artwork, title and artist from any app that uses the Windows media controls, with play, pause, previous, next and seek. The visualizer takes its colour from the artwork.",
   },
   {
@@ -33,7 +33,7 @@ const SPACES: Space[] = [
     label: "Clipboard",
     icon: ClipboardText,
     shot: SHOTS.clipboard,
-    title: "Your recent copies, kept.",
+    title: "Your recent copies, kept",
     body: "Copied text and images, 5, 10 or 20 at a time. Click one to copy it again, or drag image files onto the notch to add them. History survives a restart and clears when you sign out.",
   },
   {
@@ -41,7 +41,7 @@ const SPACES: Space[] = [
     label: "Settings",
     icon: GearSix,
     shot: SHOTS.settings,
-    title: "Settings, right there.",
+    title: "Settings, right there",
     body: "Always on top and Reduced motion are a click away inside the notch. The full Settings window holds the rest.",
   },
 ];
@@ -117,11 +117,13 @@ export function Spaces() {
   const space = SPACES[active];
 
   return (
-    <section id="spaces" ref={root} className="pt-28 md:pt-40" aria-labelledby="spaces-title">
+    <section id="spaces" ref={root} className="rule" aria-labelledby="spaces-title">
       <div className="shell">
+        <div className="frame px-5 py-24 sm:px-8 md:py-32">
         <div className="mx-auto max-w-2xl text-center">
-          <h2 id="spaces-title" className="t-title">
-            Three spaces, one click apart.
+          <p className="t-label">Spaces</p>
+          <h2 id="spaces-title" className="t-title mt-5">
+            Three spaces, one click apart
           </h2>
           <p className="t-lead mt-5">
             Open the notch and move between Home, Music and Clipboard, with settings a click away. Every view
@@ -133,7 +135,7 @@ export function Spaces() {
           role="tablist"
           aria-label="Oeca spaces"
           onKeyDown={onKey}
-          className="mx-auto mt-12 flex w-fit max-w-full gap-0.5 rounded-full p-1 shadow-[inset_0_0_0_1px_var(--color-line)] sm:gap-1"
+          className="mx-auto mt-12 flex w-fit max-w-full gap-0.5 rounded-xl p-1 shadow-[inset_0_0_0_1px_var(--color-line-strong)] sm:gap-1"
         >
           {SPACES.map((s, i) => {
             const selected = i === active;
@@ -147,14 +149,14 @@ export function Spaces() {
                 aria-controls="space-panel"
                 tabIndex={selected ? 0 : -1}
                 onClick={() => go(i)}
-                className={`flex h-10 items-center gap-1.5 rounded-full px-3.5 text-[0.875rem] font-medium whitespace-nowrap transition-colors duration-200 sm:gap-2 sm:px-4 sm:text-[0.9063rem] ${
-                  selected ? "bg-white/[0.09] text-paper" : "text-muted hover:text-paper"
+                className={`flex h-9 items-center gap-1.5 rounded-lg px-3 text-[0.875rem] font-medium whitespace-nowrap transition-colors duration-200 sm:gap-2 sm:px-3.5 ${
+                  selected ? "bg-surface text-paper shadow-[inset_0_0_0_1px_var(--color-line)]" : "text-muted hover:text-paper"
                 }`}
               >
                 <s.icon
-                  size={18}
+                  size={16}
                   weight={selected ? "fill" : "regular"}
-                  className="hidden sm:block"
+                  className={`hidden sm:block ${selected ? "text-accent" : ""}`}
                   aria-hidden
                 />
                 {s.label}
@@ -176,6 +178,7 @@ export function Spaces() {
           <p className="t-caption mt-8 text-center">
             Captured from Oeca {CAPTURED_VERSION}. The track and clipboard items are examples.
           </p>
+        </div>
         </div>
       </div>
     </section>

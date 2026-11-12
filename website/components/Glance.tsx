@@ -36,11 +36,13 @@ export function Glance() {
   );
 
   return (
-    <section ref={root} className="pt-32 md:pt-44" aria-labelledby="glance-title">
-      <div className="shell grid items-center gap-12 md:grid-cols-12 md:gap-10">
+    <section ref={root} className="rule" aria-labelledby="glance-title">
+      <div className="shell">
+      <div className="frame grid items-center gap-12 px-5 py-24 sm:px-8 md:grid-cols-12 md:gap-10 md:py-32">
         <div className="md:col-span-5">
-          <h2 id="glance-title" className="t-title max-w-[12ch]">
-            Useful even when it&rsquo;s closed.
+          <p className="t-label">At a glance</p>
+          <h2 id="glance-title" className="t-title mt-5 max-w-[12ch]">
+            Useful even when it&rsquo;s closed
           </h2>
           <p className="t-body mt-6 max-w-md">
             The closed notch shows the time, the track&rsquo;s artwork and a visualizer. A running timer joins
@@ -54,7 +56,7 @@ export function Glance() {
         <figure className="md:col-span-7">
           <div
             data-glance-panel
-            className="relative flex aspect-[2/1] items-start justify-center overflow-hidden rounded-[28px] bg-raised shadow-[inset_0_0_0_1px_var(--color-line)]"
+            className="relative flex aspect-[2/1] items-start justify-center overflow-hidden rounded-2xl bg-raised shadow-[inset_0_0_0_1px_var(--color-line-strong)]"
           >
             <Image
               data-glance-shot
@@ -71,6 +73,7 @@ export function Glance() {
             The closed notch with a five-minute timer running.
           </figcaption>
         </figure>
+      </div>
       </div>
     </section>
   );

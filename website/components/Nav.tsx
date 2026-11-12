@@ -35,16 +35,16 @@ export function Nav() {
   return (
     <header
       ref={ref}
-      className="group fixed inset-x-0 top-0 z-40 border-b border-transparent transition-[background-color,border-color] duration-300 [&.is-scrolled]:border-line [&.is-scrolled]:bg-ink/85 [&.is-scrolled]:backdrop-blur-md"
+      className="group fixed inset-x-0 top-0 z-40 border-b border-line bg-ink/70 backdrop-blur-md transition-[background-color] duration-300 [&.is-scrolled]:bg-ink/90"
     >
       <nav aria-label="Main" className="shell flex h-16 items-center gap-4 sm:gap-6">
         {/* eslint-disable-next-line @next/next/no-html-link-for-pages -- full page loads by design (see LINKS) */}
         <a href="/" className="-m-2 flex items-center gap-2.5 rounded-lg p-2" aria-label="Oeca home">
           <Image src="/media/oeca-icon-64.png" alt="" width={26} height={26} className="size-[26px]" />
-          <span className="text-[1.1875rem] font-semibold tracking-[-0.02em]">Oeca</span>
+          <span className="text-[1.125rem] font-semibold tracking-[-0.02em]">Oeca</span>
         </a>
 
-        <ul className="ml-auto flex items-center gap-7 text-[0.9063rem] text-muted">
+        <ul className="ml-auto flex items-center gap-6 text-[0.875rem] text-muted">
           {LINKS.map((l) => {
             const current = path === l.href || path === `${l.href}/`;
             return (
@@ -64,10 +64,10 @@ export function Nav() {
         <div className="flex items-center gap-2">
           <a
             href={REPO_URL}
-            className="grid size-9 place-items-center rounded-full text-muted transition-colors hover:bg-white/5 hover:text-paper"
+            className="grid size-9 place-items-center rounded-lg text-muted transition-colors hover:bg-white/5 hover:text-paper"
             aria-label="Oeca on GitHub"
           >
-            <GithubLogo size={20} weight="regular" aria-hidden />
+            <GithubLogo size={18} weight="regular" aria-hidden />
           </a>
           {/* eslint-disable-next-line @next/next/no-html-link-for-pages -- full page loads by design (see LINKS) */}
           <a href="/#download" className="btn btn-primary btn-sm">

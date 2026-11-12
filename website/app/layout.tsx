@@ -32,7 +32,7 @@ export const metadata: Metadata = {
 };
 
 export const viewport: Viewport = {
-  themeColor: "#0b0b0b",
+  themeColor: "#0b0b0c",
   colorScheme: "dark",
 };
 
@@ -51,6 +51,13 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <link
           rel="stylesheet"
           href="https://api.fontshare.com/v2/css?f[]=general-sans@400,500,600&display=swap"
+        />
+        {/* Geist Mono for versions, dates and labels, via Google Fonts (SIL OFL) */}
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="" />
+        <link
+          rel="stylesheet"
+          href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500&display=swap"
         />
       </head>
       <body>{children}</body>
