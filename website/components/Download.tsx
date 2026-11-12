@@ -1,4 +1,5 @@
-import { ArrowUpRight, WindowsLogo } from "@phosphor-icons/react/dist/ssr";
+import { ArrowUpRight } from "@phosphor-icons/react/dist/ssr";
+import { WindowsMark } from "./WindowsMark";
 import { DOWNLOAD_URL, LICENSE_URL, RELEASES_URL, REQUIREMENTS, VERSION } from "@/lib/site";
 
 export function Download() {
@@ -18,7 +19,7 @@ export function Download() {
           </p>
           <div className="mt-10 flex flex-col gap-3 sm:flex-row">
             <a className="btn btn-primary" href={DOWNLOAD_URL}>
-              <WindowsLogo size={18} weight="fill" aria-hidden />
+              <WindowsMark size={15} />
               Download {VERSION}
             </a>
             <a className="btn btn-ghost group" href={RELEASES_URL}>
