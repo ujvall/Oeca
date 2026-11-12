@@ -1,4 +1,5 @@
-import { ArrowRight, ClipboardText, Clock, MusicNotes, Timer, WindowsLogo } from "@phosphor-icons/react/dist/ssr";
+import { ArrowRight, ClipboardText, Clock, MusicNotes, Timer } from "@phosphor-icons/react/dist/ssr";
+import { WindowsMark } from "./WindowsMark";
 import { DOWNLOAD_URL, REPO_URL, VERSION } from "@/lib/site";
 
 // What lives in the notch, drawn as icons: an emblem, not a capture of the app.
@@ -34,7 +35,7 @@ export function Hero() {
           </p>
           <div data-intro className="mt-10 flex flex-col gap-3 sm:flex-row">
             <a className="btn btn-primary" href={DOWNLOAD_URL}>
-              <WindowsLogo size={18} weight="fill" aria-hidden />
+              <WindowsMark size={15} />
               Download for Windows
             </a>
             <a className="btn btn-ghost group" href={REPO_URL}>
