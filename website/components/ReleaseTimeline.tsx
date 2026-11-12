@@ -47,7 +47,7 @@ export function ReleaseTimeline({ releases }: { releases: Release[] }) {
             Timeline
           </h2>
 
-          <div className="lg:min-h-0 lg:flex-1 lg:overflow-y-auto">
+          <div data-lenis-prevent className="lg:min-h-0 lg:flex-1 lg:overflow-y-auto">
             <ol className="grid gap-0.5 p-2">
               {releases.map((r, i) => {
                 const on = i === active;

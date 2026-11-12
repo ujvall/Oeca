@@ -54,10 +54,12 @@ body {
   border-radius: 6px;
 }
 
-@media (prefers-reduced-motion: no-preference) {
-  html {
-    scroll-behavior: smooth;
-  }
+/* No visible page scrollbar: the page still scrolls by wheel, touch and keys */
+html {
+  scrollbar-width: none;
+}
+html::-webkit-scrollbar {
+  display: none;
 }
 
 @layer components {
@@ -70,15 +72,15 @@ body {
 
   /* Type scale: size, weight, leading and tracking set together */
   .t-display {
-    font-size: clamp(2.5rem, 1.5rem + 4vw, 4.5rem);
-    font-weight: 600;
-    line-height: 1.02;
-    letter-spacing: -0.04em;
-    text-wrap: balance;
+    font-size: clamp(2.125rem, 1.4rem + 2.6vw, 3.5rem);
+    font-weight: 500;
+    line-height: 1.08;
+    letter-spacing: -0.035em;
+    text-wrap: pretty;
   }
   .t-title {
-    font-size: clamp(2rem, 1.5rem + 2vw, 3rem);
-    font-weight: 600;
+    font-size: clamp(1.875rem, 1.4rem + 1.8vw, 2.75rem);
+    font-weight: 500;
     line-height: 1.06;
     letter-spacing: -0.032em;
     text-wrap: balance;
@@ -170,24 +172,14 @@ body {
     font-size: 0.875rem;
   }
 
-  /* The page frame: hairline rails on both sides of the content column,
-     and full-bleed hairlines between sections */
-  .frame {
-    border-inline: 1px solid var(--color-line);
+  /* Section rhythm: one vertical step for every home-page section */
+  .section {
+    padding-block: 5rem;
   }
-  .rule {
-    border-top: 1px solid var(--color-line);
-  }
-
-  /* Hairline grid: cells on the page background, 1px gaps show the lines */
-  .cells {
-    display: grid;
-    gap: 1px;
-    background: var(--color-line);
-    box-shadow: 0 0 0 1px var(--color-line);
-  }
-  .cells > * {
-    background: var(--color-ink);
+  @media (min-width: 48rem) {
+    .section {
+      padding-block: 7rem;
+    }
   }
 
   /* Squircle icon tile: superellipse where supported, close radius elsewhere */

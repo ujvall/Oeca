@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import { SITE_URL } from "@/lib/site";
+import { Motion } from "@/components/Motion";
 import "./globals.css";
 
 const description =
@@ -60,7 +61,10 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500&display=swap"
         />
       </head>
-      <body>{children}</body>
+      <body>
+        {children}
+        <Motion />
+      </body>
     </html>
   );
 }

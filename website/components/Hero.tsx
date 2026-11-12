@@ -75,7 +75,7 @@ export function Hero() {
             },
             onComplete: () => {
               document.documentElement.classList.remove("motion");
-              gsap.set(intro, { clearProps: "opacity,visibility,transform" });
+              gsap.set(intro, { clearProps: "opacity,visibility,transform,filter" });
             },
           })
           .set(opened, { opacity: 1, "--clip": clipToward(shots[1], shots[0], w) }, 0)
@@ -83,8 +83,8 @@ export function Hero() {
           .fromTo(stage, { autoAlpha: 0, y: -10, ...from }, { autoAlpha: 1, y: 0, duration: 0.7 }, 0)
           .fromTo(
             text,
-            { autoAlpha: 0, y: 18, ...from },
-            { autoAlpha: 1, y: 0, duration: 0.9, stagger: 0.08 },
+            { autoAlpha: 0, y: 18, filter: "blur(10px)", ...from },
+            { autoAlpha: 1, y: 0, filter: "blur(0px)", duration: 0.9, stagger: 0.08 },
             0.2,
           )
           .to(opened, { "--clip": clipFull(), duration: SHELL_DURATION, ease: SHELL_EASE }, 1.05)
@@ -105,64 +105,72 @@ export function Hero() {
   return (
     <section id="top" ref={root} className="pt-16">
       <div className="shell">
-        <div className="frame">
-          {/* The notch hangs from the nav's hairline, like the top edge of a screen */}
-          <div data-intro data-intro-stage className="px-4">
-            <NotchStage
-              name="wide"
-              shots={DESKTOP}
-              visible={1}
-              preload
-              sizes="724px"
-              className="hidden cursor-pointer md:block"
-              onClick={toggle}
-              aria-label={label}
-              aria-pressed={open}
-            />
-            <NotchStage
-              name="narrow"
-              shots={MOBILE}
-              visible={1}
-              preload
-              sizes="100vw"
-              className="cursor-pointer md:hidden"
-              onClick={toggle}
-              aria-label={label}
-              aria-pressed={open}
-            />
-          </div>
+        {/* The notch hangs from the top of the page, like the top edge of a screen */}
+        <div data-intro data-intro-stage className="px-4">
+          <NotchStage
+            name="wide"
+            shots={DESKTOP}
+            visible={1}
+            preload
+            sizes="724px"
+            className="hidden cursor-pointer md:block"
+            onClick={toggle}
+            aria-label={label}
+            aria-pressed={open}
+          />
+          <NotchStage
+            name="narrow"
+            shots={MOBILE}
+            visible={1}
+            preload
+            sizes="100vw"
+            className="cursor-pointer md:hidden"
+            onClick={toggle}
+            aria-label={label}
+            aria-pressed={open}
+          />
+        </div>
 
-          <div className="px-5 pt-12 pb-20 text-center sm:px-8 md:pt-16 md:pb-28">
-            <a
-              data-intro
-              data-intro-text
-              href="/changelog/"
-              className="t-mono group inline-flex h-8 items-center gap-2 rounded-lg px-3 text-muted shadow-[inset_0_0_0_1px_var(--color-line-strong)] transition-colors hover:text-paper"
-            >
-              <span aria-hidden className="size-1.5 rounded-[2px] bg-accent" />
-              Oeca {VERSION} is out
-              <ArrowRight size={14} aria-hidden className="transition-transform group-hover:translate-x-0.5" />
-            </a>
-            <h1 data-intro data-intro-text className="t-display mx-auto mt-8 max-w-[16ch]">
-              The top of your screen, put to work
-            </h1>
-            <p data-intro data-intro-text className="t-lead mx-auto mt-6 max-w-[33rem]">
-              A native notch for Windows. The time, what&rsquo;s playing, a countdown and your clipboard
+        <div className="pt-14 pb-8 md:pt-20 md:pb-12">
+          <a
+            data-intro
+            data-intro-text
+            href="/changelog/"
+            className="t-mono group inline-flex h-8 items-center gap-2 rounded-full pr-3 pl-2.5 text-muted shadow-[inset_0_0_0_1px_var(--color-line-strong)] transition-colors hover:bg-white/[0.03] hover:text-paper"
+          >
+            <span aria-hidden className="size-1.5 rounded-full bg-accent" />
+            Oeca {VERSION} is out
+            <ArrowRight
+              size={14}
+              aria-hidden
+              className="transition-transform duration-200 ease-out group-hover:translate-x-0.5"
+            />
+          </a>
+          <h1 data-intro data-intro-text className="t-display mt-7 max-w-[30ch]">
+            The top of your screen, put to work.{" "}
+            <span className="text-muted">
+              A native notch for Windows with the time, what&rsquo;s playing, a countdown and your clipboard
               history, one click away.
-            </p>
-            <div
-              data-intro
-              data-intro-text
-              className="mt-10 flex flex-col items-center justify-center gap-3 sm:flex-row"
-            >
-              <a className="btn btn-primary w-full sm:w-auto" href={DOWNLOAD_URL}>
-                <DownloadSimple size={18} weight="bold" aria-hidden />
-                Download for Windows
-              </a>
-              <a className="btn btn-ghost w-full sm:w-auto" href="#spaces">
-                Explore Oeca
-              </a>
-            </div>
+            </span>
+          </h1>
+          <div data-intro data-intro-text className="mt-10 flex flex-col gap-3 sm:flex-row">
+            <a className="btn btn-primary group w-full sm:w-auto" href={DOWNLOAD_URL}>
+              <DownloadSimple
+                size={18}
+                weight="bold"
+                aria-hidden
+                className="transition-transform duration-200 ease-out group-hover:translate-y-0.5"
+              />
+              Download for Windows
+            </a>
+            <a className="btn btn-ghost group w-full sm:w-auto" href="#spaces">
+              Explore Oeca
+              <ArrowRight
+                size={16}
+                aria-hidden
+                className="text-muted transition-[transform,color] duration-200 ease-out group-hover:translate-x-0.5 group-hover:text-paper"
+              />
+            </a>
           </div>
         </div>
       </div>

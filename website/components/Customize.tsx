@@ -1,3 +1,5 @@
+import { SectionHead } from "./SectionHead";
+
 // Every option here exists in the app: space.rs (OecaSettings), config.rs
 // (AccentChoice, ClipboardCapacity, CollapseDelay), tray.rs, startup.rs.
 const OPTIONS = [
@@ -13,29 +15,20 @@ const OPTIONS = [
 
 export function Customize() {
   return (
-    <section className="rule" aria-labelledby="customize-title">
+    <section className="section" aria-labelledby="customize-title">
       <div className="shell">
-      <div className="frame">
-        <div className="px-5 pt-24 pb-14 sm:px-8 md:pt-32">
-        <p className="t-label">Settings</p>
-        <h2 id="customize-title" className="t-title mt-5 max-w-[16ch]">
-          Set it up the way you work
-        </h2>
-        <p className="t-lead mt-5 max-w-xl">
+        <SectionHead id="customize-title" label="Settings" title="Set it up the way you work">
           Change settings in the notch or in the full Settings window. Oeca saves them and restores them the
           next time it starts.
-        </p>
-
-        </div>
-        <dl className="cells sm:grid-cols-2 lg:grid-cols-4">
+        </SectionHead>
+        <dl className="mt-14 grid gap-x-10 gap-y-10 sm:grid-cols-2 lg:grid-cols-4">
           {OPTIONS.map((o) => (
-            <div key={o.term} className="px-5 py-7 transition-colors hover:bg-raised sm:px-8 lg:px-6">
+            <div key={o.term} data-reveal>
               <dt className="font-medium tracking-[-0.01em]">{o.term}</dt>
               <dd className="t-body mt-2 text-[0.9375rem]">{o.desc}</dd>
             </div>
           ))}
         </dl>
-      </div>
       </div>
     </section>
   );

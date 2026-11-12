@@ -3,6 +3,7 @@
 import { useRef, useState, type KeyboardEvent } from "react";
 import { ClipboardText, GearSix, House, MusicNotes, type Icon } from "@phosphor-icons/react";
 import { NotchStage } from "./NotchStage";
+import { SectionHead } from "./SectionHead";
 import { CAPTURED_VERSION, SHOTS, type Shot } from "@/lib/site";
 import { clipFull, clipToward, stageWidth } from "@/lib/notch";
 import { MOTION_OK, SHELL_DURATION, SHELL_EASE, gsap, useGSAP } from "@/lib/gsap";
@@ -64,6 +65,26 @@ export function Spaces() {
     { scope: root },
   );
 
+  // The selected-tab surface slides between tabs instead of jumping. It is
+  // measured from the tab, so it also follows layout changes on resize.
+  const placePill = useRef<(i: number, animate: boolean) => void>(() => {});
+  useGSAP(
+    () => {
+      const list = root.current!.querySelector<HTMLElement>("[role=tablist]")!;
+      const pill = list.querySelector<HTMLElement>("[data-tab-pill]")!;
+      placePill.current = (i, animate) => {
+        const tab = list.querySelector<HTMLElement>(`#tab-${SPACES[i].id}`)!;
+        const to = { x: tab.offsetLeft, width: tab.offsetWidth };
+        if (animate) gsap.to(pill, { ...to, duration: 0.5, ease: "power3.out", overwrite: true });
+        else gsap.set(pill, { ...to, overwrite: true });
+      };
+      const ro = new ResizeObserver(() => placePill.current(shown.current, false));
+      ro.observe(list);
+      return () => ro.disconnect();
+    },
+    { scope: root },
+  );
+
   /** Grow or shrink from the capture on screen into the chosen one. Every
    *  tween starts from the live value, so rapid clicks redirect smoothly. */
   // contextSafe is applied at click time, so GSAP work stays in the component's context
@@ -72,6 +93,7 @@ export function Spaces() {
       if (next === shown.current) return;
       shown.current = next;
       setActive(next);
+      placePill.current(next, matchMedia(MOTION_OK).matches);
       const imgs = gsap.utils.toArray<HTMLImageElement>("[data-stage=spaces] img", root.current);
       const target = SHOT_LIST[next];
       const animate = matchMedia(MOTION_OK).matches;
@@ -117,68 +139,73 @@ export function Spaces() {
   const space = SPACES[active];
 
   return (
-    <section id="spaces" ref={root} className="rule" aria-labelledby="spaces-title">
+    <section id="spaces" ref={root} className="section" aria-labelledby="spaces-title">
       <div className="shell">
-        <div className="frame px-5 py-24 sm:px-8 md:py-32">
-        <div className="mx-auto max-w-2xl text-center">
-          <p className="t-label">Spaces</p>
-          <h2 id="spaces-title" className="t-title mt-5">
-            Three spaces, one click apart
-          </h2>
-          <p className="t-lead mt-5">
-            Open the notch and move between Home, Music and Clipboard, with settings a click away. Every view
-            below is captured from the app.
-          </p>
-        </div>
+        <SectionHead id="spaces-title" label="Spaces" title="Three spaces, one click apart">
+          Open the notch and move between Home, Music and Clipboard, with settings a click away. Every view
+          below is captured from the app.
+        </SectionHead>
 
-        <div
-          role="tablist"
-          aria-label="Oeca spaces"
-          onKeyDown={onKey}
-          className="mx-auto mt-12 flex w-fit max-w-full gap-0.5 rounded-xl p-1 shadow-[inset_0_0_0_1px_var(--color-line-strong)] sm:gap-1"
-        >
-          {SPACES.map((s, i) => {
-            const selected = i === active;
-            return (
-              <button
-                key={s.id}
-                id={`tab-${s.id}`}
-                type="button"
-                role="tab"
-                aria-selected={selected}
-                aria-controls="space-panel"
-                tabIndex={selected ? 0 : -1}
-                onClick={() => go(i)}
-                className={`flex h-9 items-center gap-1.5 rounded-lg px-3 text-[0.875rem] font-medium whitespace-nowrap transition-colors duration-200 sm:gap-2 sm:px-3.5 ${
-                  selected ? "bg-surface text-paper shadow-[inset_0_0_0_1px_var(--color-line)]" : "text-muted hover:text-paper"
-                }`}
-              >
-                <s.icon
-                  size={16}
-                  weight={selected ? "fill" : "regular"}
-                  className={`hidden sm:block ${selected ? "text-accent" : ""}`}
-                  aria-hidden
-                />
-                {s.label}
-              </button>
-            );
-          })}
-        </div>
-
-        <div id="space-panel" role="tabpanel" aria-labelledby={`tab-${space.id}`} className="mt-10">
-          {/* The screen's top edge: every capture hangs from it, as on the desktop */}
-          <div className="border-t border-line-strong px-1">
-            <NotchStage name="spaces" shots={SHOT_LIST} visible={0} current={active} sizes="724px" />
+        <div data-reveal className="mt-14 flex flex-wrap items-center justify-between gap-4">
+          <div
+            role="tablist"
+            aria-label="Oeca spaces"
+            onKeyDown={onKey}
+            className="relative flex w-fit max-w-full gap-0.5 rounded-xl p-1 shadow-[inset_0_0_0_1px_var(--color-line-strong)] sm:gap-1"
+          >
+            <span
+              aria-hidden
+              data-tab-pill
+              className="absolute top-1 bottom-1 left-0 rounded-lg bg-surface shadow-[inset_0_0_0_1px_var(--color-line)]"
+            />
+            {SPACES.map((s, i) => {
+              const selected = i === active;
+              return (
+                <button
+                  key={s.id}
+                  id={`tab-${s.id}`}
+                  type="button"
+                  role="tab"
+                  aria-selected={selected}
+                  aria-controls="space-panel"
+                  tabIndex={selected ? 0 : -1}
+                  onClick={() => go(i)}
+                  className={`relative flex h-9 items-center gap-1.5 rounded-lg px-3 text-[0.875rem] font-medium whitespace-nowrap transition-colors duration-200 active:scale-[0.97] sm:gap-2 sm:px-3.5 ${
+                    selected ? "text-paper" : "text-muted hover:text-paper"
+                  }`}
+                >
+                  <s.icon
+                    size={16}
+                    weight={selected ? "fill" : "regular"}
+                    className={`hidden transition-colors sm:block ${selected ? "text-accent" : ""}`}
+                    aria-hidden
+                  />
+                  {s.label}
+                </button>
+              );
+            })}
           </div>
-
-          <div data-space-copy className="mx-auto mt-8 max-w-xl text-center">
-            <h3 className="t-heading">{space.title}</h3>
-            <p className="t-body mt-3">{space.body}</p>
-          </div>
-          <p className="t-caption mt-8 text-center">
+          <p className="t-caption hidden md:block">
             Captured from Oeca {CAPTURED_VERSION}. The track and clipboard items are examples.
           </p>
         </div>
+
+        <div id="space-panel" role="tabpanel" aria-labelledby={`tab-${space.id}`} className="mt-6">
+          {/* A slice of desktop: every capture hangs from its top edge */}
+          <div
+            data-reveal
+            className="overflow-hidden rounded-2xl bg-raised px-1 pb-10 shadow-[inset_0_0_0_1px_var(--color-line)]"
+          >
+            <NotchStage name="spaces" shots={SHOT_LIST} visible={0} current={active} sizes="724px" />
+          </div>
+
+          <div data-space-copy className="mt-8 grid gap-3 md:grid-cols-12 md:gap-10">
+            <h3 className="t-heading md:col-span-6">{space.title}</h3>
+            <p className="t-body max-w-xl md:col-span-6">{space.body}</p>
+          </div>
+          <p className="t-caption mt-6 md:hidden">
+            Captured from Oeca {CAPTURED_VERSION}. The track and clipboard items are examples.
+          </p>
         </div>
       </div>
     </section>

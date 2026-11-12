@@ -35,7 +35,7 @@ export function Nav() {
   return (
     <header
       ref={ref}
-      className="group fixed inset-x-0 top-0 z-40 border-b border-line bg-ink/70 backdrop-blur-md transition-[background-color] duration-300 [&.is-scrolled]:bg-ink/90"
+      className="group fixed inset-x-0 top-0 z-40 border-b border-transparent bg-ink/70 backdrop-blur-md transition-[background-color,border-color] duration-300 [&.is-scrolled]:border-line [&.is-scrolled]:bg-ink/90"
     >
       <nav aria-label="Main" className="shell flex h-16 items-center gap-4 sm:gap-6">
         {/* eslint-disable-next-line @next/next/no-html-link-for-pages -- full page loads by design (see LINKS) */}
