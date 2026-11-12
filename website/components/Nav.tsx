@@ -3,6 +3,7 @@
 import Image from "next/image";
 import { usePathname } from "next/navigation";
 import { useRef } from "react";
+import { GithubLogo } from "@phosphor-icons/react";
 import { REPO_URL } from "@/lib/site";
 import { ScrollTrigger, useGSAP } from "@/lib/gsap";
 
@@ -11,7 +12,6 @@ import { ScrollTrigger, useGSAP } from "@/lib/gsap";
 const LINKS = [
   { href: "/#features", label: "Features", wide: true },
   { href: "/changelog/", label: "Changelog", wide: false },
-  { href: REPO_URL, label: "GitHub", wide: true },
 ];
 
 export function Nav() {
@@ -60,6 +60,13 @@ export function Nav() {
           })}
         </ul>
 
+        <a
+          href={REPO_URL}
+          aria-label="Oeca on GitHub"
+          className="-mx-1 grid size-9 place-items-center rounded-full text-muted transition-colors hover:bg-white/[0.06] hover:text-paper"
+        >
+          <GithubLogo size={18} weight="duotone" aria-hidden />
+        </a>
         {/* eslint-disable-next-line @next/next/no-html-link-for-pages -- full page loads by design (see LINKS) */}
         <a href="/#download" className="btn btn-primary btn-sm">
           Download
