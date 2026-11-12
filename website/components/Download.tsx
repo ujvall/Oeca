@@ -28,23 +28,24 @@ export function Download() {
     <section
       id="download"
       ref={root}
-      className="pt-36 pb-28 md:pt-52 md:pb-36"
+      className="rule"
       aria-labelledby="download-title"
     >
-      <div className="shell text-center">
+      <div className="shell">
+      <div className="frame px-5 pt-24 pb-20 text-center sm:px-8 md:pt-32 md:pb-24">
         <Image
           data-download-icon
           src="/media/oeca-icon-256.webp"
           alt=""
-          width={112}
-          height={112}
-          className="mx-auto size-24 md:size-28"
+          width={96}
+          height={96}
+          className="mx-auto size-20 md:size-24"
         />
         <h2 id="download-title" className="t-title mt-10">
-          Get Oeca for Windows.
+          Get Oeca for Windows
         </h2>
         <p className="t-lead mx-auto mt-5 max-w-lg">
-          Version {VERSION}. Free and open source under the{" "}
+          <span className="t-mono text-[0.95em] text-paper">v{VERSION}</span>. Free and open source under the{" "}
           <a className="link" href={LICENSE_URL}>
             MIT License
           </a>
@@ -61,7 +62,7 @@ export function Download() {
           </a>
         </div>
 
-        <dl className="mx-auto mt-20 grid max-w-4xl gap-8 border-t border-line pt-10 text-left sm:grid-cols-3">
+        <dl className="cells mx-auto mt-20 max-w-4xl overflow-hidden rounded-xl text-left sm:grid-cols-3 [&>*]:p-6">
           <div>
             <dt className="text-[0.9375rem] font-medium">Requirements</dt>
             <dd className="t-body mt-1.5 text-[0.9375rem]">{REQUIREMENTS}.</dd>
@@ -84,7 +85,7 @@ export function Download() {
             </dd>
           </div>
         </dl>
-        <p className="t-caption mx-auto mt-10 max-w-4xl text-left">
+        <p className="t-caption mx-auto mt-8 max-w-4xl text-left">
           Oeca makes no network requests unless you check for updates. Read the{" "}
           <a className="link" href="/privacy/">
             Privacy policy
@@ -99,6 +100,7 @@ export function Download() {
           </a>
           .
         </p>
+      </div>
       </div>
     </section>
   );

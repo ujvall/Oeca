@@ -1,9 +1,9 @@
 "use client";
 
 import { useRef, useState } from "react";
-import { DownloadSimple } from "@phosphor-icons/react";
+import { ArrowRight, DownloadSimple } from "@phosphor-icons/react";
 import { NotchStage } from "./NotchStage";
-import { DOWNLOAD_URL, SHOTS } from "@/lib/site";
+import { DOWNLOAD_URL, SHOTS, VERSION } from "@/lib/site";
 import { clipFull, clipToward, stageWidth } from "@/lib/notch";
 import { MOTION_OK, SHELL_DURATION, SHELL_EASE, gsap, useGSAP } from "@/lib/gsap";
 
@@ -104,8 +104,9 @@ export function Hero() {
 
   return (
     <section id="top" ref={root} className="pt-16">
-      <div className="shell pt-3 md:pt-5">
-        <div className="relative overflow-hidden rounded-[28px] bg-raised shadow-[inset_0_0_0_1px_var(--color-line)]">
+      <div className="shell">
+        <div className="frame">
+          {/* The notch hangs from the nav's hairline, like the top edge of a screen */}
           <div data-intro data-intro-stage className="px-4">
             <NotchStage
               name="wide"
@@ -131,9 +132,19 @@ export function Hero() {
             />
           </div>
 
-          <div className="px-5 pt-10 pb-14 text-center sm:px-8 md:pt-12 md:pb-20">
-            <h1 data-intro data-intro-text className="t-display mx-auto max-w-[17ch]">
-              The top of your screen, put to work.
+          <div className="px-5 pt-12 pb-20 text-center sm:px-8 md:pt-16 md:pb-28">
+            <a
+              data-intro
+              data-intro-text
+              href="/changelog/"
+              className="t-mono group inline-flex h-8 items-center gap-2 rounded-lg px-3 text-muted shadow-[inset_0_0_0_1px_var(--color-line-strong)] transition-colors hover:text-paper"
+            >
+              <span aria-hidden className="size-1.5 rounded-[2px] bg-accent" />
+              Oeca {VERSION} is out
+              <ArrowRight size={14} aria-hidden className="transition-transform group-hover:translate-x-0.5" />
+            </a>
+            <h1 data-intro data-intro-text className="t-display mx-auto mt-8 max-w-[16ch]">
+              The top of your screen, put to work
             </h1>
             <p data-intro data-intro-text className="t-lead mx-auto mt-6 max-w-[33rem]">
               A native notch for Windows. The time, what&rsquo;s playing, a countdown and your clipboard
@@ -142,7 +153,7 @@ export function Hero() {
             <div
               data-intro
               data-intro-text
-              className="mt-9 flex flex-col items-center justify-center gap-3 sm:flex-row"
+              className="mt-10 flex flex-col items-center justify-center gap-3 sm:flex-row"
             >
               <a className="btn btn-primary w-full sm:w-auto" href={DOWNLOAD_URL}>
                 <DownloadSimple size={18} weight="bold" aria-hidden />

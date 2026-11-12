@@ -3,8 +3,9 @@ import { LICENSE_URL, RELEASES_URL, REPO_URL } from "@/lib/site";
 
 export function Footer() {
   return (
-    <footer className="border-t border-line">
-      <div className="shell flex flex-col gap-8 py-10 md:flex-row md:items-start md:justify-between">
+    <footer className="rule">
+      <div className="shell">
+      <div className="frame flex flex-col gap-8 px-5 py-10 sm:px-8 md:flex-row md:items-start md:justify-between">
         <div>
           <div className="flex items-center gap-2.5">
             <Image src="/media/oeca-icon-64.png" alt="" width={22} height={22} className="size-[22px]" />
@@ -13,7 +14,7 @@ export function Footer() {
           <p className="t-caption mt-4 max-w-md">
             &copy; 2026 Ujval Sai. Oeca is free and open-source software under the MIT License.
             Third-party materials keep their own licences: the site and wordmark are set in General Sans by
-            the Indian Type Foundry, via Fontshare, and the in-app icons in these captures of Oeca 0.1.0 are{" "}
+            the Indian Type Foundry, via Fontshare, with Geist Mono by Vercel, via Google Fonts, and the in-app icons in these captures of Oeca 0.1.0 are{" "}
             <a className="link" href="https://www.flaticon.com/uicons">
               designed by UIcons from Flaticon
             </a>
@@ -21,7 +22,7 @@ export function Footer() {
           </p>
         </div>
         <nav aria-label="Footer">
-          <ul className="flex flex-wrap gap-x-6 gap-y-3 text-[0.9063rem] text-muted">
+          <ul className="flex flex-wrap gap-x-6 gap-y-3 text-[0.875rem] text-muted">
             <li>
               <a className="transition-colors hover:text-paper" href={REPO_URL}>
                 GitHub
@@ -54,6 +55,7 @@ export function Footer() {
             </li>
           </ul>
         </nav>
+      </div>
       </div>
     </footer>
   );

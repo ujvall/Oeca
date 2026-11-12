@@ -38,17 +38,17 @@ export function ReleaseTimeline({ releases }: { releases: Release[] }) {
       <nav aria-labelledby="release-list-title" className="z-30 mb-10 lg:absolute lg:top-0 lg:bottom-6 lg:left-6 lg:mb-0">
         <div
           style={{ width: RAIL_W }}
-          className="flex flex-col overflow-hidden rounded-2xl bg-[#151515] shadow-[inset_0_0_0_1px_var(--color-line-strong)] lg:sticky lg:top-[7.5rem] lg:h-[min(calc(100dvh-9rem),calc(100%-7.5rem))]"
+          className="flex flex-col overflow-hidden rounded-xl bg-raised shadow-[inset_0_0_0_1px_var(--color-line-strong)] lg:sticky lg:top-[7.5rem] lg:h-[min(calc(100dvh-9rem),calc(100%-7.5rem))]"
         >
           <h2
             id="release-list-title"
-            className="flex h-11 shrink-0 items-center pl-4 text-[0.9375rem] font-normal tracking-[-0.01em]"
+            className="t-mono flex h-11 shrink-0 items-center border-b border-line pl-4 font-normal text-muted"
           >
             Timeline
           </h2>
 
           <div className="lg:min-h-0 lg:flex-1 lg:overflow-y-auto">
-            <ol className="grid gap-1 px-2 pb-2">
+            <ol className="grid gap-0.5 p-2">
               {releases.map((r, i) => {
                 const on = i === active;
                 return (
@@ -56,20 +56,20 @@ export function ReleaseTimeline({ releases }: { releases: Release[] }) {
                     <a
                       href={`#${releaseId(r)}`}
                       aria-current={on ? "location" : undefined}
-                      className="group flex h-9 items-center gap-3 rounded-xl px-2 whitespace-nowrap text-[0.9375rem] transition-colors hover:bg-white/[0.04]"
+                      className={`group flex h-9 items-center gap-3 rounded-lg px-2 whitespace-nowrap transition-colors ${on ? "bg-surface" : "hover:bg-white/[0.04]"}`}
                     >
                       <span
                         aria-hidden
                         className={`block h-px transition-[width,background-color] duration-300 ease-out motion-reduce:transition-none ${
-                          on ? "w-6 bg-paper" : "w-3 bg-paper/30 group-hover:bg-paper"
+                          on ? "w-6 bg-accent" : "w-3 bg-paper/30 group-hover:bg-paper"
                         }`}
                       />
                       <span
-                        className={`tabular-nums ${on ? "text-paper" : "text-muted group-hover:text-paper"}`}
+                        className={`t-mono ${on ? "text-paper" : "text-muted group-hover:text-paper"}`}
                       >
                         <span className="sr-only">Oeca </span>
                         {r.version}
-                        {i === 0 && <sup className="ml-1 text-[0.625rem] text-muted">Latest</sup>}
+                        {i === 0 && <span className="ml-2 text-[0.6875rem] text-accent">Latest</span>}
                       </span>
                     </a>
                   </li>
@@ -99,10 +99,13 @@ export function ReleaseTimeline({ releases }: { releases: Release[] }) {
 function ReleaseEntry({ release: r, latest }: { release: Release; latest: boolean }) {
   return (
     <article aria-labelledby={`${releaseId(r)}-title`}>
-      <div className="flex items-center gap-3 text-[0.875rem] text-muted">
-        <span aria-hidden className="block h-px w-8 bg-paper/40" />
+      <div className="t-mono flex items-center gap-3 text-muted">
         <time dateTime={r.publishedAt}>{formatDate(r.publishedAt)}</time>
-        {latest && <span className="text-paper">Latest</span>}
+        {latest && (
+          <span className="rounded-md px-1.5 py-0.5 text-accent shadow-[inset_0_0_0_1px_rgb(161_169_255/0.35)]">
+            Latest
+          </span>
+        )}
       </div>
 
       <h2
@@ -138,9 +141,10 @@ export function UpcomingEntry({ upcoming: u }: { upcoming: Upcoming }) {
   const id = `v${u.version.replace(/\./g, "-")}-unreleased`;
   return (
     <article aria-labelledby={`${id}-title`} className="mt-12 max-w-3xl border-b border-line pb-12 md:mt-16">
-      <div className="flex items-center gap-3 text-[0.875rem] text-muted">
-        <span aria-hidden className="block h-px w-8 bg-paper/40" />
-        <span className="text-paper">Unreleased</span>
+      <div className="t-mono flex items-center gap-3 text-muted">
+        <span className="rounded-md px-1.5 py-0.5 text-paper shadow-[inset_0_0_0_1px_var(--color-line-strong)]">
+          Unreleased
+        </span>
       </div>
       <h2
         id={`${id}-title`}
@@ -163,11 +167,11 @@ function ReleaseNotes({ notes: r }: { notes: Upcoming }) {
       )}
       {r.sections.map((s) => (
         <section key={s.title} className="grid gap-3 md:grid-cols-[8rem_1fr] md:gap-6">
-          <h3 className="text-[0.9375rem] font-medium">{s.title}</h3>
+          <h3 className="t-mono pt-0.5 text-muted">{s.title}</h3>
           <ul className="grid gap-2.5">
             {s.items.map((item) => (
               <li key={item} className="flex gap-3 text-paper/85">
-                <span aria-hidden className="mt-[0.8em] block h-px w-3 shrink-0 bg-paper/30" />
+                <span aria-hidden className="mt-[0.7em] block size-1 shrink-0 rounded-[1px] bg-paper/35" />
                 {item}
               </li>
             ))}
@@ -176,7 +180,7 @@ function ReleaseNotes({ notes: r }: { notes: Upcoming }) {
       ))}
       {r.notes && r.notes.length > 0 && (
         <section className="grid gap-3 md:grid-cols-[8rem_1fr] md:gap-6">
-          <h3 className="text-[0.9375rem] font-medium text-muted">Notes</h3>
+          <h3 className="t-mono pt-0.5 text-muted">Notes</h3>
           <ul className="grid gap-2.5">
             {r.notes.map((n) => (
               <li key={n} className="t-body text-[0.9688rem]">
