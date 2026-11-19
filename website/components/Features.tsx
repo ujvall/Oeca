@@ -13,17 +13,19 @@ export function Features() {
   return (
     <section id="features" className="section" aria-labelledby="features-title">
       <div className="shell grid gap-12 md:grid-cols-12 md:gap-10">
-        <h2 id="features-title" data-reveal className="t-title max-w-[11ch] md:col-span-5">
+        <h2 id="features-title" data-reveal className="t-title max-w-[11ch] md:col-span-5 md:self-start md:sticky md:top-28">
           Three spaces, one click apart
         </h2>
-        <ul className="grid gap-x-10 gap-y-10 sm:grid-cols-2 md:col-span-7">
+        <ul className="md:col-span-7">
           {FEATURES.map((f) => (
-            <li key={f.title} data-reveal className="group">
-              <span className="icon-tile">
-                <f.icon size={20} weight="duotone" aria-hidden />
-              </span>
-              <h3 className="t-heading mt-5">{f.title}</h3>
-              <p className="t-body mt-2 max-w-[30ch]">{f.body}</p>
+            <li
+              key={f.title}
+              data-reveal
+              className="grid grid-cols-[2.5rem_1fr] gap-x-4 border-t border-line py-7 first:border-t-0 first:pt-0 sm:grid-cols-[2.5rem_9rem_1fr]"
+            >
+              <f.icon size={24} weight="duotone" aria-hidden className="mt-0.5 text-accent/70" />
+              <h3 className="text-[1.375rem] font-semibold tracking-[-0.03em]">{f.title}</h3>
+              <p className="t-body col-start-2 mt-1.5 max-w-[34ch] sm:col-start-3 sm:mt-1">{f.body}</p>
             </li>
           ))}
         </ul>

@@ -16,13 +16,14 @@ export function Technical() {
         <h2 id="built-title" data-reveal className="t-title max-w-[16ch]">
           Built the Windows way
         </h2>
-        <ul className="mt-12 grid gap-x-10 gap-y-10 sm:grid-cols-2 lg:grid-cols-4">
+        <ul
+          data-reveal
+          className="panel mt-12 grid divide-y divide-line sm:grid-cols-2 sm:divide-y-0 lg:grid-cols-4 lg:divide-x"
+        >
           {FACTS.map((f) => (
-            <li key={f.title} data-reveal className="group">
-              <span className="icon-tile">
-                <f.icon size={20} weight="duotone" aria-hidden />
-              </span>
-              <h3 className="t-heading mt-5">{f.title}</h3>
+            <li key={f.title} className="p-7 lg:p-8">
+              <f.icon size={22} weight="duotone" aria-hidden className="text-accent/70" />
+              <h3 className="t-heading mt-6">{f.title}</h3>
               <p className="t-body mt-2">{f.body}</p>
             </li>
           ))}
