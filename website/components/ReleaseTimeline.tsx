@@ -37,7 +37,7 @@ export function ReleaseTimeline({ releases }: { releases: Release[] }) {
       <nav aria-labelledby="release-list-title" className="z-30 mb-10 lg:absolute lg:top-0 lg:bottom-6 lg:left-6 lg:mb-0">
         <div
           style={{ width: RAIL_W }}
-          className="flex flex-col overflow-hidden rounded-xl bg-raised shadow-[inset_0_0_0_1px_var(--color-line-strong)] lg:sticky lg:top-[7.5rem] lg:h-[min(calc(100dvh-9rem),calc(100%-7.5rem))]"
+          className="flex flex-col overflow-hidden rounded-2xl bg-raised shadow-[inset_0_0_0_1px_var(--color-line-strong)] lg:sticky lg:top-[7.5rem] lg:h-[min(calc(100dvh-9rem),calc(100%-7.5rem))]"
         >
           <h2
             id="release-list-title"
@@ -101,7 +101,7 @@ function ReleaseEntry({ release: r, latest }: { release: Release; latest: boolea
       <div className="t-mono flex items-center gap-3 text-muted">
         <time dateTime={r.publishedAt}>{formatDate(r.publishedAt)}</time>
         {latest && (
-          <span className="rounded-md px-1.5 py-0.5 text-accent shadow-[inset_0_0_0_1px_rgb(161_169_255/0.35)]">
+          <span className="rounded-md px-1.5 py-0.5 text-paper shadow-[inset_0_0_0_1px_var(--color-line-strong)]">
             Latest
           </span>
         )}
