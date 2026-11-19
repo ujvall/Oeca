@@ -13,18 +13,18 @@ export function Technical() {
   return (
     <section id="built" className="section" aria-labelledby="built-title">
       <div className="shell">
-        <h2 id="built-title" data-reveal className="t-title max-w-[16ch]">
+        <h2 id="built-title" data-reveal className="t-title">
           Built the Windows way
         </h2>
         <ul
           data-reveal
-          className="panel mt-12 grid divide-y divide-line sm:grid-cols-2 sm:divide-y-0 lg:grid-cols-4 lg:divide-x"
+          className="panel mt-8 grid divide-y divide-line sm:grid-cols-2 sm:divide-y-0 lg:grid-cols-4 lg:divide-x"
         >
           {FACTS.map((f) => (
-            <li key={f.title} className="p-7 lg:p-8">
-              <f.icon size={22} weight="duotone" aria-hidden className="text-accent/70" />
-              <h3 className="t-heading mt-6">{f.title}</h3>
-              <p className="t-body mt-2">{f.body}</p>
+            <li key={f.title} className="p-6">
+              <f.icon size={20} aria-hidden className="text-muted" />
+              <h3 className="t-heading mt-4">{f.title}</h3>
+              <p className="t-body mt-1.5">{f.body}</p>
             </li>
           ))}
         </ul>

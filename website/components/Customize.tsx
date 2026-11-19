@@ -15,17 +15,17 @@ export function Customize() {
   return (
     <section className="section" aria-labelledby="customize-title">
       <div className="shell grid gap-8 md:grid-cols-12 md:gap-10">
-        <h2 id="customize-title" data-reveal className="t-title max-w-[11ch] md:col-span-5">
+        <h2 id="customize-title" data-reveal className="t-title max-w-[12ch] md:col-span-4">
           Set it up the way you work
         </h2>
-        <div data-reveal className="md:col-span-7">
-          <p className="t-lead max-w-xl">
+        <div data-reveal className="md:col-span-8">
+          <p className="t-body max-w-xl">
             Change them in the notch or in Settings, and Oeca keeps them for next time.
           </p>
-          <ul aria-label="Settings" className="mt-8 flex flex-wrap gap-2">
+          <ul aria-label="Settings" className="mt-6 flex flex-wrap gap-2">
             {OPTIONS.map((o) => (
               <li key={o.label} className="chip">
-                <o.icon size={16} weight="duotone" aria-hidden />
+                <o.icon size={16} aria-hidden />
                 {o.label}
               </li>
             ))}

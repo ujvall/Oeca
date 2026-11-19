@@ -5,34 +5,30 @@ import { DOWNLOAD_URL, LICENSE_URL, RELEASES_URL, REQUIREMENTS, VERSION } from "
 
 export function Download() {
   return (
-    <section id="download" className="section" aria-labelledby="download-title">
+    <section id="download" className="section scroll-mt-14" aria-labelledby="download-title">
       <div className="shell">
-        {/* Closes the page the way it opened: the same faint lit edge */}
-        <div
-          data-reveal
-          className="panel relative isolate flex flex-col items-center overflow-hidden px-6 py-16 text-center md:py-24"
-        >
-          <div aria-hidden className="edge-light -z-10" />
-          <Image
-            src="/media/oeca-icon-256.webp"
-            alt=""
-            width={64}
-            height={64}
-            className="size-16 drop-shadow-[0_10px_24px_rgb(161_169_255/0.15)]"
-          />
-          <h2 id="download-title" className="t-title mt-8">
-            Get Oeca for Windows
-          </h2>
-          <p className="t-lead mt-5 max-w-[32rem]">
-            Free and open source under the{" "}
-            <a className="link" href={LICENSE_URL}>
-              MIT License
-            </a>
-            . Installs for your account, with no administrator rights.
-          </p>
-          <div className="mt-10 flex w-full flex-col justify-center gap-3 sm:w-auto sm:flex-row">
+        <div data-reveal className="panel grid gap-8 p-6 md:grid-cols-[1fr_auto] md:items-end md:gap-12 md:p-10">
+          <div>
+            <Image src="/media/oeca-icon-256.webp" alt="" width={48} height={48} className="size-12" />
+            <h2 id="download-title" className="t-title mt-6">
+              Get Oeca for Windows
+            </h2>
+            <p className="t-body mt-3 max-w-[30rem]">
+              Free and open source under the{" "}
+              <a className="link" href={LICENSE_URL}>
+                MIT License
+              </a>
+              . Installs for your account, with no administrator rights. {REQUIREMENTS}. Not code-signed yet, so
+              SmartScreen may ask you to confirm (see the{" "}
+              <a className="link" href="/code-signing/">
+                code signing policy
+              </a>
+              ).
+            </p>
+          </div>
+          <div className="flex flex-col gap-3 sm:flex-row">
             <a className="btn btn-primary" href={DOWNLOAD_URL}>
-              <WindowsMark size={15} />
+              <WindowsMark size={14} />
               Download {VERSION}
             </a>
             <a className="btn btn-ghost group" href={RELEASES_URL}>
@@ -44,13 +40,6 @@ export function Download() {
               />
             </a>
           </div>
-          <p className="t-caption mt-6 max-w-md">
-            {REQUIREMENTS}. Not code-signed yet, so SmartScreen may ask you to confirm. See the{" "}
-            <a className="link" href="/code-signing/">
-              code signing policy
-            </a>
-            .
-          </p>
         </div>
       </div>
     </section>
