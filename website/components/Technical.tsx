@@ -6,7 +6,7 @@ const FACTS = [
   { icon: Cpu, title: "Native", body: "One Rust executable on Win32. No runtime, UI framework or web view." },
   { icon: PaintBrush, title: "Direct2D", body: "Drawn with Direct2D and DirectWrite, with resources cached per DPI." },
   { icon: Lightning, title: "Event-driven", body: "No polling. With nothing playing, it wakes once a minute for the clock." },
-  { icon: LockSimple, title: "Local", body: "Settings and history stay on your PC. No network requests unless you check for updates." },
+  { icon: LockSimple, title: "Local", body: "Settings and history stay on your PC. No network requests unless you turn on updates or Hop." },
 ];
 
 export function Technical() {

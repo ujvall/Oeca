@@ -26,6 +26,42 @@ export type Release = {
 
 export const RELEASES: Release[] = [
   {
+    version: "0.5.0",
+    tag: "v0.5.0",
+    publishedAt: "2026-11-24T17:10:02Z",
+    url: "https://github.com/ujvall/Oeca/releases/tag/v0.5.0",
+    installerUrl: "https://github.com/ujvall/Oeca/releases/download/v0.5.0/Oeca-Setup-0.5.0.exe",
+    summary: "Oeca Hop for sending files between your PC and phone, a Music scrubber, and colours that match the album art.",
+    sections: [
+      {
+        title: "Added",
+        items: [
+          "Oeca Hop: send files between your PC and phone from the new Hop space. On the phone, open oeca-hop.vercel.app: nothing to install. Works with LocalSend too",
+          "Confirm a matching code once and the device is remembered; you approve every transfer, and files land in Downloads\\Oeca Hop and are never opened automatically",
+          "Music scrubber: drag anywhere along the track to seek, with elapsed and remaining time beside it",
+          "Headset volume buttons now show the volume HUD",
+        ],
+      },
+      {
+        title: "Improved",
+        items: [
+          "Music colours now match the album art: the accent and visualizer use the cover's own colour, and a two-colour gradient when the cover has two main colours",
+          "Rounder Music player corners, rounded pause bars, and new Home, Music and Clipboard icons",
+          "Safer clipboard history: atomic, checksummed writes, and Oeca never deletes history it can't prove is its own",
+        ],
+      },
+      {
+        title: "Fixed",
+        items: [
+          "Music accent colours no longer look washed out, and dark covers (deep blue, for example) are lifted so they stay readable",
+        ],
+      },
+    ],
+    notes: [
+      "Hop is off by default and runs only while Oeca is open. When on, it uses LocalSend's public servers to find your devices; files go directly between devices, encrypted, never through a server. Devices must share a network (usually the same Wi-Fi), a VPN on one side can stop them finding each other, and there's no relay, so networks that block direct connections can't transfer.",
+    ],
+  },
+  {
     version: "0.4.0",
     tag: "v0.4.0",
     publishedAt: "2026-11-02T08:28:44Z",

@@ -24,19 +24,20 @@ export const metadata: Metadata = {
 };
 
 // Every statement about the app is checked against its source code: the
-// only network request is the update check (src/update.rs, opt-in or by
-// hand: settings_store.rs `check_for_updates`), storage in
-// clipboard_store.rs and settings_store.rs, Start on launch in startup.rs.
+// network requests are the update check (src/update.rs, opt-in or by hand:
+// settings_store.rs `check_for_updates`) and Oeca Hop (src/nearby.rs, off by
+// default; its notice is `privacy_notice`), storage in clipboard_store.rs,
+// settings_store.rs and nearby*.rs, Start on launch in startup.rs.
 export default function Privacy() {
   return (
     <LegalPage
       title="Privacy policy"
       lead="Oeca is maintained by one person, Ujval Sai. This page explains what the Oeca app, its installer and this website do with information about you."
-      updated={["2026-10-17", "17 October 2026"]}
+      updated={["2026-11-24", "24 November 2026"]}
     >
       <h2>The Oeca app</h2>
       <p>
-        <strong>Oeca makes no network requests unless you ask it to check for updates.</strong> It contains no
+        <strong>Oeca makes no network requests unless you turn on a feature that needs them</strong>: the update check and Oeca Hop, both off by default. It contains no
         telemetry, analytics, advertising or crash reporting, and it does not send anything about you or your PC to
         the developer. You can confirm this in the{" "}
         <a className="link" href={REPO_URL}>
@@ -50,8 +51,39 @@ export default function Privacy() {
         default). Each check is one HTTPS request to GitHub&apos;s public API, <code>api.github.com</code>, with no
         account or personal data; it names Oeca and its version. GitHub receives the usual information about the
         request, such as your IP address. Oeca never downloads or installs anything itself: a newer version only
-        shows a notice that opens its release page. Everything below stays on your PC.
+        shows a notice that opens its release page.
       </p>
+
+      <h3>Oeca Hop</h3>
+      <p>
+        From version 0.5.0, Oeca Hop sends files between your PC and your phone or other devices. It is off until
+        you turn it on in Settings, after a notice that explains the following, and it runs only while Oeca is open.
+      </p>
+      <ul>
+        <li>
+          While Hop is on, your PC connects to LocalSend&apos;s public signaling server{" "}
+          (<code>public.localsend.org</code>) and STUN server (<code>stun.localsend.org</code>), run by the LocalSend
+          project, not by Oeca. Both see your public IP address. The signaling server also sees your PC&apos;s Hop
+          name, its device type and its Hop identity, and passes on connection requests, which carry that identity
+          and your PC&apos;s network addresses.
+        </li>
+        <li>
+          The signaling server lists your PC to every device that shares its public IP address: usually your own
+          network, but on public Wi-Fi, a shared VPN or a mobile network that can include strangers. They can see
+          that your PC is online, its Hop identity and its network addresses before you approve anything.
+        </li>
+        <li>
+          Files go directly between the two devices, encrypted, never through those servers, and nothing is stored
+          online. Nothing is received without your approval. Received files are saved in{" "}
+          <code>Downloads\Oeca Hop</code>, marked as downloaded from the internet, and never opened by Hop.
+        </li>
+        <li>
+          Your PC&apos;s Hop identity (protected with Windows data protection) and the devices you have verified
+          are saved in <code>%LOCALAPPDATA%\Oeca</code>. Resetting the identity in Settings makes your devices
+          verify it again.
+        </li>
+      </ul>
+      <p>Everything below stays on your PC.</p>
 
       <h3>Clipboard history</h3>
       <ul>
@@ -90,9 +122,10 @@ export default function Privacy() {
       <h3>Windows registry</h3>
       <ul>
         <li>
-          <code>HKEY_CURRENT_USER\Software\Oeca\Session</code>: a temporary key that identifies your current
-          sign-in, so the clipboard history is never shown in a later session. Windows removes it when you sign out
-          or restart.
+          Oeca 0.4.0 and earlier: <code>HKEY_CURRENT_USER\Software\Oeca\Session</code>, a temporary key that
+          identifies your current sign-in, so the clipboard history is never shown in a later session. Windows
+          removes it when you sign out or restart. From 0.5.0, Oeca asks Windows for your sign-in instead and
+          stores nothing in the registry for it.
         </li>
         <li>
           Only if you turn on <strong>Start on launch</strong>: an <code>Oeca</code> entry under{" "}
@@ -105,7 +138,7 @@ export default function Privacy() {
       <p>
         Uninstalling Oeca (Settings, Apps, Installed apps) removes the app, its shortcuts and its Start on launch
         entry, and keeps your settings and clipboard history in <code>%LOCALAPPDATA%\Oeca</code>. To remove them
-        too, quit Oeca and delete that folder.
+        too, quit Oeca and delete that folder. Files received with Oeca Hop stay in <code>Downloads\Oeca Hop</code>.
       </p>
 
       <h2>The installer</h2>
