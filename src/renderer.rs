@@ -4326,10 +4326,10 @@ impl Renderer {
                     );
                     surface(track, px(10.0), 0.06);
                     let (mut weight, mut x) = (0.0f32, 0.0f32);
-                    for i in 0..n {
+                    for (i, pill) in l.pills.iter().enumerate().take(n) {
                         let (c, _) = level(H::Chosen(i));
                         weight += c;
-                        x += c * l.pills[i].left;
+                        x += c * pill.left;
                     }
                     if weight > 0.01 {
                         let left = x / weight;
