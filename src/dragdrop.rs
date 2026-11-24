@@ -693,8 +693,8 @@ mod tests {
     struct TempFile(PathBuf);
     impl TempFile {
         fn new(name: &str, bytes: &[u8]) -> Self {
-            let path =
-                std::env::temp_dir().join(format!("oeca-test-{}-{name}", std::process::id()));
+            let path = crate::data_dir::temp_dir()
+                .join(format!("oeca-test-{}-{name}", std::process::id()));
             std::fs::write(&path, bytes).unwrap();
             Self(path)
         }
@@ -741,9 +741,10 @@ mod tests {
         com();
         let renamed = TempFile::new("fake.png", b"this is a text file, not a PNG");
         assert_eq!(decode_image_file(&renamed.0), Err(DropError::Malformed));
-        let missing = std::env::temp_dir().join("oeca-test-does-not-exist.png");
+        let missing = crate::data_dir::temp_dir().join("oeca-test-does-not-exist.png");
         assert_eq!(decode_image_file(&missing), Err(DropError::Unreadable));
-        let dir = std::env::temp_dir().join(format!("oeca-test-{}-folder.png", std::process::id()));
+        let dir = crate::data_dir::temp_dir()
+            .join(format!("oeca-test-{}-folder.png", std::process::id()));
         let _ = std::fs::create_dir(&dir);
         assert_eq!(
             decode_image_file(&dir),

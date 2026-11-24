@@ -4,7 +4,12 @@ use crate::space::Scene;
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::core::{PCWSTR, w};
 
-pub const WINDOW_CLASS_NAME: PCWSTR = w!("OecaWindowClass");
+// A test instance must never find (or be found as) the user's Oeca
+pub const WINDOW_CLASS_NAME: PCWSTR = if crate::data_dir::ISOLATED {
+    w!("OecaTestWindowClass")
+} else {
+    w!("OecaWindowClass")
+};
 pub const WINDOW_TITLE: PCWSTR = w!("Oeca");
 
 // ============================================================================
@@ -30,10 +35,12 @@ pub const BASE_BOTTOM_CORNER_RADIUS: f32 = BASE_COLLAPSED_BOTTOM_CORNER_RADIUS;
 pub const BASE_TOP_TRANSITION_RADIUS: f32 = BASE_COLLAPSED_TOP_TRANSITION_RADIUS;
 pub const BASE_TOP_TRANSITION_HEIGHT: f32 = BASE_COLLAPSED_TOP_TRANSITION_HEIGHT;
 
-// Expanded reference dimensions (600 × 128 logical DIP window: 110 DIP notch + shadow margin horizontal pill, compact smooth shoulder, subtle dropshadow)
+// Expanded reference dimensions (600 Ã— 128 logical DIP window: 110 DIP notch + shadow margin horizontal pill, compact smooth shoulder, subtle dropshadow)
 pub const BASE_EXPANDED_WIDTH: f32 = 600.0;
 pub const BASE_EXPANDED_HEIGHT: f32 = 138.0;
 pub const BASE_EXPANDED_BOTTOM_CORNER_RADIUS: f32 = 18.0;
+/// The Music player's slightly rounder bottom corners (DIP).
+pub const BASE_MUSIC_BOTTOM_CORNER_RADIUS: f32 = 22.0;
 
 /// Expanded bottom corners use a continuous-curvature ("squircle") profile: the
 /// curve starts this much earlier along the wall/bottom edge (fraction of the
@@ -125,7 +132,7 @@ pub const BASE_PADDING_H: f32 = BASE_COLLAPSED_PADDING_H;
 pub const BASE_PADDING_V: f32 = BASE_COLLAPSED_PADDING_V;
 pub const BASE_SPACING: f32 = 8.0;
 
-// ── Typography ──────────────────────────────────────────────────────────
+// â”€â”€ Typography â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 //
 // One typeface for everything, resolved once at run time
 // (`renderer::ui_font`): General Sans from the copy embedded in official
@@ -138,6 +145,24 @@ pub const UI_FONT_CANDIDATES: [(&str, PCWSTR); 3] = [
     ("Satoshi", w!("Satoshi")),
     ("Bahnschrift", w!("Bahnschrift")),
 ];
+/// The second typeface, for reading text (artist, details, labels,
+/// descriptions, buttons): Windows' own UI face, clean and made for small
+/// sizes, so it needs no bundling. Segoe UI stands in where the Variable
+/// family is missing (Windows 10). General Sans stays the display face.
+pub const TEXT_FONT_CANDIDATES: [(&str, PCWSTR); 2] = [
+    ("Segoe UI Variable Text", w!("Segoe UI Variable Text")),
+    ("Segoe UI", w!("Segoe UI")),
+];
+
+/// Which of Oeca's two typefaces a role is set in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Face {
+    /// General Sans (`renderer::ui_font`): numerals and titles.
+    Display,
+    /// Segoe UI Variable Text (`renderer::text_font`): everything read.
+    Text,
+}
+
 /// Last resort when none of the candidates is installed (reported by
 /// `ui_font`, never substituted silently by DirectWrite).
 pub const FONT_FAMILY_FALLBACK_NAME: &str = "Segoe UI Variable Text";
@@ -178,11 +203,12 @@ pub enum TextRole {
     SidebarItemSelected,
 }
 
-/// Size (DIP) and weight (100..900) of a role.
+/// Size (DIP), weight (100..900) and typeface of a role.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TextStyle {
     pub size: f32,
     pub weight: i32,
+    pub face: Face,
 }
 
 impl TextRole {
@@ -205,29 +231,31 @@ impl TextRole {
         Self::SidebarItemSelected,
     ];
 
-    /// Restrained weights: semibold carries emphasis (titles, numerals),
-    /// regular carries reading text, and medium keeps the smallest grey text
-    /// (10-11 DIP) from thinning out on black.
+    /// Two faces, few weights: General Sans (display) for the numerals and
+    /// titles at medium, Segoe UI Variable Text for everything read at
+    /// regular, medium only where a label must stand out (a section
+    /// heading, the selected page). Semibold is kept for the one page title.
     pub fn style(self) -> TextStyle {
-        let (size, weight) = match self {
-            Self::ClockCompact => (BASE_FONT_SIZE_CLOCK, 600),
-            Self::ClockDisplay => (BASE_EXPANDED_FONT_SIZE_TIME, 600),
-            Self::ClockColumn => (BASE_MEDIA_TIME_FONT_SIZE, 600),
-            Self::DateCompact => (BASE_MEDIA_DATE_FONT_SIZE, 500),
-            Self::DateLine => (BASE_EXPANDED_FONT_SIZE_DATE, 400),
-            Self::MediaTitle => (BASE_MEDIA_TITLE_FONT_SIZE, 600),
-            Self::MediaArtist => (BASE_MEDIA_ARTIST_FONT_SIZE, 400),
-            Self::MediaMeta => (BASE_MEDIA_SOURCE_FONT_SIZE, 500),
-            Self::Timestamp => (BASE_MEDIA_TIMELINE_FONT_SIZE, 500),
-            Self::EmptyState => (BASE_MEDIA_ARTIST_FONT_SIZE, 400),
-            Self::PageTitle => (24.0, 600),
-            Self::SectionHeading => (13.0, 600),
-            Self::SettingLabel => (14.0, 400),
-            Self::SettingDescription => (12.0, 400),
-            Self::SidebarItem => (14.0, 400),
-            Self::SidebarItemSelected => (14.0, 600),
+        use Face::{Display, Text};
+        let (size, weight, face) = match self {
+            Self::ClockCompact => (BASE_FONT_SIZE_CLOCK, 500, Display),
+            Self::ClockDisplay => (BASE_EXPANDED_FONT_SIZE_TIME, 500, Display),
+            Self::ClockColumn => (BASE_MEDIA_TIME_FONT_SIZE, 500, Display),
+            Self::DateCompact => (BASE_MEDIA_DATE_FONT_SIZE, 400, Text),
+            Self::DateLine => (BASE_EXPANDED_FONT_SIZE_DATE, 400, Text),
+            Self::MediaTitle => (BASE_MEDIA_TITLE_FONT_SIZE, 500, Display),
+            Self::MediaArtist => (BASE_MEDIA_ARTIST_FONT_SIZE, 400, Text),
+            Self::MediaMeta => (BASE_MEDIA_SOURCE_FONT_SIZE, 400, Text),
+            Self::Timestamp => (BASE_MEDIA_TIMELINE_FONT_SIZE, 400, Text),
+            Self::EmptyState => (BASE_MEDIA_ARTIST_FONT_SIZE, 400, Text),
+            Self::PageTitle => (24.0, 600, Display),
+            Self::SectionHeading => (12.0, 500, Text),
+            Self::SettingLabel => (14.0, 400, Text),
+            Self::SettingDescription => (12.5, 400, Text),
+            Self::SidebarItem => (14.0, 400, Text),
+            Self::SidebarItemSelected => (14.0, 500, Text),
         };
-        TextStyle { size, weight }
+        TextStyle { size, weight, face }
     }
 }
 
@@ -572,6 +600,10 @@ pub const HUD_STRETCH_SPRING: Spring = Spring {
 pub const HUD_RELEASE_TIMER_ID: usize = 1010;
 /// One-shot after Windows' brightness flyout was hidden: was it brightness's?
 pub const HUD_FLYOUT_TIMER_ID: usize = 1013;
+/// One-shot after volume keys were handed back for a press: take them again.
+pub const HUD_KEYS_TIMER_ID: usize = 1014;
+/// One-shot after a volume report: is a hotkey beside it (the keyboard's)?
+pub const HUD_HEADSET_TIMER_ID: usize = 1015;
 /// The bar's empty track, and its fill's opacity while muted.
 pub const COLOR_HUD_TRACK: D2D1_COLOR_F = D2D1_COLOR_F {
     r: 1.0,
@@ -626,6 +658,12 @@ pub const BASE_SPACE_PILL_HEIGHT: f32 = 22.0;
 /// Space icons (Oeca's own house / notes / clipboard, renderer.rs): glyph
 /// box (DIP); the glyphs fill their box edge to edge.
 pub const BASE_SPACE_ICON_SIZE: f32 = 12.0;
+/// The header's drawn glyphs (spaces and the Settings gear): a little under
+/// the icon box, so each sits in its pill with room around it.
+pub const BASE_SPACE_GLYPH_SIZE: f32 = 10.5;
+/// Opacity of the header glyphs away from the highlight (the selected one is
+/// full white): the selection reads by contrast, not by an outline.
+pub const SPACE_GLYPH_IDLE_OPACITY: f32 = 0.5;
 pub const BASE_SPACE_PILL_GAP: f32 = 4.0;
 pub const BASE_SPACE_FONT_SIZE: f32 = 11.0;
 
@@ -635,22 +673,22 @@ pub const BASE_MUSIC_SIDE_INSET: f32 = 16.0;
 /// Music player (DIP): a small cover with title/artist beside it, then a
 /// full-width scrubber row, then larger centred controls. The Music notch
 /// height is derived from these rows.
-pub const BASE_MUSIC_ARTWORK_SIZE: f32 = 40.0;
-pub const BASE_MUSIC_ARTWORK_RADIUS: f32 = 8.0;
-pub const BASE_MUSIC_ARTWORK_GAP: f32 = 12.0;
-pub const BASE_MUSIC_SCRUBBER_GAP: f32 = 6.0;
+pub const BASE_MUSIC_ARTWORK_SIZE: f32 = 48.0;
+pub const BASE_MUSIC_ARTWORK_RADIUS: f32 = 10.0;
+pub const BASE_MUSIC_ARTWORK_GAP: f32 = 14.0;
+pub const BASE_MUSIC_SCRUBBER_GAP: f32 = 9.0;
 pub const BASE_MUSIC_SCRUBBER_HEIGHT: f32 = 14.0;
-pub const BASE_MUSIC_CONTROLS_GAP: f32 = 4.0;
+pub const BASE_MUSIC_CONTROLS_GAP: f32 = 9.0;
 /// Larger transport controls (same icons, scaled up): backdrop diameter, hit
 /// area, gap between hit areas, glyph sizes.
-pub const BASE_MUSIC_CONTROL_VISUAL_SIZE: f32 = 30.0;
+pub const BASE_MUSIC_CONTROL_VISUAL_SIZE: f32 = 36.0;
 pub const BASE_MUSIC_CONTROL_WIDTH: f32 = 44.0;
 pub const BASE_MUSIC_CONTROL_HEIGHT: f32 = 34.0;
-pub const BASE_MUSIC_CONTROL_GAP: f32 = 16.0;
-pub const BASE_MUSIC_ICON_SIZE: f32 = 16.0;
-pub const BASE_MUSIC_PLAY_ICON_SIZE: f32 = 19.0;
+pub const BASE_MUSIC_CONTROL_GAP: f32 = 13.0;
+pub const BASE_MUSIC_ICON_SIZE: f32 = 23.0;
+pub const BASE_MUSIC_PLAY_ICON_SIZE: f32 = 27.0;
 /// Below the controls' hit areas, before the notch's bottom edge.
-pub const BASE_MUSIC_BOTTOM_PAD: f32 = 6.0;
+pub const BASE_MUSIC_BOTTOM_PAD: f32 = 15.0;
 
 /// Music space: scrubber track width the compact Music notch is sized around
 /// (the only Music-specific width input; everything else is existing layout).
@@ -662,7 +700,7 @@ pub const BASE_MUSIC_TIMELINE_TRACK: f32 = 240.0;
 /// newest entries fill the area as a 3 x 2 grid of tiles (older entries stay
 /// in the history, reachable once newer ones are cleared or restored past
 /// them).
-pub const BASE_CLIPBOARD_WIDTH: f32 = 440.0;
+pub const BASE_CLIPBOARD_WIDTH: f32 = 560.0;
 pub const BASE_CLIPBOARD_SIDE_INSET: f32 = 16.0;
 pub const CLIPBOARD_VISIBLE_ROWS: usize = 5;
 /// The tile grid: columns, rows, the gap between tiles, their squircle
@@ -671,16 +709,16 @@ pub const CLIPBOARD_VISIBLE_ROWS: usize = 5;
 pub const CLIPBOARD_TILE_COLUMNS: usize = 3;
 pub const CLIPBOARD_TILES: usize = 6;
 pub const BASE_CLIPBOARD_TILE_GAP: f32 = 8.0;
-pub const BASE_CLIPBOARD_TILE_RADIUS: f32 = 12.0;
-pub const BASE_CLIPBOARD_TILE_PAD: f32 = 8.0;
-pub const BASE_CLIPBOARD_TILE_BUTTON: f32 = 20.0;
-pub const BASE_CLIPBOARD_TILE_INSET: f32 = 3.0;
-pub const BASE_CLIPBOARD_ROW_HEIGHT: f32 = 26.0;
+pub const BASE_CLIPBOARD_TILE_RADIUS: f32 = 14.0;
+pub const BASE_CLIPBOARD_TILE_PAD: f32 = 10.0;
+pub const BASE_CLIPBOARD_TILE_BUTTON: f32 = 18.0;
+pub const BASE_CLIPBOARD_TILE_INSET: f32 = 5.0;
+pub const BASE_CLIPBOARD_ROW_HEIGHT: f32 = 24.0;
 pub const BASE_CLIPBOARD_ROW_GAP: f32 = 2.0;
 pub const BASE_CLIPBOARD_BOTTOM_PAD: f32 = 12.0;
 /// Copy / trash glyphs on each tile, and the header's clear X.
-pub const BASE_CLIPBOARD_ACTION_ICON_SIZE: f32 = 13.0;
-pub const BASE_CLIPBOARD_CLEAR_ICON_SIZE: f32 = 9.0;
+pub const BASE_CLIPBOARD_ACTION_ICON_SIZE: f32 = 11.0;
+pub const BASE_CLIPBOARD_CLEAR_ICON_SIZE: f32 = 8.0;
 /// Tile outline stroke (DIP).
 pub const BASE_CLIPBOARD_ROW_OUTLINE: f32 = 1.0;
 /// Icon button growth at full hover / full press (fractions, additive).
@@ -706,9 +744,9 @@ pub const BASE_SETTINGS_CHEVRON_SIZE: f32 = 8.0;
 pub const CLIPBOARD_PREVIEW_CHARS: usize = 160;
 
 /// Drop page (an image dragged over the notch, DIP): a rounded dashed outline
-/// inset from the notch body, with the inbox glyph centred inside.
+/// inset from the notch body, with the inbox glyph centred inside. Its corner
+/// radius is the notch's bottom radius minus this inset (concentric).
 pub const BASE_DROP_OUTLINE_INSET: f32 = 8.0;
-pub const BASE_DROP_OUTLINE_RADIUS: f32 = 14.0;
 pub const BASE_DROP_OUTLINE_WIDTH: f32 = 1.5;
 /// Dash and gap lengths in stroke widths (round caps add one width to each dash).
 pub const DROP_OUTLINE_DASHES: [f32; 2] = [2.0, 3.5];
@@ -724,28 +762,37 @@ pub const BASE_DROP_MESSAGE_LINE: f32 = 18.0;
 /// action bar (format pills and the primary button) under them.
 pub const BASE_CONVERT_WIDTH: f32 = 400.0;
 pub const BASE_CONVERT_SIDE_INSET: f32 = 16.0;
-pub const BASE_CONVERT_ROW_HEIGHT: f32 = 36.0;
-pub const BASE_CONVERT_ROW_GAP: f32 = 2.0;
-pub const BASE_CONVERT_BAR_GAP: f32 = 8.0;
-pub const BASE_CONVERT_BAR_HEIGHT: f32 = 30.0;
-pub const BASE_CONVERT_BOTTOM_PAD: f32 = 12.0;
+pub const BASE_CONVERT_ROW_HEIGHT: f32 = 44.0;
+pub const BASE_CONVERT_ROW_GAP: f32 = 0.0;
+pub const BASE_CONVERT_BAR_GAP: f32 = 12.0;
+pub const BASE_CONVERT_BAR_HEIGHT: f32 = 36.0;
+pub const BASE_CONVERT_BOTTOM_PAD: f32 = 16.0;
 /// A row's check box, its file glyph, and the round buttons at its end.
-pub const BASE_CONVERT_CHECK_SIZE: f32 = 16.0;
-pub const BASE_CONVERT_FILE_ICON: f32 = 16.0;
+pub const BASE_CONVERT_CHECK_SIZE: f32 = 18.0;
+pub const BASE_CONVERT_FILE_ICON: f32 = 15.0;
+/// The soft tile behind a row's file glyph (DIP).
+pub const BASE_CONVERT_FILE_TILE: f32 = 28.0;
 pub const BASE_CONVERT_ROW_BUTTON: f32 = 22.0;
-/// Format pills and the primary button (DIP wide).
-pub const BASE_CONVERT_PILL_WIDTH: f32 = 38.0;
-pub const BASE_CONVERT_PILL_GAP: f32 = 4.0;
+/// The format selector's segments (one track, no gaps between them) and the
+/// primary button (DIP wide). Every control in the workspace is
+/// `BASE_CONVERT_CONTROL_HEIGHT` tall with fully round ends; the bar's track
+/// and the primary button share the bar's height.
+pub const BASE_CONVERT_PILL_WIDTH: f32 = 42.0;
+pub const BASE_CONVERT_CONTROL_HEIGHT: f32 = 28.0;
+/// The format selector's track padding round its segments (DIP).
+pub const BASE_CONVERT_TRACK_PAD: f32 = 2.0;
+/// Button and chip labels (DIP).
+pub const BASE_CONTROL_FONT_SIZE: f32 = 12.0;
 pub const BASE_CONVERT_PRIMARY_WIDTH: f32 = 96.0;
-/// A toolbar chip (quality, background) and a round toolbar button.
-pub const BASE_CONVERT_CHIP_WIDTH: f32 = 54.0;
+/// The toolbar chips ("Quality 90", the background swatch and name).
+pub const BASE_CONVERT_CHIP_WIDTHS: [f32; 2] = [84.0, 72.0];
 
-/// Inline scrubber in the controls row: `[controls]  0:49 ━━━●── -2:08`.
+/// Inline scrubber in the controls row: `[controls]  0:49 â”â”â”â—â”€â”€ -2:08`.
 pub const BASE_MEDIA_TIMELINE_LEAD: f32 = 4.0;
 pub const BASE_MEDIA_TIMELINE_LABEL_WIDTH: f32 = 28.0;
 pub const BASE_MEDIA_TIMELINE_LABEL_GAP: f32 = 4.0;
-pub const BASE_MEDIA_TIMELINE_TRACK: f32 = 5.0;
-pub const BASE_MEDIA_TIMELINE_FONT_SIZE: f32 = 10.0;
+pub const BASE_MEDIA_TIMELINE_TRACK: f32 = 6.0;
+pub const BASE_MEDIA_TIMELINE_FONT_SIZE: f32 = 10.5;
 /// Narrowest track worth drawing; below this the scrubber is omitted.
 pub const BASE_MEDIA_TIMELINE_MIN_TRACK: f32 = 24.0;
 pub const BASE_SEPARATOR_MARGIN_TOP: f32 = 6.0;
@@ -915,6 +962,10 @@ pub const COLOR_SPACE_PILL_SELECTED: D2D1_COLOR_F = D2D1_COLOR_F {
     b: 1.0,
     a: 0.13,
 };
+
+/// Raised-surface edge (white alpha): one quiet hairline round pills, tiles,
+/// buttons and switches in place of flat grey outlines.
+pub const EDGE_LIGHT: f32 = 0.12;
 
 /// Drop page outline (dashes) and inbox glyph.
 pub const COLOR_DROP_OUTLINE: D2D1_COLOR_F = D2D1_COLOR_F {
@@ -1456,6 +1507,20 @@ pub const COLLAPSE_SPRING: Spring = Spring {
     zeta: 1.0,
     response: 0.28,
 };
+/// The dragged playhead following the pointer: quick enough to keep up with
+/// fast back-and-forth drags, a touch under-damped so it carries its
+/// momentum and settles with a hint of overshoot (weight, not rubber).
+pub const SCRUB_SPRING: Spring = Spring {
+    zeta: 0.85,
+    response: 0.11,
+};
+/// The scrubber's grip (the bar thickening while held): critically damped.
+pub const SCRUB_GRIP_SPRING: Spring = Spring {
+    zeta: 1.0,
+    response: 0.18,
+};
+/// How much thicker the scrubber's bar gets while held (x its thickness).
+pub const SCRUB_GRIP_GROWTH: f32 = 0.5;
 /// Space switch (and the content blend): critically damped, calm shell.
 pub const SPACE_SPRING: Spring = Spring {
     zeta: 1.0,
@@ -1592,7 +1657,17 @@ pub fn geometry_for(state: NotchState, size: (f32, f32)) -> Geometry {
     let (w, h, top_r, top_h, bot_r) = reference_geometry_for_state(state);
     match state {
         NotchState::Collapsed => [w, h, top_r, top_h, bot_r],
-        NotchState::Expanded => [size.0, size.1, top_r, top_h, bot_r],
+        NotchState::Expanded => {
+            // ponytail: the Music space is recognised by its unique width
+            // (384 DIP); pass the space here if another one needs its own
+            let music = crate::layout::expanded_width(crate::space::OecaSpace::Music);
+            let bot_r = if (size.0 - music).abs() < 0.5 {
+                BASE_MUSIC_BOTTOM_CORNER_RADIUS
+            } else {
+                bot_r
+            };
+            [size.0, size.1, top_r, top_h, bot_r]
+        }
     }
 }
 
@@ -3523,9 +3598,19 @@ mod tests {
     const MUSIC: (f32, f32) = (384.0, 158.0);
 
     fn settled(dpi: u32, size: (f32, f32)) -> NotchDimensions {
-        NotchDimensions::from_state_and_dpi(NotchState::Expanded, dpi)
+        let d = NotchDimensions::from_state_and_dpi(NotchState::Expanded, dpi)
             .with_width_dip(size.0)
-            .with_height_dip(size.1)
+            .with_height_dip(size.1);
+        // The space's own bottom radius (Music is rounder)
+        let r = geometry_for(NotchState::Expanded, size)[4] * d.scale;
+        NotchDimensions {
+            corner_radius: r,
+            curvature: HardwareNotchCurvature {
+                bottom_radius: r,
+                ..d.curvature
+            },
+            ..d
+        }
     }
 
     #[test]
@@ -3549,11 +3634,14 @@ mod tests {
                 );
                 while anim.step(12.0) {
                     let d = anim.current_dimensions(dpi);
-                    // Only the window size moves: margins, radii, shoulders, padding stay
+                    // Only the window size and the bottom radius move:
+                    // margins, shoulders, padding stay
                     assert_eq!(
                         NotchDimensions {
                             width: home.width,
                             height: home.height,
+                            corner_radius: home.corner_radius,
+                            curvature: home.curvature,
                             ..d
                         },
                         home,

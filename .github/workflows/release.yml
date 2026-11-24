@@ -56,6 +56,11 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+      # THIRD-PARTY-NOTICES.txt must list every crate Nearby compiles in, with
+      # its license texts: regenerate it with tools/nearby_notices.py if this fails
+      - name: Check third-party notices
+        run: python tools/nearby_notices.py --check
+
       - name: Build release executable
         run: cargo build --release --locked
 

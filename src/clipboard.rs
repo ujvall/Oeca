@@ -217,7 +217,11 @@ pub enum ClipboardError {
 }
 
 /// Starts clipboard change notifications (`WM_CLIPBOARDUPDATE`) for `hwnd`.
+/// Never in a test build: it would record what the user copies.
 pub fn start_listening(hwnd: HWND) -> bool {
+    if crate::data_dir::ISOLATED {
+        return false;
+    }
     unsafe { AddClipboardFormatListener(hwnd).is_ok() }
 }
 
@@ -305,6 +309,10 @@ pub fn read(owner: HWND) -> Result<ClipboardItem, ClipboardError> {
 /// it is freed. The clipboard is closed before this returns.
 #[allow(dead_code)]
 pub fn write(owner: HWND, item: &ClipboardItem) -> Result<(), ClipboardError> {
+    // It would replace the user's clipboard, and their Oeca would record it
+    if crate::data_dir::TEST_INSTANCE {
+        return Err(ClipboardError::WriteFailed);
+    }
     let (format, bytes) = match item {
         ClipboardItem::Text(t) => {
             let mut bytes: Vec<u8> = t.encode_utf16().flat_map(u16::to_le_bytes).collect();
@@ -895,10 +903,15 @@ mod tests {
     }
 
     /// Real clipboard (run explicitly: `cargo test clipboard_live -- --ignored`).
-    /// Overwrites the user's clipboard.
+    /// Overwrites the user's clipboard (which a running Oeca then records), so
+    /// a blanket `--ignored` does not run it: set OECA_ALLOW_CLIPBOARD_OVERWRITE=1.
     #[test]
     #[ignore]
     fn clipboard_live_write_read_and_busy_failure() {
+        if std::env::var_os("OECA_ALLOW_CLIPBOARD_OVERWRITE").is_none_or(|v| v != "1") {
+            eprintln!("skipped: would overwrite the user's clipboard");
+            return;
+        }
         use windows::Win32::UI::WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE,
         };

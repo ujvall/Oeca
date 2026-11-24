@@ -1,0 +1,20 @@
+{
+  "index": {
+    "seo": {
+      "title": "LocalSend Web",
+      "description": "브라우저와 LocalSend를 실행하는 다른 장치 간에 파일을 공유하세요."
+    },
+    "connecting": "연결 중...",
+    "empty": {
+      "title": "다른 장치에서 LocalSend를 실행하세요.",
+      "deviceHint": "다른 브라우저에서 이 사이트를 여세요. 네이티브 앱 지원은 향후 버전에서 추가될 예정입니다.",
+      "lanHint": "동일 네트워크에 있는 장치만 표시됩니다."
+    },
+    "you": "당신은:",
+    "enterAlias": "이름 입력",
+    "progress": {
+      "titleSending": "파일 전송중...",
+      "titleReceiving": "파일 받는중..."
+    }
+  }
+}

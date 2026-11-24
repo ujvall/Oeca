@@ -1,0 +1,21 @@
+{
+  "index": {
+    "seo": {
+      "title": "Oeca Hop",
+      "description": "Send files between this browser and your Windows PC with Oeca Hop. Works with LocalSend too."
+    },
+    "connecting": "Connecting...",
+    "webCryptoNotSupported": "Your browser does not support LocalSend: Web Crypto API is required.",
+    "empty": {
+      "title": "Open LocalSend on another device.",
+      "deviceHint": "Open this site in another browser. Support for the native app will be added in a future version.",
+      "lanHint": "Only devices in the same network are shown."
+    },
+    "you": "You are:",
+    "enterAlias": "Enter name",
+    "progress": {
+      "titleSending": "Sending files...",
+      "titleReceiving": "Receiving files..."
+    }
+  }
+}

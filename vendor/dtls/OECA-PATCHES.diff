@@ -1,0 +1,157 @@
+diff --git a/vendor/dtls/src/curve/named_curve.rs b/vendor/dtls/src/curve/named_curve.rs
+index 6d7d97f..db2e33c 100644
+--- a/vendor/dtls/src/curve/named_curve.rs
++++ b/vendor/dtls/src/curve/named_curve.rs
+@@ -35,6 +35,31 @@ pub struct NamedCurveKeypair {
+     pub(crate) private_key: NamedCurvePrivateKey,
+ }
+ 
++/// oeca: the only key-exchange curve this copy uses. P-256 and P-384 key
++/// exchange run through crypto-bigint (RUSTSEC-2026-0387, a timing advisory),
++/// and either side could otherwise pick one: the client by listing it first,
++/// the server by choosing it. Browsers and webrtc-rs all offer X25519.
++pub const KEY_EXCHANGE_CURVES: [NamedCurve; 1] = [NamedCurve::X25519];
++
++/// oeca: what this side lists in its hello. In DTLS 1.2 the list also names
++/// the curves of the ECDSA certificates a peer may use, and every WebRTC
++/// certificate here is ECDSA P-256: without P-256 listed, Chrome refuses the
++/// handshake (checked). P-256 is listed for the certificates only: the key
++/// exchange is still X25519 (choose_curve, accept_curve), and certificate
++/// signatures do not use crypto-bigint.
++pub const OFFERED_CURVES: [NamedCurve; 2] = [NamedCurve::X25519, NamedCurve::P256];
++
++/// oeca: the server's key-exchange curve among the client's: X25519, or none
++/// (the handshake then fails), whatever the client prefers.
++pub fn choose_curve(offered: &[NamedCurve]) -> Option<NamedCurve> {
++    offered.iter().copied().find(|c| KEY_EXCHANGE_CURVES.contains(c))
++}
++
++/// oeca: whether a client goes on with the key-exchange curve the server chose.
++pub fn accept_curve(chosen: NamedCurve) -> bool {
++    KEY_EXCHANGE_CURVES.contains(&chosen)
++}
++
+ fn elliptic_curve_keypair(curve: NamedCurve) -> Result<NamedCurveKeypair> {
+     let (public_key, private_key) = match curve {
+         NamedCurve::P256 => {
+@@ -81,3 +106,26 @@ impl NamedCurve {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod oeca_tests {
++    use super::*;
++
++    #[test]
++    fn only_x25519_is_negotiated() {
++        // A client that prefers P-256 (or offers nothing else) gets X25519 or nothing
++        assert_eq!(choose_curve(&[NamedCurve::P256, NamedCurve::X25519, NamedCurve::P384]), Some(NamedCurve::X25519));
++        assert_eq!(choose_curve(&[NamedCurve::P256]), None);
++        assert_eq!(choose_curve(&[NamedCurve::P384, NamedCurve::P256]), None);
++        assert_eq!(choose_curve(&[NamedCurve::Unsupported]), None);
++        assert_eq!(choose_curve(&[]), None);
++        // A server that chooses P-256 or P-384 is refused
++        assert!(accept_curve(NamedCurve::X25519));
++        assert!(!accept_curve(NamedCurve::P256));
++        assert!(!accept_curve(NamedCurve::P384));
++        assert!(!accept_curve(NamedCurve::Unsupported));
++        // Listed: X25519 first, and P-256 for the certificates only
++        assert_eq!(OFFERED_CURVES, [NamedCurve::X25519, NamedCurve::P256]);
++        assert_eq!(choose_curve(&OFFERED_CURVES), Some(NamedCurve::X25519));
++    }
++}
+diff --git a/vendor/dtls/src/flight/flight0.rs b/vendor/dtls/src/flight/flight0.rs
+index 55805da..3d6d3b1 100644
+--- a/vendor/dtls/src/flight/flight0.rs
++++ b/vendor/dtls/src/flight/flight0.rs
+@@ -8,7 +8,7 @@ use super::flight2::*;
+ use super::*;
+ use crate::config::*;
+ use crate::conn::*;
+-use crate::curve::named_curve::NamedCurve;
++use crate::curve::named_curve::choose_curve;
+ use crate::error::Error;
+ use crate::extension::*;
+ use crate::handshake::*;
+@@ -112,10 +112,17 @@ impl Flight for Flight0 {
+                                 Some(Error::ErrNoSupportedEllipticCurves),
+                             ));
+                         }
+-                        for curve in e.elliptic_curves.iter() {
+-                            if curve != &NamedCurve::Unsupported {
+-                                state.named_curve = *curve;
+-                                break;
++                        // oeca: X25519 or nothing, whatever the client prefers
++                        match choose_curve(&e.elliptic_curves) {
++                            Some(curve) => state.named_curve = curve,
++                            None => {
++                                return Err((
++                                    Some(Alert {
++                                        alert_level: AlertLevel::Fatal,
++                                        alert_description: AlertDescription::InsufficientSecurity,
++                                    }),
++                                    Some(Error::ErrNoSupportedEllipticCurves),
++                                ));
+                             }
+                         }
+                     }
+diff --git a/vendor/dtls/src/flight/flight1.rs b/vendor/dtls/src/flight/flight1.rs
+index 0cb37e6..c36e51a 100644
+--- a/vendor/dtls/src/flight/flight1.rs
++++ b/vendor/dtls/src/flight/flight1.rs
+@@ -142,7 +142,8 @@ impl Flight for Flight1 {
+         if cfg.local_psk_callback.is_none() {
+             extensions.extend_from_slice(&[
+                 Extension::SupportedEllipticCurves(ExtensionSupportedEllipticCurves {
+-                    elliptic_curves: vec![NamedCurve::P256, NamedCurve::X25519, NamedCurve::P384],
++                    // oeca: X25519 for the key exchange, P-256 for the certificates (OFFERED_CURVES)
++                    elliptic_curves: OFFERED_CURVES.to_vec(),
+                 }),
+                 Extension::SupportedPointFormats(ExtensionSupportedPointFormats {
+                     point_formats: vec![ELLIPTIC_CURVE_POINT_FORMAT_UNCOMPRESSED],
+diff --git a/vendor/dtls/src/flight/flight3.rs b/vendor/dtls/src/flight/flight3.rs
+index d84e3bd..f061e03 100644
+--- a/vendor/dtls/src/flight/flight3.rs
++++ b/vendor/dtls/src/flight/flight3.rs
+@@ -361,7 +361,8 @@ impl Flight for Flight3 {
+         if cfg.local_psk_callback.is_none() {
+             extensions.extend_from_slice(&[
+                 Extension::SupportedEllipticCurves(ExtensionSupportedEllipticCurves {
+-                    elliptic_curves: vec![NamedCurve::P256, NamedCurve::X25519, NamedCurve::P384],
++                    // oeca: X25519 for the key exchange, P-256 for the certificates (OFFERED_CURVES)
++                    elliptic_curves: OFFERED_CURVES.to_vec(),
+                 }),
+                 Extension::SupportedPointFormats(ExtensionSupportedPointFormats {
+                     point_formats: vec![ELLIPTIC_CURVE_POINT_FORMAT_UNCOMPRESSED],
+@@ -433,6 +434,16 @@ pub(crate) fn handle_server_key_exchange(
+         state.identity_hint.clone_from(&h.identity_hint);
+         state.pre_master_secret = prf_psk_pre_master_secret(&psk);
+     } else {
++        // oeca: the server chose the curve: anything but X25519 ends the handshake
++        if !accept_curve(h.named_curve) {
++            return Err((
++                Some(Alert {
++                    alert_level: AlertLevel::Fatal,
++                    alert_description: AlertDescription::InsufficientSecurity,
++                }),
++                Some(Error::ErrNoSupportedEllipticCurves),
++            ));
++        }
+         let local_keypair = match h.named_curve.generate_keypair() {
+             Ok(local_keypair) => local_keypair,
+             Err(err) => {
+diff --git a/vendor/dtls/src/flight/flight4.rs b/vendor/dtls/src/flight/flight4.rs
+index 11a77ff..dd98de9 100644
+--- a/vendor/dtls/src/flight/flight4.rs
++++ b/vendor/dtls/src/flight/flight4.rs
+@@ -524,7 +524,8 @@ impl Flight for Flight4 {
+         if cfg.local_psk_callback.is_none() {
+             extensions.extend_from_slice(&[
+                 Extension::SupportedEllipticCurves(ExtensionSupportedEllipticCurves {
+-                    elliptic_curves: vec![NamedCurve::P256, NamedCurve::X25519, NamedCurve::P384],
++                    // oeca: X25519 for the key exchange, P-256 for the certificates (OFFERED_CURVES)
++                    elliptic_curves: OFFERED_CURVES.to_vec(),
+                 }),
+                 Extension::SupportedPointFormats(ExtensionSupportedPointFormats {
+                     point_formats: vec![ELLIPTIC_CURVE_POINT_FORMAT_UNCOMPRESSED],

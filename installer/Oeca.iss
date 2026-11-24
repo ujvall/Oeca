@@ -1,8 +1,9 @@
 ; Oeca Windows installer. Requires Inno Setup 6.7.0 or later: the dark style
 ; (6.6.0) plus hidebevels and WizardBackColor (6.7.0); built with 6.7.3.
 ;
-; Build the release executable first, then compile this script:
-;   cargo build --release --locked
+; Build the release executable first, then compile this script (tools/release.ps1
+; is `cargo build --release --locked` without this computer's folders in the exe):
+;   tools\release.ps1   (the README says how to run it)
 ;   "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" installer\Oeca.iss
 ; Output: target\installer\Oeca-Setup.exe
 ;
@@ -36,7 +37,7 @@
 #define AppExe       AddBackslash(SourcePath) + "..\target\release\" + AppExeName
 
 #if !FileExists(AppExe)
-  #error "target\release\Oeca.exe not found: run `cargo build --release --locked` first"
+  #error "target\release\Oeca.exe not found: run tools\release.ps1 first"
 #endif
 
 ; Refuse to package a stale build: the executable must be at least as new as
@@ -47,7 +48,7 @@
 #define Newer(str A, str B) Int(Copy(A, 1, 8)) > Int(Copy(B, 1, 8)) || (Int(Copy(A, 1, 8)) == Int(Copy(B, 1, 8)) && Int(Copy(A, 9, 6)) > Int(Copy(B, 9, 6)))
 #define ExeStamp Stamp(AppExe)
 #define Repo AddBackslash(SourcePath) + "..\"
-#define CheckInput(str F) Newer(Stamp(Repo + F), ExeStamp) ? Error("target\release\Oeca.exe is older than " + F + ": run `cargo build --release --locked` first") : 0
+#define CheckInput(str F) Newer(Stamp(Repo + F), ExeStamp) ? Error("target\release\Oeca.exe is older than " + F + ": run tools\release.ps1 first") : 0
 #define FindHandle
 #define FindResult
 #sub CheckSource

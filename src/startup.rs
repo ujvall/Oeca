@@ -18,9 +18,16 @@ use windows::Win32::System::Registry::{
 };
 use windows::core::{PCWSTR, w};
 
+#[cfg(not(any(test, debug_assertions)))]
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+#[cfg(not(any(test, debug_assertions)))]
 const APPROVED_KEY: PCWSTR =
     w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run");
+// Tests and test instances never touch the user's autostart entry
+#[cfg(any(test, debug_assertions))]
+const RUN_KEY: PCWSTR = w!("Software\\Oeca-Test\\Run");
+#[cfg(any(test, debug_assertions))]
+const APPROVED_KEY: PCWSTR = w!("Software\\Oeca-Test\\StartupApproved");
 const VALUE: PCWSTR = w!("Oeca");
 
 /// The `Run` command for `exe`: its path in quotes (spaces are safe).
@@ -226,8 +233,8 @@ mod tests {
         assert!(is_active(Some(cmd), Some(&[]), present));
     }
 
-    /// The real per-user Run entry (run explicitly: `cargo test startup_live
-    /// -- --ignored`). Registers the test executable, checks it, removes it,
+    /// A Run-style entry under the test-only key (run explicitly: `cargo test
+    /// startup_live -- --ignored`). Registers the test executable, checks it, removes it,
     /// and restores whatever was there before.
     #[test]
     #[ignore]

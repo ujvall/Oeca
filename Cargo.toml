@@ -1,6 +1,6 @@
 [package]
 name = "Oeca"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 license = "MIT"
 
@@ -40,10 +40,14 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Imaging",
     "Win32_Graphics_Dwm",
     "Win32_System_Variant",
-    # Session-scoped clipboard history: the volatile session key and the
-    # logon session id (clipboard_store.rs)
+    # Start on launch (startup.rs)
     "Win32_System_Registry",
+    # Session-scoped clipboard history: the Windows sign-in (clipboard_store.rs)
     "Win32_Security",
+    "Win32_Security_Authentication_Identity",
+    "Win32_System_RemoteDesktop",
+    # The data folder's physical path, checked before any write (data_dir.rs)
+    "Win32_Storage_FileSystem",
     # Single instance (a per-session named mutex), and the animation frame
     # clock (a thread-pool timer): window.rs
     "Win32_System_Threading",
@@ -52,10 +56,18 @@ windows = { version = "0.62.2", features = [
     # Volume HUD: the master volume (hud.rs)
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
+    # Volume buttons on a headset's inline remote: HID report usages (hud.rs)
+    "Win32_Devices_HumanInterfaceDevice",
     # Battery / Energy Saver state and notifications (window.rs)
     "Win32_System_Power",
     # Update availability: one HTTPS request to GitHub's releases API (update.rs)
     "Win32_Networking_WinHttp",
+    # Nearby: the device identity key at rest, DPAPI-protected (nearby.rs)
+    "Win32_Security_Cryptography",
+    # Nearby: reconnect when an IP address comes or goes (nearby.rs)
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
 ] }
 
 # Offline image / audio conversion (src/convert.rs). Pure Rust, only the
@@ -87,3 +99,36 @@ default-features = false
 
 [dependencies.avif-parse]
 version = "2.1"
+
+# Nearby (src/nearby.rs): the official LocalSend Rust core (signaling client,
+# WebRTC peer, token exchange, transfer), vendored with small patches at the commit
+# verified in Phase 1 (26cc8f9; see vendor/localsend-core/OECA-VENDOR.txt: a
+# git dependency would check out LocalSend's Flutter submodule). Only `webrtc`;
+# `pem` because that feature alone does not build upstream (crypto/cert.rs).
+# Apache-2.0; its tree is listed in THIRD-PARTY-NOTICES.txt. Tokio hosts it on
+# one dedicated thread; flate2 (already in the core's tree) inflates SDPs for
+# the connection's verification code.
+[dependencies.localsend]
+path = "vendor/localsend-core"
+default-features = false
+features = ["webrtc", "pem"]
+
+[dependencies.tokio]
+version = "1.53"
+default-features = false
+features = ["rt", "time", "sync", "macros"]  # the core itself enables "full"
+
+[dependencies.flate2]
+version = "1.1"
+
+# Already in the core's tree (its WebRTC stack): named for the persistent
+# DTLS certificate (RTCCertificate PEM, needs "pem"), Nearby's device identity.
+[dependencies.webrtc]
+version = "0.14"
+default-features = false
+features = ["pem"]
+
+# Nearby: dtls (webrtc's DTLS), vendored to negotiate X25519 only; see
+# vendor/dtls/OECA-VENDOR.txt
+[patch.crates-io]
+dtls = { path = "vendor/dtls" }

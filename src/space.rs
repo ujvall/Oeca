@@ -12,6 +12,8 @@ pub enum OecaSpace {
     Music,
     /// The in-memory clipboard history (Phase 5.2).
     Clipboard,
+    /// Oeca Nearby: devices, transfers and their decisions (`nearby_ui`).
+    Nearby,
     /// Sizes the conversion workspace (`Scene::Convert`). Never selectable and
     /// not in `ALL`: it has no pill and is never the active space.
     Convert,
@@ -77,6 +79,12 @@ pub struct OecaSettings {
     /// About). Off by default: Oeca makes no network request unless the
     /// user turns this on or checks by hand.
     pub check_for_updates: bool,
+    /// Nearby runs while Oeca is open (signaling and discovery). Off by
+    /// default, and independent of Start on launch (Settings > Nearby).
+    pub nearby: bool,
+    /// The privacy notice the user accepted (`nearby_ui::notice_id`; 0:
+    /// none). Nearby turns on only while it matches the current notice.
+    pub nearby_notice: u32,
 }
 
 impl Default for OecaSettings {
@@ -95,6 +103,8 @@ impl Default for OecaSettings {
             focus_secs: crate::timer::Mode::Focus.default_secs(),
             break_secs: crate::timer::Mode::Break.default_secs(),
             check_for_updates: false,
+            nearby: false,
+            nearby_notice: 0,
         }
     }
 }
@@ -138,7 +148,7 @@ impl Scene {
 
 impl OecaSpace {
     #[allow(dead_code)]
-    pub const ALL: [Self; 3] = [Self::Home, Self::Music, Self::Clipboard];
+    pub const ALL: [Self; 4] = [Self::Home, Self::Music, Self::Clipboard, Self::Nearby];
 
     #[allow(dead_code)]
     pub fn is_home(self) -> bool {
@@ -156,6 +166,7 @@ impl OecaSpace {
             Self::Home => "Home",
             Self::Music => "Music",
             Self::Clipboard => "Clipboard",
+            Self::Nearby => "Hop",
             Self::Convert => "Convert",
         }
     }
@@ -190,7 +201,7 @@ mod tests {
         assert!(s.switch_to(OecaSpace::Home), "Music -> Home");
         assert!(s.is_home());
         for i in 0..100 {
-            let target = OecaSpace::ALL[i % 3];
+            let target = OecaSpace::ALL[i % OecaSpace::ALL.len()];
             s.switch_to(target);
             assert_eq!(s, target, "repeated switching");
         }
@@ -269,21 +280,22 @@ mod tests {
     fn test_labels() {
         assert_eq!(
             OecaSpace::ALL.map(OecaSpace::label),
-            ["Home", "Music", "Clipboard"]
+            ["Home", "Music", "Clipboard", "Hop"]
         );
     }
 
     #[test]
-    fn test_exactly_three_spaces() {
-        // Exhaustive match (no wildcard): a fourth variant fails to compile here
+    fn test_exactly_four_spaces() {
+        // Exhaustive match (no wildcard): a new variant fails to compile here
         let index = |s: OecaSpace| match s {
             OecaSpace::Home => 0,
             OecaSpace::Music => 1,
             OecaSpace::Clipboard => 2,
-            OecaSpace::Convert => 3,
+            OecaSpace::Nearby => 3,
+            OecaSpace::Convert => 4,
         };
-        assert_eq!(OecaSpace::ALL.len(), 3);
-        assert_eq!(OecaSpace::ALL.map(index), [0, 1, 2]);
+        assert_eq!(OecaSpace::ALL.len(), 4);
+        assert_eq!(OecaSpace::ALL.map(index), [0, 1, 2, 3]);
     }
 
     #[test]

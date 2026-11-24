@@ -1,0 +1,65 @@
+LocalSend core (Rust crate `localsend`), vendored for Oeca Nearby with the patches below.
+
+Source:  https://github.com/localsend/localsend  (packages/core)
+Commit:  26cc8f997aa3f7ad789c12500a8b7206cfbb3ddc  (2026-11-21)
+Licence: Apache-2.0 (LICENSE, from the repository root)
+
+Vendored instead of a git dependency because the repository's Flutter
+submodule cannot be checked out by Cargo on Windows (path length). Oeca
+enables only the `webrtc` and `pem` features (see Cargo.toml).
+
+Every file is identical to `git archive <commit> packages/core` plus LICENSE,
+except two, changed by OECA-PATCHES.diff (lines marked `oeca:`), small enough
+to propose upstream:
+
+src/webrtc/signaling.rs
+  1. Close the WebSocket when the client drops its sender, so the server
+     drops the peer at once (no ghost peer until its 5-minute idle timeout).
+  2. End the read loop after 180 s without any frame (the 120 s ping's pong
+     included): a socket that died in sleep or a network change is noticed.
+  3. A server that closes before HELLO (its per-IP limits) is an error, not
+     a panic; the listener stops instead of panicking when its receiver is gone.
+src/webrtc/webrtc.rs
+  4. send_offer / accept_offer take an optional persistent DTLS certificate
+     (a stable fingerprint is the peer identity Oeca verifies). API change:
+     one new parameter.
+  5. The peer connection is closed however a session future ends, including
+     when the caller drops it (cancel, timeout, shutdown): no ICE / DTLS task
+     or socket outlives the session.
+  6. Failed and Closed connection states end a session, not only Disconnected.
+  7. A declined transfer lets the DECLINED message leave before the
+     connection closes (it could be lost before).
+  8. send_offer takes an optional metadata gate, awaited after the connection
+     is authenticated and before the file list: the caller can keep names,
+     sizes and types from a peer it has not verified. API change: one new
+     parameter. No wire change.
+  9. Cancel reaches the other side at once: the data channel is closed before
+     the peer connection (its SCTP stream reset is standard and understood by
+     LocalSend Web), and a session ends when the remote closes its data
+     channel (before: only when ICE gave up, about 5 s).
+ 10. An optional Extension per session: extra SDP lines, the peer connection,
+     and data channels not labelled "data" (ignored before). API change: one
+     new parameter. Oeca's verification handshake uses it; LocalSend's own
+     messages are unchanged.
+ 11. Security: the caller is given the answer the session really applies
+     (matched by session id), since any ANSWER message can claim a peer; SDP
+     inflation is bounded to 64 KiB; an answer arriving after its session
+     ended no longer panics the signaling listener.
+ 12. Security: a session's inner task is aborted when the session ends or is
+     dropped. It was detached and kept its buffers and the connection.
+ 13. Security: a chunked control message (file list, token list) is refused
+     above 1 MiB while it accumulates, before it is parsed.
+ 14. Security: a peer that opens more than 4 data channels in a session ends
+     it (each costs a task and a 64 KiB buffer).
+src/webrtc/signaling.rs
+ 15. Security: one signaling message is at most 1 MiB (64 MiB before).
+src/webrtc/webrtc.rs
+ 16. send_offer reads one confirmation per file before it closes (it read one
+     in all, so a receiver lost the last of several files), reads them while
+     sending (unread, they hid the receiver's close), checks each id, and
+     reads what is still queued when the receiver closes. Extension gains
+     file_results, which hands them to the caller. No wire change. Tested
+     at the end of webrtc.rs.
+ 17. Privacy: set_ip_filter lets the embedding app choose which local
+     addresses are offered as ICE host candidates (all when unset, as
+     before). No wire change.

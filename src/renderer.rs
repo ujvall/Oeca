@@ -9,7 +9,7 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES,
     D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
     D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory, ID2D1Bitmap, ID2D1DCRenderTarget,
-    ID2D1Factory, ID2D1PathGeometry, ID2D1RenderTarget,
+    ID2D1Factory, ID2D1PathGeometry, ID2D1RenderTarget, ID2D1SolidColorBrush,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
@@ -37,27 +37,27 @@ use windows::core::{Error, Result};
 
 use crate::clipboard::{ClipboardHistory, ClipboardItem};
 use crate::clock::ClockDateState;
+use crate::config::CLIPBOARD_PREVIEW_CHARS;
 use crate::config::Transition;
 use crate::config::{
     AccentChoice, BASE_SETTINGS_CHEVRON_SIZE, BASE_SETTINGS_TOGGLE_KNOB_INSET, rgb_color,
 };
 use crate::config::{
     BASE_DROP_MESSAGE_GAP, BASE_DROP_MESSAGE_LINE, BASE_DROP_OUTLINE_INSET,
-    BASE_DROP_OUTLINE_RADIUS, BASE_DROP_OUTLINE_WIDTH, BASE_DROP_RESULT_ICON_SIZE, COLOR_DROP_ICON,
-    COLOR_DROP_OUTLINE, DROP_OUTLINE_DASHES,
+    BASE_DROP_OUTLINE_WIDTH, BASE_DROP_RESULT_ICON_SIZE, COLOR_DROP_ICON, COLOR_DROP_OUTLINE,
+    DROP_OUTLINE_DASHES,
 };
 use crate::config::{
     BASE_MEDIA_ARTWORK_RADIUS_EXTRA, BASE_MEDIA_BADGE_OVERHANG, BASE_MEDIA_BADGE_RING,
     BASE_MEDIA_BADGE_SIZE, BASE_MEDIA_ICON_SIZE, BASE_MEDIA_PLAY_ICON_SIZE,
     BASE_MEDIA_TIMELINE_LABEL_GAP, BASE_MEDIA_TIMELINE_LABEL_WIDTH, BASE_MEDIA_TIMELINE_MIN_TRACK,
     BASE_MEDIA_TIMELINE_TRACK, BASE_MUSIC_ARTWORK_RADIUS, BASE_MUSIC_ICON_SIZE,
-    BASE_MUSIC_PLAY_ICON_SIZE, BASE_SPACE_ICON_SIZE, COLOR_ARTWORK_HAIRLINE, COLOR_BORDER_HOVER,
+    BASE_MUSIC_PLAY_ICON_SIZE, BASE_SPACE_GLYPH_SIZE, COLOR_ARTWORK_HAIRLINE, COLOR_BORDER_HOVER,
     COLOR_MEDIA_DIVIDER, COLOR_MEDIA_TRACK_UNPLAYED, COLOR_SPACE_PILL_SELECTED, COLOR_TEXT_PRIMARY,
     COLOR_TEXT_SECONDARY, COLOR_TEXT_TERTIARY, COLOR_TIMER, COLOR_TRANSPARENT, CornerProfile,
     FONT_FAMILY_FALLBACK, MEDIA_ICON_REST_OPACITY, MEDIA_PRESS_ICON_SCALE, NOTCH_BG_COLOR,
-    NOTCH_BORDER_COLOR, NotchDimensions, SKIP_GLYPH_HALF_WIDTH,
+    NOTCH_BORDER_COLOR, NotchDimensions,
 };
-use crate::config::{CLIPBOARD_PREVIEW_CHARS, COLOR_CLIPBOARD_ROW};
 use crate::config::{TextRole, UI_FONT_CANDIDATES};
 #[cfg(test)]
 use crate::layout::resolve_media_layout;
@@ -206,6 +206,17 @@ pub struct Renderer {
     /// The conversion workspace (Some while a batch is open): a snapshot of
     /// the batch, set by the window on every change.
     convert: RefCell<Option<crate::convert_batch::View>>,
+    /// The Nearby space's picture (`set_nearby`).
+    nearby: RefCell<NearbyPicture>,
+    /// This frame shows the Nearby space settled and fully opaque.
+    nearby_settled: Cell<bool>,
+    /// The question on show (its transfer and buttons) and when it was first
+    /// drawn settled: its decisions arm `ARMING` after that.
+    nearby_seen: RefCell<Option<NearbySeen>>,
+    /// Which picture (`set_nearby` counts them) is the one on show: a click
+    /// counts only on the picture last drawn.
+    nearby_generation: Cell<u64>,
+    nearby_drawn: Cell<u64>,
     /// The running animation's content blend and opacity (None when settled).
     transition: Cell<Option<Transition>>,
     /// Settings page open / settings values (mirror `WindowState`, which sets
@@ -239,6 +250,8 @@ pub struct Renderer {
     /// The visualizer's gradient ramp and round-end masks, and the bar
     /// width (device pixels) the masks were made for.
     viz_brushes: RefCell<Option<(ID2D1Bitmap, ID2D1Bitmap, u32)>>,
+    /// The raised-surface edge brush, made once per render target.
+    edge_brush: RefCell<Option<EdgeBrush>>,
     /// The gradient ends and opacity last baked into the ramp bitmap.
     viz_baked: Cell<Option<([D2D1_COLOR_F; 2], f32)>>,
     /// The artwork's turn to a new track's (None when not turning).
@@ -252,6 +265,12 @@ pub struct Renderer {
     /// shown until the session reports its new position (or briefly).
     scrub: Cell<Option<f32>>,
     seek_hold: Cell<Option<(i64, std::time::Instant)>>,
+    /// The playhead as drawn during and just after a scrub: it follows the
+    /// pointer on `SCRUB_SPRING` (None otherwise, or with Reduced motion).
+    /// Its target is set where the bar is drawn.
+    scrub_glide: Cell<Option<crate::config::Glide>>,
+    /// The bar's grip, 0 at rest .. 1 while held (it thickens).
+    scrub_grip: Cell<crate::config::Glide>,
     /// The countdown timer as shown (mirrors `WindowState`, which sets it on
     /// every change; the numerals are read from it at draw time).
     timer: Cell<TimerView>,
@@ -474,7 +493,7 @@ fn inset_quad(pts: Quad, r: f32) -> Quad {
 /// that radius x 2 wide with round joins. The play triangle is split down
 /// its middle into two halves that become the two pause bars (each vertex
 /// travels straight to its partner), the corner rounding blends from the
-/// triangle's to the bars' fully rounded ends, and while the halves still
+/// triangle's to the bars' rounded corners, and while the halves still
 /// touch a bridge keeps the seam closed. At 0 and 1 this is exactly the rest
 /// glyph (`icon_shapes`' geometry, rounded).
 fn play_pause_outline(cx: f32, cy: f32, u: f32, m: f32, snap: bool) -> (Vec<Quad>, f32) {
@@ -524,11 +543,11 @@ fn play_pause_outline(cx: f32, cy: f32, u: f32, m: f32, snap: bool) -> (Vec<Quad
         ]
     };
     // Corner rounding: the triangle's (as `rounded_triangle_corners`), and
-    // the bars' fully round ends
+    // the bars' (`BAR_ROUNDING`)
     let (a, _) = rounded_triangle_corners(tri);
     let cut = (a[0].0 - tri[0].0).hypot(a[0].1 - tri[0].1);
     let r_play = cut * (std::f32::consts::PI / 6.0).tan();
-    let r = r_play + (b1.width() / 2.0 - r_play) * m;
+    let r = r_play + (b1.width() * BAR_ROUNDING - r_play) * m;
     let lerp =
         |p: (f32, f32), q: (f32, f32), k: f32| (p.0 + (q.0 - p.0) * k, p.1 + (q.1 - p.1) * k);
     let mix = |x: Quad, y: Quad| -> Quad { std::array::from_fn(|i| lerp(x[i], y[i], m)) };
@@ -555,7 +574,7 @@ fn skip_morph(control: MediaControl, cx: f32, cy: f32, u: f32, phase: f32) -> Ve
     // The rest glyph's own whole-pixel geometry (`icon_shapes`, snapped), so
     // the roll starts and ends exactly on it: no pop at either end
     let h = (u * SKIP_GLYPH_HEIGHT).round().max(2.0);
-    let tw = (u * SKIP_GLYPH_HALF_WIDTH).round().max(2.0);
+    let tw = (u * SKIP_TRIANGLE_WIDTH).round().max(2.0);
     let left = (cx - tw).round();
     let cy = (cy - h / 2.0).round() + h / 2.0;
     // (base x, width, scale) of each triangle, pointing right
@@ -681,8 +700,11 @@ fn viz_cap_mask(bar: u32) -> (Vec<u8>, u32) {
 fn viz_ramp_colour(ends: [D2D1_COLOR_F; 2], y: f32, opacity: f32) -> D2D1_COLOR_F {
     let y = y.clamp(0.0, 1.0);
     let [a, b] = ends.map(|c| [c.r, c.g, c.b]);
+    // Only a two-colour gradient is shaded toward its ends; one colour is
+    // a flat bar
     let d = 2.0 * y - 1.0;
-    let k = (1.0 - VIZ_END_DARKEN * d * d) * opacity.clamp(0.0, 1.0);
+    let darken = if a == b { 0.0 } else { VIZ_END_DARKEN };
+    let k = (1.0 - darken * d * d) * opacity.clamp(0.0, 1.0);
     let [r, g, b] = crate::media::gradient_mix(a, b, y).map(|v| (v * k).clamp(0.0, 1.0));
     D2D1_COLOR_F { r, g, b, a: 1.0 }
 }
@@ -861,6 +883,14 @@ struct MediaFormats {
     /// A clipboard tile's text preview: wrapped, top-aligned, the last line
     /// that fits ends in an ellipsis.
     clip_text: IDWriteTextFormat,
+    /// Button and chip labels (centred both ways): medium, and semibold for
+    /// the one primary action.
+    control: IDWriteTextFormat,
+    control_lead: IDWriteTextFormat,
+    control_strong: IDWriteTextFormat,
+    /// Nearby: small trailing text (identity, sizes) and the code to compare.
+    meta_trailing: IDWriteTextFormat,
+    code: IDWriteTextFormat,
 }
 
 /// The drop page's hint for files that are not images Oeca can add.
@@ -874,6 +904,36 @@ const CONVERT_DISCARD_NOTE: &str = "Converted files that aren't saved are lost";
 const DROP_COPY_LABEL: &str = "Add to clipboard";
 const DROP_CONVERT_ZONE_LABEL: &str = "Convert";
 const DROP_CONVERT_LABEL: &str = "Drop to convert";
+
+/// What the Nearby space draws: the model, the device list's scroll, and
+/// whether a file dialog is open (Send is dimmed meanwhile).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct NearbyPicture {
+    pub model: Option<crate::nearby_ui::Model>,
+    pub scroll: usize,
+    pub picking: bool,
+}
+
+/// A question on show: its transfer, its buttons, when first drawn.
+type NearbySeen = (
+    crate::nearby::TransferId,
+    Vec<crate::nearby_ui::Action>,
+    std::time::Instant,
+);
+
+/// Wakes the notch when a shown Nearby question arms (one-shot).
+pub const NEARBY_ARM_TIMER_ID: usize = 1016;
+
+/// Nearby's warnings (changed identity, dangerous files, failures): a soft
+/// amber, readable on the notch's black.
+const NEARBY_WARN_COLOR: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 1.0,
+    g: 0.76,
+    b: 0.38,
+    a: 1.0,
+};
+/// The verification code's digits (DIP).
+const NEARBY_CODE_FONT_SIZE: f32 = 26.0;
 
 /// Music space empty state (no media session): a quiet label, never metadata.
 const MUSIC_EMPTY_LABEL: &str = "Nothing playing";
@@ -987,6 +1047,36 @@ fn resolve_ui_font(dwrite: &IDWriteFactory, bundled: &[&'static [u8]]) -> UiFont
         name,
         family,
         collection: None,
+    }
+}
+
+/// The text face (`TEXT_FONT_CANDIDATES`): the first installed, else the
+/// display face. Resolved once per thread, like `ui_font`.
+pub(crate) fn text_font(dwrite: &IDWriteFactory) -> UiFont {
+    thread_local! {
+        static FONT: std::cell::OnceCell<UiFont> = const { std::cell::OnceCell::new() };
+    }
+    FONT.with(|f| {
+        f.get_or_init(|| {
+            let families = crate::config::TEXT_FONT_CANDIDATES.map(|(_, f)| f);
+            match first_installed(dwrite, &families) {
+                Some(i) => UiFont {
+                    name: crate::config::TEXT_FONT_CANDIDATES[i].0,
+                    family: crate::config::TEXT_FONT_CANDIDATES[i].1,
+                    collection: None,
+                },
+                None => ui_font(dwrite),
+            }
+        })
+        .clone()
+    })
+}
+
+/// The font a role is set in (its `Face`).
+pub(crate) fn face_font(dwrite: &IDWriteFactory, face: crate::config::Face) -> UiFont {
+    match face {
+        crate::config::Face::Display => ui_font(dwrite),
+        crate::config::Face::Text => text_font(dwrite),
     }
 }
 
@@ -1240,6 +1330,56 @@ impl SwitchAnim {
     }
 }
 
+/// The raised-surface edge brush (white at `EDGE_LIGHT`), one per render
+/// target: a single quiet hairline round pills, tiles and buttons. One solid
+/// stroke per shape (a gradient or a second pass costs several times as much
+/// on the software target, and a flat top highlight read as rough).
+pub(crate) type EdgeBrush = ID2D1SolidColorBrush;
+
+pub(crate) fn create_edge_brush(rt: &ID2D1RenderTarget) -> Result<EdgeBrush> {
+    let white = D2D1_COLOR_F {
+        r: 1.0,
+        g: 1.0,
+        b: 1.0,
+        a: crate::config::EDGE_LIGHT,
+    };
+    unsafe { rt.CreateSolidColorBrush(&white, None) }
+}
+
+/// Sets the edge brush's opacity, touching it only when it really changes
+/// (changing a brush between draws makes Direct2D flush its batch).
+pub(crate) fn edge_opacity(edge: &EdgeBrush, opacity: f32) {
+    unsafe {
+        if edge.GetOpacity() != opacity {
+            edge.SetOpacity(opacity);
+        }
+    }
+}
+
+/// Strokes the edge of a rounded rect just inside `r` (a crisp hairline of
+/// `width`), at `opacity`.
+pub(crate) fn stroke_edge(
+    rt: &ID2D1RenderTarget,
+    edge: &EdgeBrush,
+    r: RectF,
+    radius: f32,
+    width: f32,
+    opacity: f32,
+) {
+    if opacity <= 0.0 {
+        return;
+    }
+    let h = width / 2.0;
+    let inner = RectF::new(r.left + h, r.top + h, r.right - h, r.bottom - h);
+    let shape = D2D1_ROUNDED_RECT {
+        rect: inner.to_d2d_rect(),
+        radiusX: (radius - h).max(0.0),
+        radiusY: (radius - h).max(0.0),
+    };
+    edge_opacity(edge, opacity);
+    unsafe { rt.DrawRoundedRectangle(&shape, edge, width, None) };
+}
+
 /// A switch, shared by the notch Settings page and the Settings window: white
 /// track with a black knob at the right when on; a faint track with a white
 /// knob at the left when off. `knob_scale` < 1 tucks the knob in (pressed).
@@ -1250,6 +1390,7 @@ pub(crate) fn draw_switch(
     inset: f32,
     knob_scale: f32,
     accent: AccentChoice,
+    edge: &EdgeBrush,
 ) -> Result<()> {
     // `level`: 0 = OFF, 1 = ON (in between while it animates); the track
     // colour and knob colour blend with the knob's travel
@@ -1273,6 +1414,8 @@ pub(crate) fn draw_switch(
             },
             &track,
         );
+        // The off track is a recessed graphite channel with a lit rim
+        stroke_edge(rt, edge, t, t.height() / 2.0, 1.0, 1.0 - level);
         let full = t.height() - 2.0 * inset;
         let (off_left, on_left) = (t.left + inset, t.right - inset - full);
         let left = off_left + (on_left - off_left) * level;
@@ -1444,15 +1587,22 @@ impl CornerCoverage {
     }
 }
 
+/// Each skip triangle's width (fraction of the icon size). Drawn a little wider
+/// than the layout's `SKIP_GLYPH_HALF_WIDTH` (which places the controls), so
+/// the tuned layout stays where it is.
+const SKIP_TRIANGLE_WIDTH: f32 = 0.65;
 /// Skip glyph height (fraction of the icon size).
 const SKIP_GLYPH_HEIGHT: f32 = 0.74;
 /// Triangle vertex rounding (fraction of the triangle's height).
 const TRIANGLE_ROUNDING: f32 = 0.16;
+/// A pause bar's corner radius (fraction of its width): rounded corners, not
+/// a capsule.
+const BAR_ROUNDING: f32 = 0.27;
 
 /// One filled primitive of a transport icon.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum IconShape {
-    /// Capsule bar (fully rounded ends)
+    /// Bar with rounded corners (`BAR_ROUNDING`)
     Bar(RectF),
     Triangle([(f32, f32); 3]),
 }
@@ -1474,9 +1624,9 @@ fn icon_shapes(
     let len = |v: f32, min: f32| if snap { v.round().max(min) } else { v.max(min) };
     match (control, play_pause) {
         (MediaControl::PlayPause, PlayPauseIcon::Pause) => {
-            let w = len(u * 0.26, 2.0);
-            let gap = len(u * 0.24, 2.0);
-            let h = len(u * 0.92, 2.0);
+            let w = len(u * 0.287, 2.0);
+            let gap = len(u * 0.137, 2.0);
+            let h = len(u * 0.945, 2.0);
             let left = q(cx - (2.0 * w + gap) / 2.0);
             let top = q(cy - h / 2.0);
             vec![
@@ -1491,7 +1641,7 @@ fn icon_shapes(
         }
         (MediaControl::PlayPause, PlayPauseIcon::Play) => {
             let h = len(u, 2.0);
-            let w = len(u * 0.88, 2.0);
+            let w = len(u * 0.943, 2.0);
             let left = q(cx - w * 5.0 / 12.0);
             let top = q(cy - h / 2.0);
             vec![IconShape::Triangle([
@@ -1503,7 +1653,7 @@ fn icon_shapes(
         (MediaControl::Next | MediaControl::Previous, _) => {
             // Two touching triangles (fast-forward / rewind style)
             let h = len(u * SKIP_GLYPH_HEIGHT, 2.0);
-            let tw = len(u * SKIP_GLYPH_HALF_WIDTH, 2.0);
+            let tw = len(u * SKIP_TRIANGLE_WIDTH, 2.0);
             let left = q(cx - tw);
             let top = q(cy - h / 2.0);
             let mid = top + h / 2.0;
@@ -1752,6 +1902,29 @@ impl Renderer {
             || self.collapsed_art.borrow().is_animating()
     }
 
+    /// The scrubber's playhead or grip still moving (see `scrub_glide`).
+    /// They step on the display's frame clock (`step_scrub`), not the
+    /// feedback timer, so a fast drag moves at the refresh rate.
+    pub fn scrub_moving(&self) -> bool {
+        self.scrub_glide.get().is_some_and(|g| g.is_animating())
+            || (self.scrub.get().is_none() && self.scrub_glide.get().is_some())
+            || self.scrub_grip.get().is_animating()
+    }
+
+    /// Steps the scrub's playhead and grip; drops the playhead's spring once
+    /// the drag is over and it has landed (playback draws directly again).
+    pub fn step_scrub(&self, dt_ms: f32) -> bool {
+        let mut grip = self.scrub_grip.get();
+        grip.step(crate::config::SCRUB_GRIP_SPRING, dt_ms);
+        self.scrub_grip.set(grip);
+        if let Some(mut g) = self.scrub_glide.get() {
+            let moving = g.step(crate::config::SCRUB_SPRING, dt_ms);
+            let done = !moving && self.scrub.get().is_none();
+            self.scrub_glide.set((!done).then_some(g));
+        }
+        self.scrub_moving()
+    }
+
     /// Advances glyph motion, the artwork turn and the collapsed album art's
     /// fades; true while any moves.
     pub fn step_media_motion(&self, dt_ms: f32) -> bool {
@@ -1780,11 +1953,30 @@ impl Renderer {
     pub fn settle_media_motion(&self) {
         self.icons.borrow_mut().settle();
         *self.flip.borrow_mut() = None;
+        self.scrub_glide.set(None);
+        let mut grip = self.scrub_grip.get();
+        grip.snap(grip.target);
+        self.scrub_grip.set(grip);
     }
 
     /// The scrubber while dragged (fraction of the track), or None.
     pub fn set_scrub(&self, fraction: Option<f32>) {
         self.scrub.set(fraction);
+        let motion = crate::window::motion_allowed(
+            self.settings.get().reduced_motion,
+            crate::window::is_client_animation_enabled(),
+        );
+        if let (Some(f), Some(mut g)) = (fraction, self.scrub_glide.get()) {
+            g.target = f.clamp(0.0, 1.0);
+            self.scrub_glide.set(Some(g));
+        }
+        let mut grip = self.scrub_grip.get();
+        grip.target = if fraction.is_some() { 1.0 } else { 0.0 };
+        if !motion {
+            grip.snap(grip.target);
+            self.scrub_glide.set(None);
+        }
+        self.scrub_grip.set(grip);
     }
 
     /// Shows a committed seek at `position_ms` until the session reports
@@ -1879,6 +2071,114 @@ impl Renderer {
         }
         *slot = view;
         true
+    }
+
+    /// Sets the Nearby space's picture; true if it changed.
+    pub fn set_nearby(&self, picture: NearbyPicture) -> bool {
+        let mut slot = self.nearby.borrow_mut();
+        if *slot == picture {
+            return false;
+        }
+        *slot = picture;
+        self.nearby_generation
+            .set(self.nearby_generation.get().wrapping_add(1));
+        true
+    }
+
+    /// The Nearby picture now set is the one last drawn (what the user sees):
+    /// a click on a row or button means this picture's.
+    pub fn nearby_on_show(&self) -> bool {
+        self.nearby_drawn.get() == self.nearby_generation.get()
+    }
+
+    /// The Nearby picture (what the buttons on show do).
+    pub fn nearby_picture(&self) -> std::cell::Ref<'_, NearbyPicture> {
+        self.nearby.borrow()
+    }
+
+    /// When the question on show was first drawn settled (None: not on
+    /// screen now).
+    pub fn nearby_shown_at(&self) -> Option<std::time::Instant> {
+        use crate::nearby_ui::Page;
+        // Only for the card in the picture: a newer one not yet drawn has
+        // not been shown
+        let p = self.nearby.borrow();
+        let Some(Page::Transfer(card)) = p.model.as_ref().map(|m| &m.page) else {
+            return None;
+        };
+        self.nearby_seen
+            .borrow()
+            .as_ref()
+            .filter(|(id, actions, _)| {
+                *id == card.id && actions.iter().eq(card.buttons.iter().map(|b| &b.action))
+            })
+            .map(|s| s.2)
+    }
+
+    /// The card's decisions count now: shown long enough, and the runtime's
+    /// own delay passed (`Card::armed`).
+    pub fn nearby_armed(&self, now: std::time::Instant) -> bool {
+        use crate::nearby_ui::Page;
+        let p = self.nearby.borrow();
+        match p.model.as_ref().map(|m| &m.page) {
+            Some(Page::Transfer(c)) => c.armed(now, self.nearby_shown_at()),
+            _ => true,
+        }
+    }
+
+    /// After a frame: the question on show keeps its first-drawn time while
+    /// it stays on screen; anything else forgets it. A question not yet
+    /// armed wakes the notch (`NEARBY_ARM_TIMER_ID`) when it arms.
+    fn nearby_mark(&self, hwnd: HWND) {
+        use crate::nearby_ui::Page;
+        let p = self.nearby.borrow();
+        let card = match p.model.as_ref().map(|m| &m.page) {
+            Some(Page::Transfer(c)) if c.asks && self.nearby_settled.get() => c,
+            _ => {
+                *self.nearby_seen.borrow_mut() = None;
+                return;
+            }
+        };
+        let now = std::time::Instant::now();
+        let mut seen = self.nearby_seen.borrow_mut();
+        let same = seen.as_ref().is_some_and(|(id, actions, _)| {
+            *id == card.id && actions.iter().eq(card.buttons.iter().map(|b| &b.action))
+        });
+        if !same {
+            let actions = card.buttons.iter().map(|b| b.action).collect();
+            *seen = Some((card.id.clone(), actions, now));
+        }
+        let at = seen.as_ref().map_or(now, |s| s.2);
+        if let Some(wait) = crate::nearby_ui::arm_delay(card, now, at) {
+            let ms = u32::try_from(wait.as_millis())
+                .unwrap_or(u32::MAX)
+                .saturating_add(1);
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
+                    Some(hwnd),
+                    NEARBY_ARM_TIMER_ID,
+                    ms,
+                    None,
+                );
+            }
+        }
+    }
+
+    /// What the Nearby space has on show (for hit-testing).
+    pub fn nearby_shown(&self) -> crate::layout::NearbyShown {
+        use crate::layout::NearbyShown;
+        use crate::nearby_ui::Page;
+        let p = self.nearby.borrow();
+        match p.model.as_ref().map(|m| &m.page) {
+            Some(Page::Off) => NearbyShown::Off,
+            Some(Page::Peers(rows)) => NearbyShown::Peers(
+                rows.len()
+                    .saturating_sub(p.scroll)
+                    .min(crate::layout::NEARBY_ROWS),
+            ),
+            Some(Page::Transfer(card)) => NearbyShown::Card(card.buttons.len().min(3)),
+            _ => NearbyShown::Nothing,
+        }
     }
 
     /// What the workspace's controls are right now (for hit-testing).
@@ -2033,16 +2333,24 @@ impl Renderer {
             viz_palette: RefCell::new(None),
             viz_blend: Cell::new(VizBlend::default()),
             viz_brushes: RefCell::new(None),
+            edge_brush: RefCell::new(None),
             viz_baked: Cell::new(None),
             flip: RefCell::new(None),
             collapsed_art: RefCell::new(CollapsedArt::default()),
             collapsed_thumbs: RefCell::new(Vec::new()),
             scrub: Cell::new(None),
+            scrub_glide: Cell::new(None),
+            scrub_grip: Cell::new(crate::config::Glide::at(0.0)),
             seek_hold: Cell::new(None),
             drop: Cell::new(crate::dragdrop::DropPage::Off),
             drop_outcome: Cell::new(crate::dragdrop::DropOutcome::Copied),
             drop_zone: Cell::new(crate::dragdrop::DropZone::Copy),
             convert: RefCell::new(None),
+            nearby: RefCell::new(NearbyPicture::default()),
+            nearby_settled: Cell::new(false),
+            nearby_seen: RefCell::new(None),
+            nearby_generation: Cell::new(0),
+            nearby_drawn: Cell::new(u64::MAX),
             transition: Cell::new(None),
             settings_open: Cell::new(false),
             settings: Cell::new(OecaSettings::default()),
@@ -2077,6 +2385,7 @@ impl Renderer {
             self.thumbs.borrow_mut().clear();
             self.collapsed_thumbs.borrow_mut().clear();
             *self.viz_brushes.borrow_mut() = None;
+            *self.edge_brush.borrow_mut() = None;
             self.viz_baked.set(None);
 
             *self.cached_rt.borrow_mut() = None;
@@ -2222,7 +2531,7 @@ impl Renderer {
     ) -> Result<IDWriteTextFormat> {
         let style = role.style();
         self.create_line_format(
-            &ui_font(&self.dwrite_factory),
+            &face_font(&self.dwrite_factory, style.face),
             style.size * scale,
             DWRITE_FONT_WEIGHT(style.weight),
             align,
@@ -3357,6 +3666,16 @@ impl Renderer {
         }))
     }
 
+    /// The cached raised-surface edge brush (made on first use per target).
+    fn edge(&self, rt: &ID2D1RenderTarget) -> Result<EdgeBrush> {
+        if let Some(edge) = self.edge_brush.borrow().as_ref() {
+            return Ok(edge.clone());
+        }
+        let edge = create_edge_brush(rt)?;
+        *self.edge_brush.borrow_mut() = Some(edge.clone());
+        Ok(edge)
+    }
+
     /// Space selector: two capsules above the expanded content. The active space
     /// gets a quiet filled capsule and primary text; the other is text only.
     /// The active space's selector laid out on `dimensions` as they are.
@@ -3410,7 +3729,14 @@ impl Renderer {
         alpha: f32,
     ) -> Result<()> {
         let s = dimensions.scale;
-        let u = (BASE_SPACE_ICON_SIZE * s).round();
+        let u = (BASE_SPACE_GLYPH_SIZE * s).round();
+        // How much of the highlight covers a pill (0..1): its glyph brightens
+        // with it, so the selection glides with the highlight in a blend
+        let lit = |r: RectF| {
+            let overlap = (r.right.min(highlight.right) - r.left.max(highlight.left)).max(0.0);
+            let idle = crate::config::SPACE_GLYPH_IDLE_OPACITY;
+            alpha * (idle + (1.0 - idle) * (overlap / r.width().max(1.0)).min(1.0))
+        };
         unsafe {
             let fill = rt.CreateSolidColorBrush(&COLOR_SPACE_PILL_SELECTED, None)?;
             fill.SetOpacity(alpha);
@@ -3431,13 +3757,12 @@ impl Renderer {
                 },
                 None,
             )?;
-            white.SetOpacity(alpha);
             for space in OecaSpace::ALL {
                 let r = selector.bounds(space);
-                // White glyphs; the active space is marked by its pill
-                let brush = &white;
+                // The highlighted space full white, the others dimmed
+                white.SetOpacity(lit(r));
                 let (cx, cy) = ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
-                self.draw_space_icon(rt, space, cx, cy, u, brush)?;
+                self.draw_space_icon(rt, space, cx, cy, u, &white)?;
             }
             // Settings icon at the right end: same glyph size, grows a little
             // on hover / press like the other icon buttons
@@ -3446,6 +3771,7 @@ impl Renderer {
                 + crate::config::CLIPBOARD_BUTTON_HOVER_GROW * hover
                 + crate::config::CLIPBOARD_BUTTON_PRESS_GROW * press;
             let r = selector.settings;
+            white.SetOpacity(lit(r).max(alpha * (hover + press).min(1.0)));
             let (cx, cy) = ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
             self.draw_glyph(rt, GEAR, cx, cy, u * grow, &white)?;
         }
@@ -3467,6 +3793,7 @@ impl Renderer {
             OecaSpace::Home => HOUSE_BLANK,
             OecaSpace::Music => MUSIC_ALT,
             OecaSpace::Clipboard | OecaSpace::Convert => CLIPBOARD,
+            OecaSpace::Nearby => NEARBY,
         };
         self.draw_glyph(rt, segments, cx, cy, u, brush)
     }
@@ -3559,12 +3886,12 @@ impl Renderer {
         self.with_layer(rt, Some(&silhouette), 1.0, || unsafe {
             let dashes = rt.CreateSolidColorBrush(&COLOR_DROP_OUTLINE, None)?;
             let tint = rt.CreateSolidColorBrush(&COLOR_SPACE_PILL_SELECTED, None)?;
+            // Concentric with the notch's bottom corners: inner radius =
+            // outer radius - padding (to the stroke's centre line)
+            let radius = (target.curvature.bottom_radius - inset - half).max(0.0);
             for (i, &(zone, active)) in zones.iter().enumerate() {
-                let profile = CornerProfile::new(
-                    px(BASE_DROP_OUTLINE_RADIUS),
-                    1.0,
-                    zone.width().min(zone.height()) / 2.0,
-                );
+                let profile =
+                    CornerProfile::new(radius, 1.0, zone.width().min(zone.height()) / 2.0);
                 let path = self.smooth_rect_path(zone, profile.span, profile.handle)?;
                 // The zone under the pointer is lit; its twin recedes
                 if zones.len() > 1 && active {
@@ -3672,12 +3999,19 @@ impl Renderer {
             RectF::new(r.left + h, r.top + h, r.right - h, r.bottom - h)
         };
         let result = unsafe {
-            let outline = rt.CreateSolidColorBrush(&COLOR_CLIPBOARD_ROW, None)?;
+            let edge = self.edge(rt)?;
             let primary = rt.CreateSolidColorBrush(&COLOR_TEXT_PRIMARY, None)?;
             let secondary = rt.CreateSolidColorBrush(&COLOR_TEXT_SECONDARY, None)?;
             let tertiary = rt.CreateSolidColorBrush(&COLOR_TEXT_TERTIARY, None)?;
-            let fill = rt.CreateSolidColorBrush(&COLOR_SPACE_PILL_SELECTED, None)?;
-            let track = rt.CreateSolidColorBrush(&COLOR_MEDIA_TRACK_UNPLAYED, None)?;
+            // Translucent white for surfaces: set to the alpha each one needs
+            let white = rt.CreateSolidColorBrush(&COLOR_TEXT_PRIMARY, None)?;
+            let ink = rt.CreateSolidColorBrush(&NOTCH_BG_COLOR, None)?;
+            // The one accent (Settings > Appearance): the round checks, a
+            // finished file and the call to action. With the default White
+            // the checks stay a quiet lift, so the button is the only white
+            let choice = self.settings.get().accent;
+            let accent = rt.CreateSolidColorBrush(&choice.color(), None)?;
+            let neutral = choice == AccentChoice::White;
             let text =
                 |s: &[u16],
                  f: &IDWriteTextFormat,
@@ -3692,74 +4026,118 @@ impl Renderer {
                         DWRITE_MEASURING_MODE_NATURAL,
                     )
                 };
-            // An outlined pill (lifted by hover / press); `filled`: solid
-            let pill = |r: RectF, filled: f32, lift: f32| {
-                let radius = r.height() / 2.0;
-                let f = filled.max(0.55 * lift);
-                if f > 0.0 {
-                    fill.SetOpacity(f);
-                    rt.FillRoundedRectangle(&rounded(r, radius), &fill);
+            let surface = |r: RectF, radius: f32, alpha: f32| {
+                white.SetOpacity(alpha);
+                rt.FillRoundedRectangle(&rounded(r, radius), &white);
+            };
+            // A secondary control: a flat quiet fill, brighter on hover / press
+            let quiet = |r: RectF, lift: f32| surface(r, r.height() / 2.0, 0.06 + 0.06 * lift);
+            // A round icon button (28 DIP): a soft disc on hover / press
+            let disc = |r: RectF, lift: f32| {
+                if lift > 0.0 {
+                    let d = r.width().min(r.height());
+                    let (cx, cy) = ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
+                    let c = RectF::new(cx - d / 2.0, cy - d / 2.0, cx + d / 2.0, cy + d / 2.0);
+                    surface(c, d / 2.0, 0.08 * lift);
                 }
-                if filled < 1.0 {
-                    outline.SetOpacity(1.0 - 0.8 * filled);
-                    let i = inner(r);
-                    rt.DrawRoundedRectangle(&rounded(i, i.height() / 2.0), &outline, line_w, None);
-                    outline.SetOpacity(1.0);
+            };
+            // A round check: a hairline ring, filling with the accent (and a
+            // dark tick) as `level` rises; dimmer when it cannot be ticked
+            let round_check = |r: RectF, level: f32, enabled: bool| -> Result<()> {
+                let d = r.width().min(r.height());
+                let (cx, cy) = ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
+                let c = RectF::new(cx - d / 2.0, cy - d / 2.0, cx + d / 2.0, cy + d / 2.0);
+                if level < 1.0 {
+                    let i = inner(c);
+                    white.SetOpacity((if enabled { 0.35 } else { 0.15 }) * (1.0 - level));
+                    rt.DrawRoundedRectangle(&rounded(i, i.height() / 2.0), &white, line_w, None);
                 }
+                if level > 0.0 {
+                    let (fill, tick) = if neutral {
+                        white.SetOpacity(0.18 * level);
+                        (&white, &primary)
+                    } else {
+                        accent.SetOpacity(level);
+                        (&accent, &ink)
+                    };
+                    rt.FillRoundedRectangle(&rounded(c, d / 2.0), fill);
+                    tick.SetOpacity(level);
+                    self.draw_glyph(rt, CHECK, cx, cy, d * 0.56, tick)?;
+                    tick.SetOpacity(1.0);
+                    accent.SetOpacity(1.0);
+                }
+                Ok(())
             };
             let center = |r: RectF| ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
 
-            // -- Toolbar --
-            let (ccx, ccy) = center(l.check);
-            let box_r = l.check;
-            let any = v.selected > 0;
-            let tick = if v.all_selected { 1.0 } else { 0.0 };
-            let box_alpha = if v.any_selectable || v.all_selected {
-                1.0
-            } else {
-                0.4
-            };
-            outline.SetOpacity(box_alpha);
-            let ib = inner(box_r);
-            rt.DrawRoundedRectangle(&rounded(ib, px(4.5)), &outline, line_w, None);
-            outline.SetOpacity(1.0);
-            if tick > 0.0 {
-                fill.SetOpacity(1.0);
-                rt.FillRoundedRectangle(&rounded(box_r, px(4.5)), &fill);
-                self.draw_glyph(rt, CHECK, ccx, ccy, px(11.0), &primary)?;
-            } else if any {
-                // Some selected: a dash
-                let dash = RectF::new(ccx - px(3.5), ccy - line_w, ccx + px(3.5), ccy + line_w);
-                secondary.SetOpacity(1.0);
-                rt.FillRoundedRectangle(&rounded(dash, line_w), &secondary);
-            }
-            let hover_all = lift(H::SelectAll);
-            let label_brush = if hover_all > 0.2 {
-                &primary
-            } else {
-                &secondary
-            };
+            // -- Toolbar: one 28 DIP row --
+            // The count, plain text (it selects all on click when there are
+            // several files)
+            let hover_all = if l.checks { lift(H::SelectAll) } else { 0.0 };
             text(
                 &utf16(&v.count_label),
-                &formats.source,
+                &formats.artist,
                 l.count,
-                label_brush,
+                if hover_all > 0.2 {
+                    &primary
+                } else {
+                    &secondary
+                },
             );
-            // Option chips (quality, background), folder, close
+            // Option chips: "Quality 90", and the background as a swatch
+            // and its name
             for (i, chip) in v.chips.iter().enumerate().take(2) {
                 let r = l.chips[i];
-                let rr = RectF::new(r.left, r.top + px(1.0), r.right, r.bottom - px(1.0));
-                pill(rr, 0.0, lift(H::Chip(i)));
-                text(&utf16(chip), &formats.empty, rr, &secondary);
+                let cl = lift(H::Chip(i));
+                quiet(r, cl);
+                let label = if cl > 0.2 { &primary } else { &secondary };
+                match (i, v.background) {
+                    (1, Some([sr, sg, sb])) => {
+                        let d = px(8.0);
+                        let (sx, sy) = (r.left + px(12.0), (r.top + r.bottom) / 2.0);
+                        let dot = RectF::new(sx, sy - d / 2.0, sx + d, sy + d / 2.0);
+                        let swatch = rt
+                            .CreateSolidColorBrush(&crate::config::rgb_color([sr, sg, sb]), None)?;
+                        rt.FillRoundedRectangle(&rounded(dot, d / 2.0), &swatch);
+                        white.SetOpacity(0.3);
+                        let ring = inner(dot);
+                        rt.DrawRoundedRectangle(
+                            &rounded(ring, ring.height() / 2.0),
+                            &white,
+                            line_w,
+                            None,
+                        );
+                        let after =
+                            RectF::new(dot.right + px(6.0), r.top, r.right - px(8.0), r.bottom);
+                        text(&utf16(chip), &formats.control_lead, after, label);
+                    }
+                    _ => text(&utf16(chip), &formats.control, r, label),
+                }
             }
+            // Folder and close: tertiary at rest, primary on hover
             let fl = lift(H::Folder);
+            disc(l.folder, fl);
             let (fx, fy) = center(l.folder);
-            self.draw_glyph(rt, FOLDER, fx, fy, px(14.0) * (1.0 + 0.16 * fl), &secondary)?;
+            self.draw_glyph(
+                rt,
+                FOLDER,
+                fx,
+                fy,
+                px(13.0),
+                if fl > 0.2 { &primary } else { &tertiary },
+            )?;
             let cl = lift(H::Close);
+            disc(l.close, cl);
             let (xx, xy) = center(l.close);
-            self.draw_cross(rt, xx, xy, px(9.0) * (1.0 + 0.16 * cl), &secondary)?;
+            self.draw_cross(
+                rt,
+                xx,
+                xy,
+                px(8.0),
+                if cl > 0.2 { &primary } else { &tertiary },
+            )?;
 
-            // -- Rows, or the discard question --
+            // -- The discard question, or the files --
             if v.confirming {
                 text(
                     &utf16(&v.confirm_message),
@@ -3773,100 +4151,91 @@ impl Renderer {
                     l.confirm_note,
                     &tertiary,
                 );
-                for (r, label, hit, filled) in [
+                for (r, label, hit, solid) in [
                     (l.keep, "Keep", H::Keep, true),
                     (l.discard, "Discard", H::Discard, false),
                 ] {
-                    pill(r, if filled { 1.0 } else { 0.0 }, lift(hit));
-                    text(&utf16(label), &formats.empty, r, &primary);
+                    if solid {
+                        accent.SetOpacity(1.0 - 0.1 * lift(hit));
+                        rt.FillRoundedRectangle(&rounded(r, r.height() / 2.0), &accent);
+                        accent.SetOpacity(1.0);
+                        text(&utf16(label), &formats.control_strong, r, &ink);
+                    } else {
+                        quiet(r, lift(hit));
+                        text(&utf16(label), &formats.control, r, &primary);
+                    }
                 }
-            } else if v.rows.is_empty() {
-                let (ex, ey) = center(l.rows[0]);
-                self.draw_glyph(rt, INBOX, ex, ey + px(4.0), px(22.0), &tertiary)?;
-                text(
-                    &utf16("Drop files to convert"),
-                    &formats.empty,
-                    RectF::new(
-                        l.rows[1].left,
-                        l.rows[1].top + px(8.0),
-                        l.rows[1].right,
-                        l.rows[1].bottom + px(8.0),
-                    ),
-                    &tertiary,
-                );
             }
-            for (i, row) in v
-                .rows
-                .iter()
-                .enumerate()
-                .take(if v.confirming { 0 } else { 3 })
-            {
+            // The files as one grouped list: a quiet container with a
+            // hairline border and inset dividers (from the file tile on), not
+            // a box per row
+            let shown = if v.confirming { 0 } else { v.rows.len().min(3) };
+            let list_radius = px(14.0);
+            if shown > 0 {
+                let (first, last) = (l.rows[0], l.rows[shown - 1]);
+                let list = RectF::new(first.left, first.top, first.right, last.bottom);
+                surface(list, list_radius, 0.04);
+                stroke_edge(rt, &edge, list, list_radius, line_w, 0.5);
+                white.SetOpacity(0.06);
+                for i in 1..shown {
+                    let y = (l.rows[i].top - line_w / 2.0).round();
+                    let from = l.row_parts(i).icon.left;
+                    let line = RectF::new(from, y, list.right - px(12.0), y + line_w);
+                    rt.FillRectangle(&line.to_d2d_rect(), &white);
+                }
+            }
+            for (i, row) in v.rows.iter().enumerate().take(shown) {
                 let fade = 1.0 - level(H::Gone(i)).0;
                 let draw_row = || -> Result<()> {
                     let p = l.row_parts(i);
                     let (check_level, _) = level(H::Check(i));
                     let (hover, press) = level(H::Row(i));
-                    // Row surface: ticked rows fill in, hover adds a touch
-                    let body = rounded(inner(p.row), px(10.0));
-                    let lit = (0.34 * check_level + 0.26 * hover + 0.2 * press).min(0.7);
+                    // Hover / press: a soft overlay inside the list
+                    let lit = (0.04 * hover + 0.03 * press).min(0.07);
                     if lit > 0.0 {
-                        fill.SetOpacity(lit);
-                        rt.FillRoundedRectangle(&rounded(p.row, px(10.0)), &fill);
+                        let h = RectF::new(
+                            p.row.left + px(4.0),
+                            p.row.top + px(4.0),
+                            p.row.right - px(4.0),
+                            p.row.bottom - px(4.0),
+                        );
+                        surface(h, list_radius - px(4.0), lit);
                     }
-                    outline.SetOpacity(0.55 + 0.45 * check_level);
-                    rt.DrawRoundedRectangle(&body, &outline, line_w, None);
-                    outline.SetOpacity(1.0);
-                    // Check box, or the outcome's glyph
+                    // The check (several files), or the outcome's glyph
                     let (bx, by) = center(p.check);
                     match row.kind {
                         RowKind::Done | RowKind::Saved => {
-                            self.draw_glyph(rt, DONE, bx, by, px(15.0), &primary)?;
+                            let g = if l.checks { (bx, by) } else { center(p.remove) };
+                            self.draw_glyph(rt, DONE, g.0, g.1, px(16.0), &accent)?;
                         }
-                        RowKind::Failed => {
-                            self.draw_glyph(rt, ALERT, bx, by, px(15.0), &tertiary)?;
+                        RowKind::Failed if l.checks => {
+                            self.draw_glyph(rt, ALERT, bx, by, px(16.0), &tertiary)?;
                         }
-                        RowKind::Busy => {
+                        RowKind::Busy if l.checks => {
                             self.draw_glyph(rt, UPDATE_ARROW, bx, by, px(12.0), &secondary)?;
                         }
-                        RowKind::Normal => {
-                            let ib = inner(p.check);
-                            outline.SetOpacity(if row.selectable { 1.0 } else { 0.4 });
-                            rt.DrawRoundedRectangle(&rounded(ib, px(4.5)), &outline, line_w, None);
-                            outline.SetOpacity(1.0);
-                            if check_level > 0.0 {
-                                fill.SetOpacity(check_level);
-                                rt.FillRoundedRectangle(&rounded(p.check, px(4.5)), &fill);
-                                primary.SetOpacity(check_level);
-                                self.draw_glyph(rt, CHECK, bx, by, px(11.0), &primary)?;
-                                primary.SetOpacity(1.0);
-                            }
+                        RowKind::Normal if l.checks => {
+                            round_check(p.check, check_level, row.selectable)?;
                         }
+                        _ => {}
                     }
-                    // File glyph, name, detail
-                    let (ix, iy) = center(p.icon);
+                    // The file's tile and glyph (tertiary), its name (primary)
+                    // and details (secondary)
                     let glyph = if row.family == Some(crate::convert::Family::Audio) {
                         MUSIC_ALT
                     } else {
                         PICTURE
                     };
                     let dim = row.kind == RowKind::Failed;
-                    // The glyph sits on a soft tile: a file's type reads at a glance
-                    let tile = px(24.0);
-                    let tile_rect = RectF::new(
-                        ix - tile / 2.0,
-                        iy - tile / 2.0,
-                        ix + tile / 2.0,
-                        iy + tile / 2.0,
-                    );
-                    fill.SetOpacity(if dim { 0.18 } else { 0.32 });
-                    rt.FillRoundedRectangle(&rounded(tile_rect, px(7.0)), &fill);
+                    surface(p.icon, px(7.0), 0.06);
+                    let (ix, iy) = center(p.icon);
                     self.draw_glyph(
                         rt,
                         glyph,
                         ix,
                         iy,
-                        px(14.0),
-                        if dim { &tertiary } else { &primary },
+                        px(crate::config::BASE_CONVERT_FILE_ICON),
+                        &tertiary,
                     )?;
                     text(
                         &utf16(&row.name),
@@ -3874,23 +4243,19 @@ impl Renderer {
                         p.name,
                         if dim { &secondary } else { &primary },
                     );
-                    text(&utf16(&row.detail), &formats.source, p.detail, &tertiary);
+                    text(&utf16(&row.detail), &formats.source, p.detail, &secondary);
                     if let Some(progress) = row.progress {
-                        rt.FillRoundedRectangle(
-                            &rounded(p.progress, p.progress.height() / 2.0),
-                            &track,
-                        );
+                        surface(p.progress, p.progress.height() / 2.0, 0.1);
                         let mut done = p.progress;
                         done.right = done.left + done.width() * progress.clamp(0.0, 1.0);
                         if done.width() > 0.0 {
-                            rt.FillRoundedRectangle(&rounded(done, done.height() / 2.0), &primary);
+                            rt.FillRoundedRectangle(&rounded(done, done.height() / 2.0), &accent);
                         }
                     }
                     // Trailing: Save or Show, then remove
                     if row.save {
-                        let sl = lift(H::Save(i));
-                        pill(p.action, 0.0, sl);
-                        text(&utf16("Save"), &formats.empty, p.action, &primary);
+                        quiet(p.action, lift(H::Save(i)));
+                        text(&utf16("Save"), &formats.control, p.action, &primary);
                     } else if row.show {
                         let (sx, sy) = center(p.action);
                         let sl = lift(H::Show(i));
@@ -3899,16 +4264,17 @@ impl Renderer {
                             FOLDER,
                             sx + p.action.width() / 2.0 - px(11.0),
                             sy,
-                            px(14.0) * (1.0 + 0.16 * sl),
-                            &secondary,
+                            px(13.0),
+                            if sl > 0.2 { &primary } else { &tertiary },
                         )?;
                     }
                     let rl = lift(H::Remove(i));
                     if hover > 0.0 || press > 0.0 || rl > 0.0 {
                         let (rx, ry) = center(p.remove);
-                        tertiary.SetOpacity((0.45 + 0.55 * rl).min(1.0) * hover.max(rl));
-                        self.draw_cross(rt, rx, ry, px(8.0) * (1.0 + 0.2 * rl), &tertiary)?;
-                        tertiary.SetOpacity(1.0);
+                        let b = if rl > 0.2 { &primary } else { &tertiary };
+                        b.SetOpacity(hover.max(rl));
+                        self.draw_cross(rt, rx, ry, px(8.0), b)?;
+                        b.SetOpacity(1.0);
                     }
                     Ok(())
                 };
@@ -3919,27 +4285,24 @@ impl Renderer {
                 }
             }
             if !v.confirming && v.total > crate::convert_batch::VISIBLE_ROWS {
-                // A thin scroll bar at the rows' right edge
+                // A thin scroll bar at the list's right edge
                 let area = RectF::new(
-                    l.rows[0].right - px(3.0),
-                    l.rows[0].top + px(6.0),
-                    l.rows[0].right - px(1.0),
-                    l.rows[2].bottom - px(6.0),
+                    l.rows[0].right - px(4.0),
+                    l.rows[0].top + px(8.0),
+                    l.rows[0].right - px(2.0),
+                    l.rows[2].bottom - px(8.0),
                 );
                 let share = crate::convert_batch::VISIBLE_ROWS as f32 / v.total as f32;
                 let h = (area.height() * share).max(px(10.0));
                 let top = area.top
                     + (area.height() - h) * v.scroll as f32
                         / (v.total - crate::convert_batch::VISIBLE_ROWS) as f32;
-                track.SetOpacity(0.5);
-                rt.FillRoundedRectangle(&rounded(area, px(1.0)), &track);
-                track.SetOpacity(1.0);
-                secondary.SetOpacity(0.7);
-                rt.FillRoundedRectangle(
-                    &rounded(RectF::new(area.left, top, area.right, top + h), px(1.0)),
-                    &secondary,
+                surface(area, px(1.0), 0.06);
+                surface(
+                    RectF::new(area.left, top, area.right, top + h),
+                    px(1.0),
+                    0.35,
                 );
-                secondary.SetOpacity(1.0);
             }
 
             // -- Action bar (dimmed while the discard question is open) --
@@ -3947,36 +4310,81 @@ impl Renderer {
                 if let (true, Some(hint)) = (v.formats.is_empty(), v.hint) {
                     text(&utf16(hint), &formats.source, l.pills_area, &tertiary);
                 }
+                // The formats as one segmented control: a quiet track and a
+                // single thumb. The thumb sits where the chosen levels weigh
+                // it, so as one fades out and the next in it glides between
+                // them (no layout or extra state)
+                let n = v.formats.len().min(5);
+                if n > 0 {
+                    let (first, last) = (l.pills[0], l.pills[n - 1]);
+                    let pad = first.top - l.pills_area.top;
+                    let track = RectF::new(
+                        first.left - pad,
+                        l.pills_area.top,
+                        last.right + pad,
+                        l.pills_area.bottom,
+                    );
+                    surface(track, px(10.0), 0.06);
+                    let (mut weight, mut x) = (0.0f32, 0.0f32);
+                    for i in 0..n {
+                        let (c, _) = level(H::Chosen(i));
+                        weight += c;
+                        x += c * l.pills[i].left;
+                    }
+                    if weight > 0.01 {
+                        let left = x / weight;
+                        let thumb = RectF::new(left, first.top, left + first.width(), first.bottom);
+                        surface(thumb, px(8.0), 0.16 * weight.min(1.0));
+                    }
+                }
                 for (i, f) in v.formats.iter().enumerate().take(5) {
                     let r = l.pills[i];
-                    let (chosen, _) = level(H::Chosen(i));
-                    pill(r, chosen, lift(H::Format(i)));
+                    let offered = v.offered.contains(f);
+                    let hover = if offered { lift(H::Format(i)) } else { 0.0 };
+                    let picked = v.target == Some(*f);
+                    if hover > 0.0 && !picked {
+                        surface(r, px(8.0), 0.05 * hover);
+                    }
+                    let ink = if picked || hover > 0.2 {
+                        &primary
+                    } else {
+                        &secondary
+                    };
+                    // The file's own format: shown, but disabled
+                    if !offered {
+                        ink.SetOpacity(0.45);
+                    }
                     text(
                         &utf16(f.label()),
-                        &formats.empty,
-                        r,
-                        if v.target == Some(*f) {
-                            &primary
+                        if picked {
+                            &formats.control_strong
                         } else {
-                            &secondary
+                            &formats.control
                         },
+                        r,
+                        ink,
                     );
+                    ink.SetOpacity(1.0);
                 }
                 let pl = lift(H::Primary);
                 let solid = v.primary != Primary::Cancel && v.primary != Primary::Done;
+                let radius = l.primary.height() / 2.0;
                 if solid {
-                    // Light fill, dark label: the single call to action
-                    let radius = l.primary.height() / 2.0;
-                    primary.SetOpacity(0.9 + 0.1 * pl);
-                    rt.FillRoundedRectangle(&rounded(l.primary, radius), &primary);
-                    primary.SetOpacity(1.0);
-                    let ink = rt.CreateSolidColorBrush(&NOTCH_BG_COLOR, None)?;
-                    text(&utf16(&v.primary_label), &formats.empty, l.primary, &ink);
-                } else {
-                    pill(l.primary, 0.0, pl);
+                    // The call to action: the accent, a dark semibold label
+                    accent.SetOpacity(1.0 - 0.1 * pl);
+                    rt.FillRoundedRectangle(&rounded(l.primary, radius), &accent);
+                    accent.SetOpacity(1.0);
                     text(
                         &utf16(&v.primary_label),
-                        &formats.empty,
+                        &formats.control_strong,
+                        l.primary,
+                        &ink,
+                    );
+                } else {
+                    quiet(l.primary, pl);
+                    text(
+                        &utf16(&v.primary_label),
+                        &formats.control,
                         l.primary,
                         &primary,
                     );
@@ -4156,6 +4564,8 @@ impl Renderer {
             return Ok(());
         }
         let blending = t.from != t.to;
+        self.nearby_settled
+            .set(!blending && t.alpha >= 1.0 && t.to == Scene::Space(OecaSpace::Nearby));
         let mask = if blending || t.alpha < 1.0 {
             Some(self.create_notch_geometry(dims)?)
         } else {
@@ -4184,8 +4594,8 @@ impl Renderer {
             }
             // Home <-> Music with a session: one composition morphing
             if let (Scene::Space(a), Scene::Space(b)) = (t.from, t.to)
-                && a != OecaSpace::Clipboard
-                && b != OecaSpace::Clipboard
+                && matches!(a, OecaSpace::Home | OecaSpace::Music)
+                && matches!(b, OecaSpace::Home | OecaSpace::Music)
                 && self.media.borrow().is_some()
             {
                 let music = if b == OecaSpace::Music {
@@ -4232,6 +4642,8 @@ impl Renderer {
             self.draw_settings(rt, &settled)
         } else if space == OecaSpace::Clipboard {
             self.draw_clipboard(rt, &settled)
+        } else if space == OecaSpace::Nearby {
+            self.draw_nearby(rt, &settled)
         } else {
             let media = self.media.borrow();
             let composition = media.as_ref().and_then(|m| {
@@ -4265,6 +4677,366 @@ impl Renderer {
             self.set_offset(rt, 0.0);
         }
         drawn
+    }
+
+    /// The Nearby space (see `NearbyLayout`): the status line in the header,
+    /// then a message, the device rows or the transfer card. Decisions draw
+    /// dimmed until the picture says they are armed.
+    fn draw_nearby(&self, rt: &ID2D1RenderTarget, dims: &NotchDimensions) -> Result<()> {
+        use crate::layout::NearbyHit as H;
+        use crate::nearby_ui::{Card, FileState, Page, Tone};
+        let picture = self.nearby.borrow();
+        let Some(model) = picture.model.as_ref() else {
+            return Ok(());
+        };
+        self.nearby_drawn.set(self.nearby_generation.get());
+        let Some(l) = crate::layout::resolve_nearby_layout(dims) else {
+            return Ok(());
+        };
+        let formats = self.media_formats(dims)?;
+        let px = |x: f32| (x * dims.scale).round();
+        let lift = |h: H| {
+            let (hover, press) = self.feedback.borrow().clip_levels(PanelHit::Nearby(h));
+            (hover + press).min(1.0)
+        };
+        let utf16 = |s: &str| -> Vec<u16> { s.encode_utf16().collect() };
+        let rounded = |r: RectF, radius: f32| D2D1_ROUNDED_RECT {
+            rect: r.to_d2d_rect(),
+            radiusX: radius,
+            radiusY: radius,
+        };
+        let line_w = px(crate::config::BASE_CLIPBOARD_ROW_OUTLINE).max(1.0);
+        unsafe {
+            let edge = self.edge(rt)?;
+            let primary = rt.CreateSolidColorBrush(&COLOR_TEXT_PRIMARY, None)?;
+            let secondary = rt.CreateSolidColorBrush(&COLOR_TEXT_SECONDARY, None)?;
+            let tertiary = rt.CreateSolidColorBrush(&COLOR_TEXT_TERTIARY, None)?;
+            let warn = rt.CreateSolidColorBrush(&NEARBY_WARN_COLOR, None)?;
+            let white = rt.CreateSolidColorBrush(&COLOR_TEXT_PRIMARY, None)?;
+            let ink = rt.CreateSolidColorBrush(&NOTCH_BG_COLOR, None)?;
+            let accent = rt.CreateSolidColorBrush(&self.settings.get().accent.color(), None)?;
+            let text =
+                |s: &str,
+                 f: &IDWriteTextFormat,
+                 r: RectF,
+                 b: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush| {
+                    rt.DrawText(
+                        &utf16(s),
+                        f,
+                        &r.to_d2d_rect(),
+                        b,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    )
+                };
+            let surface = |r: RectF, radius: f32, alpha: f32| {
+                white.SetOpacity(alpha);
+                rt.FillRoundedRectangle(&rounded(r, radius), &white);
+            };
+            // A text button: quiet, or filled with the accent (the one call
+            // to action); dimmed while it cannot be used
+            let button = |r: RectF, label: &str, filled: bool, lift: f32, enabled: bool| {
+                let dim = if enabled { 1.0 } else { 0.4 };
+                if filled {
+                    accent.SetOpacity(dim * (1.0 - 0.1 * lift));
+                    rt.FillRoundedRectangle(&rounded(r, r.height() / 2.0), &accent);
+                    accent.SetOpacity(1.0);
+                    ink.SetOpacity(dim);
+                    text(label, &formats.control_strong, r, &ink);
+                    ink.SetOpacity(1.0);
+                } else {
+                    let lift = if enabled { lift } else { 0.0 };
+                    surface(r, r.height() / 2.0, (0.06 + 0.06 * lift) * dim);
+                    primary.SetOpacity(dim);
+                    text(label, &formats.control, r, &primary);
+                    primary.SetOpacity(1.0);
+                }
+            };
+            // The header's status line
+            text(&model.status, &formats.source, l.status, &tertiary);
+
+            match &model.page {
+                Page::Off | Page::Unavailable(_) | Page::Message { .. } => {
+                    let (title, note, open) = match &model.page {
+                        Page::Off => (
+                            crate::nearby_ui::OFF_TITLE.to_string(),
+                            crate::nearby_ui::OFF_NOTE.to_string(),
+                            true,
+                        ),
+                        Page::Unavailable(why) => {
+                            ("Hop isn't available".to_string(), why.to_string(), false)
+                        }
+                        Page::Message { title, note } => (title.clone(), note.clone(), false),
+                        _ => unreachable!(),
+                    };
+                    // Without a button the two lines centre in the area
+                    let dy = if open {
+                        0.0
+                    } else {
+                        ((l.message_button.bottom - l.message_note.bottom) / 2.0).round()
+                    };
+                    let down = |r: RectF| RectF::new(r.left, r.top + dy, r.right, r.bottom + dy);
+                    text(&title, &formats.empty, down(l.message_title), &primary);
+                    text(&note, &formats.empty, down(l.message_note), &tertiary);
+                    if open {
+                        button(
+                            l.message_button,
+                            crate::nearby_ui::OPEN_SETTINGS,
+                            false,
+                            lift(H::OpenSettings),
+                            true,
+                        );
+                    }
+                }
+                Page::Peers(peers) => {
+                    let shown: Vec<_> = peers
+                        .iter()
+                        .skip(picture.scroll)
+                        .take(crate::layout::NEARBY_ROWS)
+                        .collect();
+                    if let (Some(_), Some(last)) = (shown.first(), l.rows.get(shown.len() - 1)) {
+                        let radius = px(14.0);
+                        let list =
+                            RectF::new(l.rows[0].left, l.rows[0].top, last.right, last.bottom);
+                        surface(list, radius, 0.04);
+                        stroke_edge(rt, &edge, list, radius, line_w, 0.5);
+                        white.SetOpacity(0.06);
+                        for i in 1..shown.len() {
+                            let y = ((l.rows[i - 1].bottom + l.rows[i].top) / 2.0).round();
+                            let line = RectF::new(
+                                l.row_names[i].left,
+                                y,
+                                list.right - px(12.0),
+                                y + line_w,
+                            );
+                            rt.FillRectangle(&line.to_d2d_rect(), &white);
+                        }
+                    }
+                    for (i, p) in shown.iter().enumerate() {
+                        text(&p.name, &formats.artist, l.row_names[i], &primary);
+                        text(&p.detail, &formats.source, l.row_details[i], &secondary);
+                        button(
+                            l.row_buttons[i],
+                            "Send files",
+                            false,
+                            lift(H::Send(i)),
+                            !picture.picking,
+                        );
+                    }
+                    if peers.len() > crate::layout::NEARBY_ROWS {
+                        // A thin scroll bar at the list's right edge
+                        let (top, bottom) = (
+                            l.rows[0].top + px(8.0),
+                            l.rows[crate::layout::NEARBY_ROWS - 1].bottom - px(8.0),
+                        );
+                        let area = RectF::new(
+                            l.rows[0].right - px(4.0),
+                            top,
+                            l.rows[0].right - px(2.0),
+                            bottom,
+                        );
+                        let n = peers.len() as f32;
+                        let share = crate::layout::NEARBY_ROWS as f32 / n;
+                        let h = (area.height() * share).max(px(10.0));
+                        let max = (peers.len() - crate::layout::NEARBY_ROWS) as f32;
+                        let t = area.top
+                            + (area.height() - h) * picture.scroll.min(max as usize) as f32 / max;
+                        surface(area, px(1.0), 0.06);
+                        surface(RectF::new(area.left, t, area.right, t + h), px(1.0), 0.35);
+                    }
+                }
+                Page::Transfer(card) => {
+                    let c: &Card = card;
+                    text(&c.title, &formats.artist, l.card_title, &primary);
+                    if let Some((label, tone)) = c.identity {
+                        let b = match tone {
+                            Tone::Good => &secondary,
+                            Tone::Plain => &tertiary,
+                            Tone::Warn => &warn,
+                        };
+                        text(label, &formats.meta_trailing, l.card_identity, b);
+                    }
+                    text(
+                        &c.note,
+                        &formats.source,
+                        l.card_note,
+                        if c.warn { &warn } else { &secondary },
+                    );
+                    if let Some(code) = &c.code {
+                        text(
+                            &crate::nearby_ui::code_text(code).0,
+                            &formats.code,
+                            l.card_code,
+                            &primary,
+                        );
+                    } else {
+                        let mut lines = l.card_lines.iter();
+                        if let Some(p) = c.progress {
+                            let bar = l.card_progress;
+                            surface(bar, bar.height() / 2.0, 0.1);
+                            let mut done = bar;
+                            done.right = done.left + done.width() * p.clamp(0.0, 1.0);
+                            if done.width() > 0.5 {
+                                rt.FillRoundedRectangle(
+                                    &rounded(done, done.height() / 2.0),
+                                    &accent,
+                                );
+                            }
+                            lines.next();
+                        }
+                        // Files: dangerous ones first, then those still
+                        // pending or not done (the outcome that matters)
+                        let mut order: Vec<usize> = (0..c.files.len()).collect();
+                        order.sort_by_key(|i| {
+                            let f = &c.files[*i];
+                            (!f.dangerous, f.state == FileState::Done)
+                        });
+                        let slots: Vec<&RectF> = lines.collect();
+                        let room = slots.len();
+                        // One line (under the progress bar): the first file
+                        // still under way; two: the last says how many more
+                        let more = c.files.len().saturating_sub(room);
+                        let listed = if more > 0 && room > 1 {
+                            room - 1
+                        } else {
+                            room.min(c.files.len())
+                        };
+                        for (k, i) in order.iter().take(listed).enumerate() {
+                            self.draw_nearby_file(
+                                rt,
+                                &c.files[*i],
+                                *slots[k],
+                                &formats,
+                                dims,
+                                &primary,
+                                &secondary,
+                                &tertiary,
+                                &warn,
+                                &accent,
+                            )?;
+                        }
+                        if more > 0 && listed < room && listed > 0 {
+                            let n = c.files.len() - listed;
+                            text(
+                                &format!("and {n} more {}", if n == 1 { "file" } else { "files" }),
+                                &formats.source,
+                                *slots[listed],
+                                &tertiary,
+                            );
+                        }
+                    }
+                    text(&c.summary, &formats.source, l.card_footer, &tertiary);
+                    let rects = l.card_buttons(c.buttons.len());
+                    let armed = c.armed(std::time::Instant::now(), self.nearby_shown_at());
+                    for (i, (b, r)) in c.buttons.iter().zip(rects).enumerate() {
+                        let enabled = armed || !Card::is_decision(b.action);
+                        button(*r, b.label, b.primary, lift(H::Button(i)), enabled);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One file line of a transfer card: a mark for a dangerous file, the
+    /// name (its stem cut with an ellipsis, its extension never), then the
+    /// size or the file's outcome at the right.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_nearby_file(
+        &self,
+        rt: &ID2D1RenderTarget,
+        f: &crate::nearby_ui::FileLine,
+        r: RectF,
+        formats: &MediaFormats,
+        dims: &NotchDimensions,
+        primary: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
+        secondary: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
+        tertiary: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
+        warn: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
+        accent: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
+    ) -> Result<()> {
+        use crate::nearby_ui::FileState;
+        let px = |x: f32| (x * dims.scale).round();
+        let utf16 = |s: &str| -> Vec<u16> { s.encode_utf16().collect() };
+        let draw = |s: &str, fmt: &IDWriteTextFormat, r: RectF, b| unsafe {
+            rt.DrawText(
+                &utf16(s),
+                fmt,
+                &r.to_d2d_rect(),
+                b,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            )
+        };
+        // Natural width (the same format the name draws in)
+        let width = |s: &str| -> Result<f32> {
+            unsafe {
+                let layout = self.dwrite_factory.CreateTextLayout(
+                    &utf16(s),
+                    &formats.source,
+                    10_000.0,
+                    1.0,
+                )?;
+                let mut m = DWRITE_TEXT_METRICS::default();
+                layout.GetMetrics(&mut m)?;
+                Ok(m.widthIncludingTrailingWhitespace)
+            }
+        };
+        let (status, brush) = match f.state {
+            FileState::Pending => (f.size.clone(), tertiary),
+            FileState::Done => (f.size.clone(), secondary),
+            FileState::NotDone => ("Not saved".to_string(), warn),
+            FileState::NotConfirmed => ("Not confirmed".to_string(), warn),
+        };
+        let status_w = px(96.0);
+        let status_r = RectF::new(r.right - status_w, r.top, r.right, r.bottom);
+        draw(&status, &formats.meta_trailing, status_r, brush);
+        // A glyph column on every line, so the names align
+        let (cy, u) = ((r.top + r.bottom) / 2.0, px(12.0));
+        if f.dangerous {
+            self.draw_glyph(rt, ALERT, r.left + u / 2.0, cy, u, warn)?;
+        } else if f.state == FileState::Done {
+            self.draw_glyph(rt, DONE, r.left + u / 2.0, cy, u, accent)?;
+        }
+        let x = r.left + u + px(6.0);
+        let avail = (status_r.left - px(12.0) - x).max(0.0);
+        // The extension first (its end, if even it is too long), then the
+        // stem in what is left, cut with an ellipsis
+        let ext = if f.ext.is_empty() {
+            String::new()
+        } else {
+            let measured = std::cell::Cell::new(Ok(()));
+            let fitted = crate::nearby_ui::fit_tail(&f.ext, avail, |s| {
+                width(s).unwrap_or_else(|e| {
+                    measured.set(Err(e));
+                    f32::MAX
+                })
+            });
+            measured.into_inner()?;
+            fitted
+        };
+        let ext_w = if ext.is_empty() {
+            0.0
+        } else {
+            width(&ext)?.ceil().min(avail)
+        };
+        let stem_w = width(&f.stem)?.ceil().min((avail - ext_w).max(0.0));
+        draw(
+            &f.stem,
+            &formats.source,
+            RectF::new(x, r.top, x + stem_w, r.bottom),
+            primary,
+        );
+        if ext_w > 0.0 {
+            let ex = x + stem_w;
+            draw(
+                &ext,
+                &formats.source,
+                RectF::new(ex, r.top, ex + ext_w + 1.0, r.bottom),
+                primary,
+            );
+        }
+        Ok(())
     }
 
     /// Settings page: a quiet "Settings" label, the quick settings (title,
@@ -4340,7 +5112,8 @@ impl Renderer {
 
     /// A switch (see `draw_switch`).
     fn draw_switch(&self, rt: &ID2D1RenderTarget, t: RectF, level: f32, inset: f32) -> Result<()> {
-        draw_switch(rt, t, level, inset, 1.0, self.settings.get().accent)
+        let edge = self.edge(rt)?;
+        draw_switch(rt, t, level, inset, 1.0, self.settings.get().accent, &edge)
     }
 
     /// Home <-> Music with a session: cover, text and controls move between
@@ -4396,7 +5169,7 @@ impl Renderer {
         };
         let center = |r: RectF| ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
         unsafe {
-            let outline = rt.CreateSolidColorBrush(&COLOR_CLIPBOARD_ROW, None)?;
+            let edge = self.edge(rt)?;
             let outline_w = px(crate::config::BASE_CLIPBOARD_ROW_OUTLINE).max(1.0);
             let primary = rt.CreateSolidColorBrush(&COLOR_TEXT_PRIMARY, None)?;
             let secondary = rt.CreateSolidColorBrush(&COLOR_TEXT_SECONDARY, None)?;
@@ -4455,25 +5228,9 @@ impl Renderer {
                         fill.SetOpacity(if filled { 1.0 + 0.6 * lift } else { 0.6 * lift });
                         rt.FillRoundedRectangle(&pill, &fill);
                     }
-                    if !filled {
-                        let half = outline_w / 2.0;
-                        let inner = RectF::new(
-                            r.left + half,
-                            r.top + half,
-                            r.right - half,
-                            r.bottom - half,
-                        );
-                        rt.DrawRoundedRectangle(
-                            &D2D1_ROUNDED_RECT {
-                                rect: inner.to_d2d_rect(),
-                                radiusX: inner.height() / 2.0,
-                                radiusY: inner.height() / 2.0,
-                            },
-                            &outline,
-                            outline_w,
-                            None,
-                        );
-                    }
+                    // Both raised with a lit rim; the outlined one quieter
+                    let rim = if filled { 1.0 } else { 0.7 + 0.3 * lift };
+                    stroke_edge(rt, &edge, r, r.height() / 2.0, outline_w, rim);
                     text(&utf16(label), &formats.empty, r, &primary);
                 }
             } else {
@@ -4492,7 +5249,7 @@ impl Renderer {
                 let p = l.tile_parts(i);
                 let shown = self.feedback.borrow().clip_levels(PanelHit::Row(i)).0;
                 let half = outline_w / 2.0;
-                let edge = RectF::new(
+                let inset = RectF::new(
                     p.tile.left + half,
                     p.tile.top + half,
                     p.tile.right - half,
@@ -4501,14 +5258,17 @@ impl Renderer {
                 let profile = CornerProfile::new(
                     px(crate::config::BASE_CLIPBOARD_TILE_RADIUS),
                     1.0,
-                    edge.width().min(edge.height()) / 2.0,
+                    inset.width().min(inset.height()) / 2.0,
                 );
-                let path = self.smooth_rect_path(edge, profile.span, profile.handle)?;
+                let path = self.smooth_rect_path(inset, profile.span, profile.handle)?;
+                // A quiet hairline tile; hover lifts it (no fill at rest: a
+                // large anti-aliased fill per tile per frame)
                 if shown > 0.0 {
                     lift.SetOpacity(0.45 * shown);
                     rt.FillGeometry(&path, &lift, None);
                 }
-                rt.DrawGeometry(&path, &outline, outline_w, None);
+                edge_opacity(&edge, 1.0);
+                rt.DrawGeometry(&path, &edge, outline_w, None);
                 match row {
                     ClipRow::Text(t) => text(t, &formats.clip_text, p.text, &primary),
                     ClipRow::Image(art, caption) => {
@@ -4516,7 +5276,7 @@ impl Renderer {
                         let size = (img.width().max(1.0) as u32, img.height().max(1.0) as u32);
                         // Concentric with the tile: the outline's own curve,
                         // starting as much later as the image sits inside it
-                        let inner = profile.nested(img.left - edge.left);
+                        let inner = profile.nested(img.left - inset.left);
                         match self.thumb_bitmap(rt, art, size, inner) {
                             Ok(bitmap) => rt.DrawBitmap(
                                 &bitmap,
@@ -4660,16 +5420,8 @@ impl Renderer {
     fn viz_colours(&self, fallback: D2D1_COLOR_F) -> [D2D1_COLOR_F; 2] {
         let target = match self.viz_palette.borrow().as_ref().and_then(|(_, g)| *g) {
             Some(g) => [rgb_color(g.top), rgb_color(g.bottom)],
-            None => {
-                let lift = |v: f32| v + (1.0 - v) * 0.12;
-                let top = D2D1_COLOR_F {
-                    r: lift(fallback.r),
-                    g: lift(fallback.g),
-                    b: lift(fallback.b),
-                    a: 1.0,
-                };
-                [top, D2D1_COLOR_F { a: 1.0, ..fallback }]
-            }
+            // Flat in the accent
+            None => [D2D1_COLOR_F { a: 1.0, ..fallback }; 2],
         };
         let now = std::time::Instant::now();
         let mut blend = self.viz_blend.get();
@@ -4849,10 +5601,34 @@ impl Renderer {
             _ => timeline.position_at(now_filetime(), playing),
         };
         let frac = elapsed as f32 / timeline.duration_ms as f32;
+        // A scrub moves the playhead on a spring: it starts from where the
+        // bar was, follows the pointer with weight, and lands on the seek
+        let motion = crate::window::motion_allowed(
+            self.settings.get().reduced_motion,
+            crate::window::is_client_animation_enabled(),
+        );
+        let frac = match self.scrub_glide.get() {
+            Some(mut g) => {
+                g.target = frac;
+                self.scrub_glide.set(Some(g));
+                g.value
+            }
+            None if motion && self.scrub.get().is_some() => {
+                let from = timeline.position_at(now_filetime(), playing) as f32
+                    / timeline.duration_ms as f32;
+                let mut g = crate::config::Glide::at(from.clamp(0.0, 1.0));
+                g.target = frac;
+                self.scrub_glide.set(Some(g));
+                g.value
+            }
+            None => frac,
+        };
 
-        // Apple-style track: one rounded bar; the played part is the same bar in
-        // the accent, clipped at the playhead (rounded start, straight cut), no thumb
-        let thick = px(BASE_MEDIA_TIMELINE_TRACK).max(2.0);
+        // Apple-style track: one rounded bar; the played part is a shorter
+        // rounded bar in the accent on top of it, no thumb
+        // Thicker while held (the grip eases it in and out)
+        let grip = 1.0 + crate::config::SCRUB_GRIP_GROWTH * self.scrub_grip.get().value;
+        let thick = (px(BASE_MEDIA_TIMELINE_TRACK) * grip).max(2.0);
         let top = ((strip.top + strip.bottom) / 2.0 - thick / 2.0).round();
         let bar = D2D1_ROUNDED_RECT {
             rect: RectF::new(track_left, top, track_right, top + thick).to_d2d_rect(),
@@ -4865,14 +5641,17 @@ impl Renderer {
             rt.FillRoundedRectangle(&bar, &unplayed);
             let x = track_left + (track_right - track_left) * frac.clamp(0.0, 1.0);
             if x > track_left {
+                // Its own pill: rounded at the playhead too (radius shrinks
+                // with the length at the very start)
                 let played = rt.CreateSolidColorBrush(&accent, None)?;
                 played.SetOpacity(opacity);
-                rt.PushAxisAlignedClip(
-                    &RectF::new(track_left, top, x, top + thick).to_d2d_rect(),
-                    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                );
-                rt.FillRoundedRectangle(&bar, &played);
-                rt.PopAxisAlignedClip();
+                let r = (thick / 2.0).min((x - track_left) / 2.0);
+                let fill = D2D1_ROUNDED_RECT {
+                    rect: RectF::new(track_left, top, x, top + thick).to_d2d_rect(),
+                    radiusX: r,
+                    radiusY: r,
+                };
+                rt.FillRoundedRectangle(&fill, &played);
             }
 
             let label = rt.CreateSolidColorBrush(&COLOR_TEXT_TERTIARY, None)?;
@@ -5223,8 +6002,8 @@ impl Renderer {
                         rt.FillRoundedRectangle(
                             &D2D1_ROUNDED_RECT {
                                 rect: b.to_d2d_rect(),
-                                radiusX: b.width() / 2.0,
-                                radiusY: b.width() / 2.0,
+                                radiusX: b.width() * BAR_ROUNDING,
+                                radiusY: b.width() * BAR_ROUNDING,
                             },
                             &ink,
                         );
@@ -5630,7 +6409,7 @@ impl Renderer {
         Ok(path)
     }
 
-    /// Fills transport glyph primitives (capsule bars, rounded triangles).
+    /// Fills transport glyph primitives (rounded bars, rounded triangles).
     fn fill_shapes(
         &self,
         rt: &ID2D1RenderTarget,
@@ -5640,7 +6419,7 @@ impl Renderer {
         for shape in shapes {
             match *shape {
                 IconShape::Bar(r) => unsafe {
-                    let radius = r.width() / 2.0;
+                    let radius = r.width() * BAR_ROUNDING;
                     rt.FillRoundedRectangle(
                         &D2D1_ROUNDED_RECT {
                             rect: r.to_d2d_rect(),
@@ -5885,6 +6664,31 @@ impl Renderer {
                     DWRITE_TEXT_ALIGNMENT_CENTER,
                 )?,
                 timer_slot: role(TextRole::ClockCompact, DWRITE_TEXT_ALIGNMENT_TRAILING)?,
+                control: self.create_line_format(
+                    &text_font(&self.dwrite_factory),
+                    crate::config::BASE_CONTROL_FONT_SIZE * s,
+                    DWRITE_FONT_WEIGHT(400),
+                    DWRITE_TEXT_ALIGNMENT_CENTER,
+                )?,
+                control_lead: self.create_line_format(
+                    &text_font(&self.dwrite_factory),
+                    crate::config::BASE_CONTROL_FONT_SIZE * s,
+                    DWRITE_FONT_WEIGHT(400),
+                    DWRITE_TEXT_ALIGNMENT_LEADING,
+                )?,
+                control_strong: self.create_line_format(
+                    &text_font(&self.dwrite_factory),
+                    crate::config::BASE_CONTROL_FONT_SIZE * s,
+                    DWRITE_FONT_WEIGHT(500),
+                    DWRITE_TEXT_ALIGNMENT_CENTER,
+                )?,
+                meta_trailing: role(TextRole::MediaMeta, DWRITE_TEXT_ALIGNMENT_TRAILING)?,
+                code: self.create_line_format(
+                    &text_font(&self.dwrite_factory),
+                    NEARBY_CODE_FONT_SIZE * s,
+                    DWRITE_FONT_WEIGHT(500),
+                    DWRITE_TEXT_ALIGNMENT_LEADING,
+                )?,
                 clip_text: {
                     let f = role(TextRole::MediaArtist, DWRITE_TEXT_ALIGNMENT_LEADING)?;
                     unsafe {
@@ -6527,6 +7331,7 @@ impl Renderer {
             };
             rt.BindDC(mem_dc, &bind_rect)?;
 
+            self.nearby_settled.set(false);
             rt.BeginDraw();
 
             // Transparent background (clears all alpha to 0)
@@ -6595,6 +7400,7 @@ impl Renderer {
             self.set_offset(rt, 0.0);
 
             rt.EndDraw(None, None)?;
+            self.nearby_mark(hwnd);
 
             // Soft dark ambient shadow for expanded notch. The mask (kept in
             // scratch_a) depends only on the silhouette, so frames of a settled
@@ -6877,242 +7683,560 @@ const SUN: &[IconSeg] = &[
     IconSeg::Z,
 ];
 
+/// Nearby: a dot under two arcs; the Nearby space. Hand-made (like the HUD
+/// solids): two quarter bands and a disc around (0, 0.23), filling -0.33..0.33.
+pub(crate) const NEARBY: &[IconSeg] = &[
+    IconSeg::M(-0.2333, -0.0033),
+    IconSeg::C(-0.1045, -0.1322, 0.1045, -0.1322, 0.2333, -0.0033),
+    IconSeg::L(0.1485, 0.0815),
+    IconSeg::C(0.0665, -0.0005, -0.0665, -0.0005, -0.1485, 0.0815),
+    IconSeg::Z,
+    IconSeg::M(-0.3889, -0.1589),
+    IconSeg::C(-0.1741, -0.3737, 0.1741, -0.3737, 0.3889, -0.1589),
+    IconSeg::L(0.3041, -0.0741),
+    IconSeg::C(0.1361, -0.2420, -0.1361, -0.2420, -0.3041, -0.0741),
+    IconSeg::Z,
+    IconSeg::M(0.1000, 0.2300),
+    IconSeg::C(0.1000, 0.2852, 0.0552, 0.3300, 0.0000, 0.3300),
+    IconSeg::C(-0.0552, 0.3300, -0.1000, 0.2852, -0.1000, 0.2300),
+    IconSeg::C(-0.1000, 0.1748, -0.0552, 0.1300, -0.0000, 0.1300),
+    IconSeg::C(0.0552, 0.1300, 0.1000, 0.1748, 0.1000, 0.2300),
+    IconSeg::Z,
+];
+
 /// Home: a soft-roofed house with an arched door; the Home space.
 const HOUSE_BLANK: &[IconSeg] = &[
-    IconSeg::M(0.0900, -0.4521),
-    IconSeg::L(0.4625, -0.1444),
-    IconSeg::C(0.4863, -0.1248, 0.5000, -0.0956, 0.5000, -0.0648),
-    IconSeg::L(0.5000, 0.3540),
-    IconSeg::C(0.5000, 0.4320, 0.4367, 0.4953, 0.3587, 0.4953),
-    IconSeg::L(0.2011, 0.4953),
-    IconSeg::C(0.1681, 0.4953, 0.1413, 0.4685, 0.1413, 0.4355),
-    IconSeg::L(0.1413, 0.2942),
-    IconSeg::C(0.1413, 0.2312, 0.0902, 0.1801, 0.0272, 0.1801),
-    IconSeg::L(-0.0272, 0.1801),
-    IconSeg::C(-0.0902, 0.1801, -0.1413, 0.2312, -0.1413, 0.2942),
-    IconSeg::L(-0.1413, 0.4355),
-    IconSeg::C(-0.1413, 0.4685, -0.1681, 0.4953, -0.2011, 0.4953),
-    IconSeg::L(-0.3587, 0.4953),
-    IconSeg::C(-0.4367, 0.4953, -0.5000, 0.4320, -0.5000, 0.3540),
-    IconSeg::L(-0.5000, -0.0648),
-    IconSeg::C(-0.5000, -0.0956, -0.4863, -0.1248, -0.4625, -0.1444),
-    IconSeg::L(-0.0900, -0.4521),
-    IconSeg::C(-0.0378, -0.4953, 0.0378, -0.4953, 0.0900, -0.4521),
+    IconSeg::M(-0.0128, -0.4993),
+    IconSeg::C(-0.0054, -0.4996, 0.0020, -0.4999, 0.0093, -0.4997),
+    IconSeg::C(0.0167, -0.4995, 0.0242, -0.4991, 0.0315, -0.4982),
+    IconSeg::C(0.0388, -0.4973, 0.0460, -0.4961, 0.0532, -0.4944),
+    IconSeg::C(0.0604, -0.4928, 0.0676, -0.4907, 0.0746, -0.4884),
+    IconSeg::C(0.0816, -0.4861, 0.0885, -0.4835, 0.0952, -0.4806),
+    IconSeg::C(0.1020, -0.4776, 0.1087, -0.4744, 0.1151, -0.4708),
+    IconSeg::C(0.1215, -0.4672, 0.1277, -0.4632, 0.1339, -0.4592),
+    IconSeg::C(0.1400, -0.4551, 0.1460, -0.4509, 0.1519, -0.4464),
+    IconSeg::C(0.1577, -0.4419, 0.1634, -0.4369, 0.1691, -0.4322),
+    IconSeg::C(0.1748, -0.4275, 0.1804, -0.4230, 0.1860, -0.4183),
+    IconSeg::C(0.1916, -0.4136, 0.1972, -0.4088, 0.2029, -0.4041),
+    IconSeg::C(0.2085, -0.3993, 0.2144, -0.3945, 0.2201, -0.3898),
+    IconSeg::C(0.2258, -0.3851, 0.2313, -0.3806, 0.2370, -0.3759),
+    IconSeg::C(0.2427, -0.3713, 0.2485, -0.3667, 0.2542, -0.3621),
+    IconSeg::C(0.2599, -0.3574, 0.2655, -0.3526, 0.2711, -0.3478),
+    IconSeg::C(0.2767, -0.3431, 0.2823, -0.3382, 0.2880, -0.3336),
+    IconSeg::C(0.2937, -0.3289, 0.2995, -0.3244, 0.3052, -0.3197),
+    IconSeg::C(0.3110, -0.3150, 0.3168, -0.3101, 0.3225, -0.3054),
+    IconSeg::C(0.3282, -0.3007, 0.3337, -0.2962, 0.3394, -0.2915),
+    IconSeg::C(0.3450, -0.2869, 0.3506, -0.2820, 0.3562, -0.2773),
+    IconSeg::C(0.3619, -0.2725, 0.3674, -0.2677, 0.3731, -0.2630),
+    IconSeg::C(0.3788, -0.2584, 0.3846, -0.2538, 0.3904, -0.2492),
+    IconSeg::C(0.3961, -0.2445, 0.4019, -0.2400, 0.4076, -0.2353),
+    IconSeg::C(0.4133, -0.2306, 0.4190, -0.2259, 0.4245, -0.2210),
+    IconSeg::C(0.4300, -0.2162, 0.4356, -0.2114, 0.4406, -0.2060),
+    IconSeg::C(0.4457, -0.2007, 0.4504, -0.1950, 0.4549, -0.1892),
+    IconSeg::C(0.4594, -0.1834, 0.4637, -0.1774, 0.4676, -0.1712),
+    IconSeg::C(0.4716, -0.1649, 0.4753, -0.1583, 0.4785, -0.1517),
+    IconSeg::C(0.4817, -0.1450, 0.4842, -0.1384, 0.4867, -0.1314),
+    IconSeg::C(0.4892, -0.1245, 0.4917, -0.1172, 0.4935, -0.1100),
+    IconSeg::C(0.4953, -0.1029, 0.4967, -0.0955, 0.4976, -0.0883),
+    IconSeg::C(0.4986, -0.0810, 0.4987, -0.0738, 0.4991, -0.0665),
+    IconSeg::C(0.4995, -0.0592, 0.4997, -0.0518, 0.4999, -0.0444),
+    IconSeg::C(0.5000, -0.0370, 0.4999, -0.0297, 0.4999, -0.0223),
+    IconSeg::C(0.4999, -0.0149, 0.4999, -0.0075, 0.4999, -0.0002),
+    IconSeg::C(0.4999, 0.0072, 0.4999, 0.0146, 0.4999, 0.0220),
+    IconSeg::C(0.4999, 0.0293, 0.4999, 0.0367, 0.4999, 0.0441),
+    IconSeg::C(0.4999, 0.0515, 0.4999, 0.0588, 0.4999, 0.0662),
+    IconSeg::C(0.4999, 0.0736, 0.4999, 0.0810, 0.4999, 0.0883),
+    IconSeg::C(0.4999, 0.0957, 0.4999, 0.1031, 0.4999, 0.1105),
+    IconSeg::C(0.4999, 0.1179, 0.4999, 0.1252, 0.4999, 0.1326),
+    IconSeg::C(0.4999, 0.1400, 0.4999, 0.1474, 0.4999, 0.1547),
+    IconSeg::C(0.4999, 0.1621, 0.4999, 0.1695, 0.4999, 0.1769),
+    IconSeg::C(0.4999, 0.1842, 0.4999, 0.1916, 0.4999, 0.1990),
+    IconSeg::C(0.4999, 0.2064, 0.4999, 0.2137, 0.4999, 0.2211),
+    IconSeg::C(0.4999, 0.2285, 0.4999, 0.2359, 0.4999, 0.2432),
+    IconSeg::C(0.4999, 0.2506, 0.4999, 0.2580, 0.4999, 0.2654),
+    IconSeg::C(0.4998, 0.2727, 0.4997, 0.2801, 0.4995, 0.2875),
+    IconSeg::C(0.4993, 0.2949, 0.4993, 0.3023, 0.4987, 0.3096),
+    IconSeg::C(0.4982, 0.3169, 0.4974, 0.3242, 0.4961, 0.3314),
+    IconSeg::C(0.4948, 0.3386, 0.4930, 0.3457, 0.4909, 0.3527),
+    IconSeg::C(0.4887, 0.3598, 0.4862, 0.3669, 0.4834, 0.3737),
+    IconSeg::C(0.4806, 0.3806, 0.4775, 0.3872, 0.4740, 0.3936),
+    IconSeg::C(0.4705, 0.4001, 0.4666, 0.4063, 0.4624, 0.4124),
+    IconSeg::C(0.4582, 0.4184, 0.4537, 0.4244, 0.4489, 0.4300),
+    IconSeg::C(0.4441, 0.4356, 0.4388, 0.4411, 0.4335, 0.4461),
+    IconSeg::C(0.4282, 0.4512, 0.4228, 0.4559, 0.4170, 0.4604),
+    IconSeg::C(0.4112, 0.4648, 0.4049, 0.4690, 0.3986, 0.4727),
+    IconSeg::C(0.3923, 0.4765, 0.3858, 0.4799, 0.3791, 0.4829),
+    IconSeg::C(0.3724, 0.4859, 0.3655, 0.4885, 0.3585, 0.4907),
+    IconSeg::C(0.3515, 0.4930, 0.3444, 0.4950, 0.3371, 0.4964),
+    IconSeg::C(0.3299, 0.4977, 0.3224, 0.4984, 0.3150, 0.4990),
+    IconSeg::C(0.3076, 0.4996, 0.3002, 0.4996, 0.2929, 0.4997),
+    IconSeg::C(0.2855, 0.4999, 0.2781, 0.4997, 0.2707, 0.4997),
+    IconSeg::C(0.2634, 0.4997, 0.2560, 0.4997, 0.2486, 0.4997),
+    IconSeg::C(0.2412, 0.4997, 0.2339, 0.4998, 0.2265, 0.4997),
+    IconSeg::C(0.2191, 0.4997, 0.2117, 0.4997, 0.2044, 0.4994),
+    IconSeg::C(0.1970, 0.4991, 0.1894, 0.4991, 0.1822, 0.4979),
+    IconSeg::C(0.1750, 0.4966, 0.1679, 0.4947, 0.1612, 0.4919),
+    IconSeg::C(0.1545, 0.4891, 0.1480, 0.4852, 0.1421, 0.4810),
+    IconSeg::C(0.1362, 0.4767, 0.1305, 0.4718, 0.1256, 0.4664),
+    IconSeg::C(0.1207, 0.4609, 0.1164, 0.4547, 0.1129, 0.4484),
+    IconSeg::C(0.1093, 0.4420, 0.1062, 0.4351, 0.1042, 0.4281),
+    IconSeg::C(0.1022, 0.4211, 0.1015, 0.4137, 0.1009, 0.4064),
+    IconSeg::C(0.1002, 0.3991, 0.1002, 0.3916, 0.1001, 0.3842),
+    IconSeg::C(0.1000, 0.3769, 0.1001, 0.3695, 0.1001, 0.3621),
+    IconSeg::C(0.1001, 0.3547, 0.1001, 0.3474, 0.1001, 0.3400),
+    IconSeg::C(0.1001, 0.3326, 0.1001, 0.3252, 0.1001, 0.3179),
+    IconSeg::C(0.1001, 0.3105, 0.1001, 0.3031, 0.1001, 0.2957),
+    IconSeg::C(0.1001, 0.2884, 0.1001, 0.2810, 0.1001, 0.2736),
+    IconSeg::C(0.1001, 0.2662, 0.1002, 0.2589, 0.1001, 0.2515),
+    IconSeg::C(0.1000, 0.2441, 0.1000, 0.2367, 0.0993, 0.2294),
+    IconSeg::C(0.0987, 0.2220, 0.0978, 0.2147, 0.0960, 0.2076),
+    IconSeg::C(0.0942, 0.2005, 0.0916, 0.1936, 0.0885, 0.1870),
+    IconSeg::C(0.0853, 0.1804, 0.0816, 0.1737, 0.0772, 0.1679),
+    IconSeg::C(0.0728, 0.1620, 0.0678, 0.1565, 0.0622, 0.1517),
+    IconSeg::C(0.0567, 0.1470, 0.0503, 0.1428, 0.0438, 0.1394),
+    IconSeg::C(0.0374, 0.1359, 0.0307, 0.1330, 0.0236, 0.1311),
+    IconSeg::C(0.0165, 0.1292, 0.0088, 0.1279, 0.0015, 0.1277),
+    IconSeg::C(-0.0058, 0.1276, -0.0132, 0.1287, -0.0203, 0.1304),
+    IconSeg::C(-0.0273, 0.1320, -0.0343, 0.1346, -0.0409, 0.1379),
+    IconSeg::C(-0.0475, 0.1411, -0.0540, 0.1452, -0.0597, 0.1499),
+    IconSeg::C(-0.0653, 0.1545, -0.0704, 0.1599, -0.0750, 0.1656),
+    IconSeg::C(-0.0797, 0.1713, -0.0840, 0.1775, -0.0874, 0.1840),
+    IconSeg::C(-0.0908, 0.1904, -0.0933, 0.1972, -0.0953, 0.2042),
+    IconSeg::C(-0.0972, 0.2112, -0.0982, 0.2187, -0.0990, 0.2260),
+    IconSeg::C(-0.0998, 0.2333, -0.1000, 0.2407, -0.1002, 0.2481),
+    IconSeg::C(-0.1004, 0.2555, -0.1002, 0.2629, -0.1002, 0.2702),
+    IconSeg::C(-0.1002, 0.2776, -0.1002, 0.2850, -0.1002, 0.2924),
+    IconSeg::C(-0.1002, 0.2997, -0.1002, 0.3071, -0.1002, 0.3145),
+    IconSeg::C(-0.1002, 0.3219, -0.1002, 0.3292, -0.1002, 0.3366),
+    IconSeg::C(-0.1002, 0.3440, -0.1002, 0.3514, -0.1002, 0.3587),
+    IconSeg::C(-0.1002, 0.3661, -0.1001, 0.3735, -0.1002, 0.3809),
+    IconSeg::C(-0.1002, 0.3882, -0.1000, 0.3957, -0.1005, 0.4030),
+    IconSeg::C(-0.1010, 0.4103, -0.1014, 0.4177, -0.1032, 0.4247),
+    IconSeg::C(-0.1049, 0.4318, -0.1077, 0.4389, -0.1110, 0.4454),
+    IconSeg::C(-0.1144, 0.4519, -0.1187, 0.4581, -0.1234, 0.4637),
+    IconSeg::C(-0.1281, 0.4694, -0.1334, 0.4747, -0.1392, 0.4791),
+    IconSeg::C(-0.1450, 0.4836, -0.1516, 0.4873, -0.1583, 0.4904),
+    IconSeg::C(-0.1650, 0.4934, -0.1722, 0.4960, -0.1793, 0.4975),
+    IconSeg::C(-0.1864, 0.4990, -0.1937, 0.4990, -0.2010, 0.4994),
+    IconSeg::C(-0.2084, 0.4997, -0.2158, 0.4997, -0.2232, 0.4997),
+    IconSeg::C(-0.2305, 0.4998, -0.2379, 0.4997, -0.2453, 0.4997),
+    IconSeg::C(-0.2527, 0.4997, -0.2600, 0.4997, -0.2674, 0.4997),
+    IconSeg::C(-0.2748, 0.4997, -0.2822, 0.4999, -0.2895, 0.4997),
+    IconSeg::C(-0.2969, 0.4996, -0.3043, 0.4995, -0.3117, 0.4990),
+    IconSeg::C(-0.3191, 0.4985, -0.3266, 0.4979, -0.3338, 0.4967),
+    IconSeg::C(-0.3411, 0.4956, -0.3481, 0.4939, -0.3552, 0.4919),
+    IconSeg::C(-0.3622, 0.4898, -0.3694, 0.4872, -0.3762, 0.4844),
+    IconSeg::C(-0.3829, 0.4815, -0.3893, 0.4783, -0.3957, 0.4746),
+    IconSeg::C(-0.4021, 0.4709, -0.4085, 0.4666, -0.4144, 0.4622),
+    IconSeg::C(-0.4204, 0.4579, -0.4259, 0.4533, -0.4313, 0.4484),
+    IconSeg::C(-0.4367, 0.4434, -0.4418, 0.4381, -0.4467, 0.4326),
+    IconSeg::C(-0.4516, 0.4271, -0.4562, 0.4214, -0.4606, 0.4154),
+    IconSeg::C(-0.4649, 0.4094, -0.4689, 0.4031, -0.4726, 0.3966),
+    IconSeg::C(-0.4762, 0.3902, -0.4794, 0.3835, -0.4823, 0.3767),
+    IconSeg::C(-0.4852, 0.3700, -0.4876, 0.3631, -0.4898, 0.3561),
+    IconSeg::C(-0.4920, 0.3491, -0.4939, 0.3419, -0.4954, 0.3347),
+    IconSeg::C(-0.4969, 0.3276, -0.4981, 0.3203, -0.4988, 0.3130),
+    IconSeg::C(-0.4995, 0.3057, -0.4994, 0.2982, -0.4996, 0.2909),
+    IconSeg::C(-0.4997, 0.2835, -0.4999, 0.2761, -0.4999, 0.2687),
+    IconSeg::C(-0.5000, 0.2614, -0.4999, 0.2540, -0.4999, 0.2466),
+    IconSeg::C(-0.4999, 0.2392, -0.4999, 0.2319, -0.4999, 0.2245),
+    IconSeg::C(-0.4999, 0.2171, -0.4999, 0.2097, -0.4999, 0.2024),
+    IconSeg::C(-0.4999, 0.1950, -0.4999, 0.1876, -0.4999, 0.1802),
+    IconSeg::C(-0.4999, 0.1729, -0.4999, 0.1655, -0.4999, 0.1581),
+    IconSeg::C(-0.4999, 0.1507, -0.4999, 0.1434, -0.4999, 0.1360),
+    IconSeg::C(-0.4999, 0.1286, -0.4999, 0.1212, -0.4999, 0.1139),
+    IconSeg::C(-0.4999, 0.1065, -0.4999, 0.0991, -0.4999, 0.0917),
+    IconSeg::C(-0.4999, 0.0843, -0.4999, 0.0770, -0.4999, 0.0696),
+    IconSeg::C(-0.4999, 0.0622, -0.4999, 0.0548, -0.4999, 0.0475),
+    IconSeg::C(-0.4999, 0.0401, -0.4999, 0.0327, -0.4999, 0.0253),
+    IconSeg::C(-0.4999, 0.0180, -0.4999, 0.0106, -0.4999, 0.0032),
+    IconSeg::C(-0.4999, -0.0042, -0.4999, -0.0115, -0.4999, -0.0189),
+    IconSeg::C(-0.4999, -0.0263, -0.5000, -0.0337, -0.4999, -0.0410),
+    IconSeg::C(-0.4999, -0.0484, -0.4999, -0.0558, -0.4996, -0.0632),
+    IconSeg::C(-0.4992, -0.0705, -0.4989, -0.0780, -0.4981, -0.0853),
+    IconSeg::C(-0.4972, -0.0926, -0.4959, -0.0999, -0.4943, -0.1070),
+    IconSeg::C(-0.4927, -0.1142, -0.4907, -0.1211, -0.4883, -0.1280),
+    IconSeg::C(-0.4859, -0.1350, -0.4828, -0.1420, -0.4797, -0.1487),
+    IconSeg::C(-0.4766, -0.1554, -0.4733, -0.1619, -0.4696, -0.1682),
+    IconSeg::C(-0.4658, -0.1745, -0.4616, -0.1807, -0.4572, -0.1865),
+    IconSeg::C(-0.4527, -0.1924, -0.4479, -0.1980, -0.4429, -0.2034),
+    IconSeg::C(-0.4379, -0.2088, -0.4327, -0.2139, -0.4272, -0.2188),
+    IconSeg::C(-0.4217, -0.2237, -0.4156, -0.2284, -0.4099, -0.2330),
+    IconSeg::C(-0.4042, -0.2377, -0.3987, -0.2423, -0.3931, -0.2469),
+    IconSeg::C(-0.3874, -0.2515, -0.3815, -0.2561, -0.3758, -0.2608),
+    IconSeg::C(-0.3701, -0.2655, -0.3646, -0.2703, -0.3589, -0.2750),
+    IconSeg::C(-0.3533, -0.2798, -0.3477, -0.2846, -0.3421, -0.2893),
+    IconSeg::C(-0.3364, -0.2940, -0.3305, -0.2985, -0.3248, -0.3032),
+    IconSeg::C(-0.3191, -0.3079, -0.3136, -0.3127, -0.3079, -0.3174),
+    IconSeg::C(-0.3022, -0.3221, -0.2964, -0.3266, -0.2907, -0.3313),
+    IconSeg::C(-0.2850, -0.3360, -0.2795, -0.3408, -0.2738, -0.3456),
+    IconSeg::C(-0.2681, -0.3503, -0.2622, -0.3551, -0.2565, -0.3598),
+    IconSeg::C(-0.2509, -0.3645, -0.2454, -0.3690, -0.2397, -0.3737),
+    IconSeg::C(-0.2340, -0.3784, -0.2281, -0.3832, -0.2224, -0.3879),
+    IconSeg::C(-0.2167, -0.3928, -0.2112, -0.3971, -0.2055, -0.4018),
+    IconSeg::C(-0.1999, -0.4065, -0.1944, -0.4113, -0.1887, -0.4161),
+    IconSeg::C(-0.1830, -0.4208, -0.1771, -0.4256, -0.1714, -0.4303),
+    IconSeg::C(-0.1657, -0.4350, -0.1603, -0.4397, -0.1545, -0.4442),
+    IconSeg::C(-0.1488, -0.4487, -0.1430, -0.4531, -0.1369, -0.4573),
+    IconSeg::C(-0.1309, -0.4615, -0.1246, -0.4657, -0.1182, -0.4693),
+    IconSeg::C(-0.1117, -0.4729, -0.1050, -0.4761, -0.0983, -0.4791),
+    IconSeg::C(-0.0915, -0.4821, -0.0847, -0.4849, -0.0777, -0.4873),
+    IconSeg::C(-0.0707, -0.4897, -0.0634, -0.4916, -0.0563, -0.4933),
+    IconSeg::C(-0.0492, -0.4951, -0.0422, -0.4968, -0.0349, -0.4978),
+    IconSeg::C(-0.0277, -0.4988, -0.0202, -0.4990, -0.0128, -0.4993),
     IconSeg::Z,
 ];
-/// Music: two beamed notes; the Music space.
+/// Music: a note with a slanted flag; the Music space.
 pub(crate) const MUSIC_ALT: &[IconSeg] = &[
-    IconSeg::M(-0.1000, 0.2895),
-    IconSeg::C(-0.1000, 0.3999, -0.1895, 0.4895, -0.3000, 0.4895),
-    IconSeg::C(-0.4105, 0.4895, -0.5000, 0.3999, -0.5000, 0.2895),
-    IconSeg::C(-0.5000, 0.1790, -0.4105, 0.0895, -0.3000, 0.0895),
-    IconSeg::C(-0.1895, 0.0895, -0.1000, 0.1790, -0.1000, 0.2895),
-    IconSeg::Z,
-    IconSeg::M(0.5000, 0.1450),
-    IconSeg::C(0.5000, 0.2555, 0.4105, 0.3450, 0.3000, 0.3450),
-    IconSeg::C(0.1895, 0.3450, 0.1000, 0.2555, 0.1000, 0.1450),
-    IconSeg::C(0.1000, 0.0346, 0.1895, -0.0550, 0.3000, -0.0550),
-    IconSeg::C(0.4105, -0.0550, 0.5000, 0.0346, 0.5000, 0.1450),
-    IconSeg::Z,
-    IconSeg::M(-0.1556, -0.2994),
-    IconSeg::L(-0.1500, -0.2994),
-    IconSeg::C(-0.1224, -0.2994, -0.1000, -0.2770, -0.1000, -0.2494),
-    IconSeg::L(-0.1000, 0.2395),
-    IconSeg::C(-0.1000, 0.2671, -0.1224, 0.2895, -0.1500, 0.2895),
-    IconSeg::L(-0.1556, 0.2895),
-    IconSeg::C(-0.1832, 0.2895, -0.2056, 0.2671, -0.2056, 0.2395),
-    IconSeg::L(-0.2056, -0.2494),
-    IconSeg::C(-0.2056, -0.2770, -0.1832, -0.2994, -0.1556, -0.2994),
-    IconSeg::Z,
-    IconSeg::M(0.4444, -0.4550),
-    IconSeg::L(0.4500, -0.4550),
-    IconSeg::C(0.4776, -0.4550, 0.5000, -0.4326, 0.5000, -0.4050),
-    IconSeg::L(0.5000, 0.0950),
-    IconSeg::C(0.5000, 0.1227, 0.4776, 0.1450, 0.4500, 0.1450),
-    IconSeg::L(0.4444, 0.1450),
-    IconSeg::C(0.4168, 0.1450, 0.3944, 0.1227, 0.3944, 0.0950),
-    IconSeg::L(0.3944, -0.4050),
-    IconSeg::C(0.3944, -0.4326, 0.4168, -0.4550, 0.4444, -0.4550),
-    IconSeg::Z,
-    IconSeg::M(-0.1544, -0.3280),
-    IconSeg::L(0.4234, -0.4793),
-    IconSeg::C(0.4621, -0.4895, 0.5000, -0.4603, 0.5000, -0.4202),
-    IconSeg::L(0.5000, -0.3299),
-    IconSeg::C(0.5000, -0.3021, 0.4813, -0.2778, 0.4544, -0.2708),
-    IconSeg::L(-0.1234, -0.1195),
-    IconSeg::C(-0.1621, -0.1093, -0.2000, -0.1385, -0.2000, -0.1786),
-    IconSeg::L(-0.2000, -0.2689),
-    IconSeg::C(-0.2000, -0.2967, -0.1813, -0.3210, -0.1544, -0.3280),
+    IconSeg::M(0.3435, -0.4980),
+    IconSeg::C(0.3500, -0.4960, 0.3569, -0.4907, 0.3608, -0.4851),
+    IconSeg::C(0.3648, -0.4795, 0.3661, -0.4715, 0.3673, -0.4644),
+    IconSeg::C(0.3684, -0.4572, 0.3676, -0.4498, 0.3676, -0.4425),
+    IconSeg::C(0.3677, -0.4351, 0.3676, -0.4279, 0.3676, -0.4205),
+    IconSeg::C(0.3676, -0.4132, 0.3676, -0.4056, 0.3676, -0.3982),
+    IconSeg::C(0.3676, -0.3909, 0.3676, -0.3836, 0.3676, -0.3763),
+    IconSeg::C(0.3676, -0.3690, 0.3676, -0.3617, 0.3676, -0.3544),
+    IconSeg::C(0.3676, -0.3471, 0.3676, -0.3399, 0.3676, -0.3325),
+    IconSeg::C(0.3676, -0.3251, 0.3676, -0.3176, 0.3676, -0.3102),
+    IconSeg::C(0.3676, -0.3029, 0.3676, -0.2956, 0.3676, -0.2883),
+    IconSeg::C(0.3676, -0.2810, 0.3687, -0.2736, 0.3676, -0.2664),
+    IconSeg::C(0.3666, -0.2592, 0.3654, -0.2510, 0.3616, -0.2452),
+    IconSeg::C(0.3578, -0.2395, 0.3513, -0.2348, 0.3450, -0.2316),
+    IconSeg::C(0.3386, -0.2285, 0.3306, -0.2280, 0.3234, -0.2264),
+    IconSeg::C(0.3163, -0.2247, 0.3091, -0.2233, 0.3019, -0.2218),
+    IconSeg::C(0.2947, -0.2203, 0.2875, -0.2187, 0.2804, -0.2173),
+    IconSeg::C(0.2733, -0.2158, 0.2664, -0.2146, 0.2592, -0.2131),
+    IconSeg::C(0.2520, -0.2117, 0.2446, -0.2101, 0.2373, -0.2086),
+    IconSeg::C(0.2301, -0.2071, 0.2230, -0.2056, 0.2158, -0.2041),
+    IconSeg::C(0.2086, -0.2026, 0.2014, -0.2010, 0.1942, -0.1995),
+    IconSeg::C(0.1871, -0.1980, 0.1799, -0.1965, 0.1727, -0.1950),
+    IconSeg::C(0.1655, -0.1935, 0.1584, -0.1920, 0.1512, -0.1905),
+    IconSeg::C(0.1440, -0.1890, 0.1368, -0.1874, 0.1296, -0.1859),
+    IconSeg::C(0.1225, -0.1844, 0.1157, -0.1829, 0.1085, -0.1814),
+    IconSeg::C(0.1013, -0.1799, 0.0938, -0.1783, 0.0866, -0.1769),
+    IconSeg::C(0.0793, -0.1754, 0.0716, -0.1750, 0.0650, -0.1727),
+    IconSeg::C(0.0585, -0.1704, 0.0503, -0.1682, 0.0473, -0.1629),
+    IconSeg::C(0.0443, -0.1576, 0.0470, -0.1483, 0.0469, -0.1410),
+    IconSeg::C(0.0468, -0.1336, 0.0469, -0.1261, 0.0469, -0.1187),
+    IconSeg::C(0.0469, -0.1113, 0.0469, -0.1041, 0.0469, -0.0968),
+    IconSeg::C(0.0469, -0.0895, 0.0469, -0.0822, 0.0469, -0.0749),
+    IconSeg::C(0.0469, -0.0676, 0.0469, -0.0603, 0.0469, -0.0530),
+    IconSeg::C(0.0469, -0.0456, 0.0469, -0.0380, 0.0469, -0.0307),
+    IconSeg::C(0.0469, -0.0233, 0.0469, -0.0161, 0.0469, -0.0088),
+    IconSeg::C(0.0469, -0.0014, 0.0469, 0.0059, 0.0469, 0.0132),
+    IconSeg::C(0.0469, 0.0205, 0.0469, 0.0277, 0.0469, 0.0351),
+    IconSeg::C(0.0469, 0.0424, 0.0469, 0.0500, 0.0469, 0.0574),
+    IconSeg::C(0.0469, 0.0647, 0.0469, 0.0720, 0.0469, 0.0793),
+    IconSeg::C(0.0469, 0.0866, 0.0469, 0.0939, 0.0469, 0.1012),
+    IconSeg::C(0.0469, 0.1085, 0.0469, 0.1157, 0.0469, 0.1231),
+    IconSeg::C(0.0469, 0.1305, 0.0469, 0.1380, 0.0469, 0.1454),
+    IconSeg::C(0.0469, 0.1528, 0.0469, 0.1600, 0.0469, 0.1673),
+    IconSeg::C(0.0469, 0.1746, 0.0469, 0.1819, 0.0469, 0.1892),
+    IconSeg::C(0.0469, 0.1965, 0.0469, 0.2038, 0.0469, 0.2111),
+    IconSeg::C(0.0469, 0.2185, 0.0469, 0.2260, 0.0469, 0.2334),
+    IconSeg::C(0.0469, 0.2408, 0.0469, 0.2480, 0.0469, 0.2553),
+    IconSeg::C(0.0469, 0.2626, 0.0469, 0.2699, 0.0469, 0.2772),
+    IconSeg::C(0.0469, 0.2845, 0.0472, 0.2918, 0.0469, 0.2991),
+    IconSeg::C(0.0467, 0.3064, 0.0463, 0.3138, 0.0454, 0.3211),
+    IconSeg::C(0.0445, 0.3284, 0.0430, 0.3359, 0.0412, 0.3430),
+    IconSeg::C(0.0395, 0.3501, 0.0373, 0.3569, 0.0348, 0.3637),
+    IconSeg::C(0.0323, 0.3706, 0.0293, 0.3775, 0.0261, 0.3841),
+    IconSeg::C(0.0229, 0.3908, 0.0195, 0.3972, 0.0156, 0.4034),
+    IconSeg::C(0.0116, 0.4096, 0.0072, 0.4154, 0.0027, 0.4212),
+    IconSeg::C(-0.0018, 0.4270, -0.0065, 0.4329, -0.0116, 0.4382),
+    IconSeg::C(-0.0167, 0.4434, -0.0222, 0.4479, -0.0279, 0.4525),
+    IconSeg::C(-0.0336, 0.4571, -0.0395, 0.4618, -0.0456, 0.4657),
+    IconSeg::C(-0.0518, 0.4697, -0.0584, 0.4730, -0.0649, 0.4763),
+    IconSeg::C(-0.0715, 0.4797, -0.0781, 0.4831, -0.0849, 0.4858),
+    IconSeg::C(-0.0917, 0.4885, -0.0987, 0.4906, -0.1057, 0.4926),
+    IconSeg::C(-0.1128, 0.4945, -0.1200, 0.4963, -0.1273, 0.4975),
+    IconSeg::C(-0.1345, 0.4986, -0.1419, 0.4990, -0.1492, 0.4994),
+    IconSeg::C(-0.1565, 0.4997, -0.1638, 0.5000, -0.1711, 0.4997),
+    IconSeg::C(-0.1784, 0.4995, -0.1857, 0.4989, -0.1930, 0.4979),
+    IconSeg::C(-0.2002, 0.4968, -0.2075, 0.4952, -0.2145, 0.4933),
+    IconSeg::C(-0.2216, 0.4915, -0.2285, 0.4895, -0.2353, 0.4869),
+    IconSeg::C(-0.2421, 0.4843, -0.2488, 0.4809, -0.2553, 0.4775),
+    IconSeg::C(-0.2618, 0.4741, -0.2681, 0.4705, -0.2742, 0.4665),
+    IconSeg::C(-0.2803, 0.4625, -0.2863, 0.4580, -0.2920, 0.4533),
+    IconSeg::C(-0.2976, 0.4486, -0.3030, 0.4434, -0.3082, 0.4382),
+    IconSeg::C(-0.3134, 0.4329, -0.3184, 0.4276, -0.3229, 0.4219),
+    IconSeg::C(-0.3275, 0.4163, -0.3318, 0.4103, -0.3358, 0.4042),
+    IconSeg::C(-0.3398, 0.3981, -0.3435, 0.3918, -0.3467, 0.3853),
+    IconSeg::C(-0.3500, 0.3787, -0.3529, 0.3717, -0.3554, 0.3649),
+    IconSeg::C(-0.3580, 0.3580, -0.3602, 0.3512, -0.3619, 0.3441),
+    IconSeg::C(-0.3636, 0.3370, -0.3646, 0.3294, -0.3656, 0.3222),
+    IconSeg::C(-0.3667, 0.3149, -0.3679, 0.3080, -0.3683, 0.3007),
+    IconSeg::C(-0.3687, 0.2934, -0.3685, 0.2857, -0.3679, 0.2784),
+    IconSeg::C(-0.3673, 0.2711, -0.3663, 0.2640, -0.3649, 0.2568),
+    IconSeg::C(-0.3635, 0.2497, -0.3617, 0.2423, -0.3596, 0.2353),
+    IconSeg::C(-0.3574, 0.2282, -0.3548, 0.2213, -0.3520, 0.2145),
+    IconSeg::C(-0.3493, 0.2078, -0.3464, 0.2013, -0.3430, 0.1949),
+    IconSeg::C(-0.3395, 0.1885, -0.3355, 0.1820, -0.3313, 0.1760),
+    IconSeg::C(-0.3270, 0.1699, -0.3224, 0.1641, -0.3177, 0.1586),
+    IconSeg::C(-0.3129, 0.1531, -0.3078, 0.1478, -0.3025, 0.1427),
+    IconSeg::C(-0.2973, 0.1376, -0.2921, 0.1325, -0.2863, 0.1280),
+    IconSeg::C(-0.2805, 0.1235, -0.2741, 0.1196, -0.2678, 0.1159),
+    IconSeg::C(-0.2615, 0.1122, -0.2551, 0.1088, -0.2485, 0.1057),
+    IconSeg::C(-0.2419, 0.1026, -0.2350, 0.0998, -0.2281, 0.0974),
+    IconSeg::C(-0.2212, 0.0950, -0.2141, 0.0929, -0.2070, 0.0914),
+    IconSeg::C(-0.1998, 0.0898, -0.1924, 0.0887, -0.1851, 0.0880),
+    IconSeg::C(-0.1777, 0.0872, -0.1704, 0.0870, -0.1631, 0.0868),
+    IconSeg::C(-0.1558, 0.0867, -0.1485, 0.0866, -0.1412, 0.0872),
+    IconSeg::C(-0.1339, 0.0878, -0.1265, 0.0892, -0.1193, 0.0906),
+    IconSeg::C(-0.1121, 0.0921, -0.1051, 0.0937, -0.0982, 0.0959),
+    IconSeg::C(-0.0912, 0.0981, -0.0844, 0.1009, -0.0778, 0.1038),
+    IconSeg::C(-0.0711, 0.1068, -0.0645, 0.1101, -0.0581, 0.1137),
+    IconSeg::C(-0.0517, 0.1172, -0.0453, 0.1217, -0.0392, 0.1254),
+    IconSeg::C(-0.0332, 0.1290, -0.0250, 0.1375, -0.0218, 0.1356),
+    IconSeg::C(-0.0187, 0.1337, -0.0206, 0.1213, -0.0203, 0.1140),
+    IconSeg::C(-0.0201, 0.1067, -0.0203, 0.0991, -0.0203, 0.0917),
+    IconSeg::C(-0.0203, 0.0844, -0.0203, 0.0771, -0.0203, 0.0698),
+    IconSeg::C(-0.0203, 0.0625, -0.0203, 0.0552, -0.0203, 0.0479),
+    IconSeg::C(-0.0203, 0.0406, -0.0203, 0.0334, -0.0203, 0.0260),
+    IconSeg::C(-0.0203, 0.0186, -0.0203, 0.0111, -0.0203, 0.0037),
+    IconSeg::C(-0.0203, -0.0037, -0.0203, -0.0109, -0.0203, -0.0182),
+    IconSeg::C(-0.0203, -0.0255, -0.0203, -0.0328, -0.0203, -0.0401),
+    IconSeg::C(-0.0203, -0.0474, -0.0203, -0.0547, -0.0203, -0.0620),
+    IconSeg::C(-0.0203, -0.0694, -0.0203, -0.0769, -0.0203, -0.0843),
+    IconSeg::C(-0.0203, -0.0917, -0.0203, -0.0989, -0.0203, -0.1062),
+    IconSeg::C(-0.0203, -0.1135, -0.0203, -0.1208, -0.0203, -0.1281),
+    IconSeg::C(-0.0203, -0.1354, -0.0203, -0.1427, -0.0203, -0.1500),
+    IconSeg::C(-0.0203, -0.1574, -0.0203, -0.1650, -0.0203, -0.1723),
+    IconSeg::C(-0.0203, -0.1797, -0.0203, -0.1869, -0.0203, -0.1942),
+    IconSeg::C(-0.0203, -0.2015, -0.0203, -0.2089, -0.0203, -0.2162),
+    IconSeg::C(-0.0203, -0.2235, -0.0203, -0.2307, -0.0203, -0.2381),
+    IconSeg::C(-0.0203, -0.2454, -0.0203, -0.2530, -0.0203, -0.2604),
+    IconSeg::C(-0.0203, -0.2677, -0.0203, -0.2750, -0.0203, -0.2823),
+    IconSeg::C(-0.0203, -0.2896, -0.0203, -0.2969, -0.0203, -0.3042),
+    IconSeg::C(-0.0203, -0.3115, -0.0203, -0.3187, -0.0203, -0.3261),
+    IconSeg::C(-0.0203, -0.3335, -0.0203, -0.3410, -0.0203, -0.3484),
+    IconSeg::C(-0.0203, -0.3557, -0.0203, -0.3630, -0.0203, -0.3703),
+    IconSeg::C(-0.0203, -0.3776, -0.0210, -0.3850, -0.0203, -0.3922),
+    IconSeg::C(-0.0196, -0.3994, -0.0194, -0.4076, -0.0162, -0.4137),
+    IconSeg::C(-0.0130, -0.4198, -0.0071, -0.4253, -0.0011, -0.4289),
+    IconSeg::C(0.0050, -0.4324, 0.0130, -0.4331, 0.0201, -0.4349),
+    IconSeg::C(0.0272, -0.4367, 0.0344, -0.4380, 0.0416, -0.4394),
+    IconSeg::C(0.0488, -0.4409, 0.0560, -0.4421, 0.0632, -0.4436),
+    IconSeg::C(0.0703, -0.4450, 0.0775, -0.4466, 0.0847, -0.4481),
+    IconSeg::C(0.0919, -0.4496, 0.0990, -0.4511, 0.1062, -0.4527),
+    IconSeg::C(0.1134, -0.4542, 0.1206, -0.4557, 0.1278, -0.4572),
+    IconSeg::C(0.1349, -0.4586, 0.1421, -0.4599, 0.1493, -0.4613),
+    IconSeg::C(0.1565, -0.4628, 0.1636, -0.4643, 0.1708, -0.4659),
+    IconSeg::C(0.1780, -0.4674, 0.1852, -0.4693, 0.1924, -0.4708),
+    IconSeg::C(0.1995, -0.4723, 0.2067, -0.4735, 0.2139, -0.4749),
+    IconSeg::C(0.2211, -0.4764, 0.2282, -0.4780, 0.2354, -0.4795),
+    IconSeg::C(0.2426, -0.4810, 0.2498, -0.4826, 0.2570, -0.4840),
+    IconSeg::C(0.2641, -0.4855, 0.2713, -0.4867, 0.2785, -0.4882),
+    IconSeg::C(0.2857, -0.4896, 0.2928, -0.4912, 0.3000, -0.4927),
+    IconSeg::C(0.3072, -0.4942, 0.3143, -0.4963, 0.3216, -0.4972),
+    IconSeg::C(0.3288, -0.4981, 0.3369, -0.5000, 0.3435, -0.4980),
     IconSeg::Z,
 ];
-/// Clipboard: a board and its clip; the Clipboard space.
+/// Clipboard: a solid board with its clip in a notch; the Clipboard space.
 pub(crate) const CLIPBOARD: &[IconSeg] = &[
-    IconSeg::M(-0.2647, -0.3627),
-    IconSeg::L(-0.3088, -0.3627),
-    IconSeg::C(-0.2845, -0.3627, -0.2647, -0.3430, -0.2647, -0.3186),
-    IconSeg::L(-0.2647, -0.2451),
-    IconSeg::C(-0.2647, -0.2018, -0.2296, -0.1667, -0.1863, -0.1667),
-    IconSeg::L(0.1863, -0.1667),
-    IconSeg::C(0.2296, -0.1667, 0.2647, -0.2018, 0.2647, -0.2451),
-    IconSeg::L(0.2647, -0.3186),
-    IconSeg::C(0.2647, -0.3430, 0.2845, -0.3627, 0.3088, -0.3627),
-    IconSeg::L(0.2647, -0.3627),
-    IconSeg::C(0.3459, -0.3627, 0.4118, -0.2969, 0.4118, -0.2157),
-    IconSeg::L(0.4118, 0.3529),
-    IconSeg::C(0.4118, 0.4344, 0.3459, 0.5000, 0.2647, 0.5000),
-    IconSeg::L(-0.2647, 0.5000),
-    IconSeg::C(-0.3459, 0.5000, -0.4118, 0.4344, -0.4118, 0.3529),
-    IconSeg::L(-0.4118, -0.2157),
-    IconSeg::C(-0.4118, -0.2969, -0.3459, -0.3627, -0.2647, -0.3627),
+    IconSeg::M(-0.0975, -0.4996),
+    IconSeg::C(-0.0902, -0.4997, -0.0828, -0.4996, -0.0754, -0.4996),
+    IconSeg::C(-0.0680, -0.4996, -0.0606, -0.4996, -0.0533, -0.4996),
+    IconSeg::C(-0.0460, -0.4996, -0.0388, -0.4996, -0.0315, -0.4996),
+    IconSeg::C(-0.0242, -0.4996, -0.0168, -0.4996, -0.0094, -0.4996),
+    IconSeg::C(-0.0020, -0.4996, 0.0054, -0.4996, 0.0127, -0.4996),
+    IconSeg::C(0.0201, -0.4996, 0.0272, -0.4996, 0.0345, -0.4996),
+    IconSeg::C(0.0418, -0.4996, 0.0493, -0.4996, 0.0566, -0.4996),
+    IconSeg::C(0.0640, -0.4996, 0.0714, -0.4996, 0.0788, -0.4996),
+    IconSeg::C(0.0861, -0.4996, 0.0932, -0.4998, 0.1005, -0.4996),
+    IconSeg::C(0.1079, -0.4994, 0.1155, -0.4995, 0.1227, -0.4982),
+    IconSeg::C(0.1299, -0.4970, 0.1373, -0.4952, 0.1438, -0.4921),
+    IconSeg::C(0.1502, -0.4890, 0.1564, -0.4846, 0.1615, -0.4795),
+    IconSeg::C(0.1666, -0.4744, 0.1712, -0.4680, 0.1744, -0.4615),
+    IconSeg::C(0.1776, -0.4550, 0.1796, -0.4479, 0.1805, -0.4407),
+    IconSeg::C(0.1815, -0.4336, 0.1814, -0.4257, 0.1802, -0.4186),
+    IconSeg::C(0.1789, -0.4115, 0.1765, -0.4045, 0.1730, -0.3982),
+    IconSeg::C(0.1695, -0.3919, 0.1644, -0.3857, 0.1591, -0.3808),
+    IconSeg::C(0.1537, -0.3760, 0.1476, -0.3718, 0.1410, -0.3689),
+    IconSeg::C(0.1345, -0.3661, 0.1268, -0.3648, 0.1196, -0.3638),
+    IconSeg::C(0.1124, -0.3628, 0.1051, -0.3632, 0.0978, -0.3631),
+    IconSeg::C(0.0905, -0.3630, 0.0831, -0.3631, 0.0757, -0.3631),
+    IconSeg::C(0.0683, -0.3631, 0.0609, -0.3631, 0.0536, -0.3631),
+    IconSeg::C(0.0463, -0.3631, 0.0391, -0.3631, 0.0318, -0.3631),
+    IconSeg::C(0.0245, -0.3631, 0.0170, -0.3631, 0.0097, -0.3631),
+    IconSeg::C(0.0023, -0.3631, -0.0051, -0.3631, -0.0125, -0.3631),
+    IconSeg::C(-0.0198, -0.3631, -0.0269, -0.3631, -0.0342, -0.3631),
+    IconSeg::C(-0.0415, -0.3631, -0.0490, -0.3631, -0.0564, -0.3631),
+    IconSeg::C(-0.0637, -0.3631, -0.0712, -0.3631, -0.0785, -0.3631),
+    IconSeg::C(-0.0858, -0.3631, -0.0929, -0.3630, -0.1003, -0.3631),
+    IconSeg::C(-0.1076, -0.3633, -0.1152, -0.3630, -0.1224, -0.3642),
+    IconSeg::C(-0.1296, -0.3653, -0.1370, -0.3668, -0.1435, -0.3699),
+    IconSeg::C(-0.1499, -0.3731, -0.1561, -0.3778, -0.1612, -0.3829),
+    IconSeg::C(-0.1663, -0.3880, -0.1709, -0.3941, -0.1741, -0.4006),
+    IconSeg::C(-0.1773, -0.4070, -0.1793, -0.4145, -0.1802, -0.4217),
+    IconSeg::C(-0.1812, -0.4288, -0.1811, -0.4364, -0.1799, -0.4434),
+    IconSeg::C(-0.1786, -0.4505, -0.1762, -0.4579, -0.1727, -0.4642),
+    IconSeg::C(-0.1693, -0.4706, -0.1645, -0.4767, -0.1591, -0.4816),
+    IconSeg::C(-0.1538, -0.4864, -0.1474, -0.4902, -0.1408, -0.4931),
+    IconSeg::C(-0.1341, -0.4960, -0.1265, -0.4978, -0.1193, -0.4989),
+    IconSeg::C(-0.1121, -0.5000, -0.1048, -0.4995, -0.0975, -0.4996),
     IconSeg::Z,
-    IconSeg::M(-0.0686, -0.5000),
-    IconSeg::L(0.0686, -0.5000),
-    IconSeg::C(0.1174, -0.5000, 0.1569, -0.4605, 0.1569, -0.4118),
-    IconSeg::L(0.1569, -0.3529),
-    IconSeg::C(0.1569, -0.3042, 0.1174, -0.2647, 0.0686, -0.2647),
-    IconSeg::L(-0.0686, -0.2647),
-    IconSeg::C(-0.1174, -0.2647, -0.1569, -0.3042, -0.1569, -0.3529),
-    IconSeg::L(-0.1569, -0.4118),
-    IconSeg::C(-0.1569, -0.4605, -0.1174, -0.5000, -0.0686, -0.5000),
-    IconSeg::Z,
-];
-/// Palette: three paint wells and a thumb notch; Settings window, Appearance.
-pub(crate) const PALETTE: &[IconSeg] = &[
-    IconSeg::M(0.1376, 0.4790),
-    IconSeg::L(0.1219, 0.4850),
-    IconSeg::L(0.0935, 0.4912),
-    IconSeg::L(0.0649, 0.4958),
-    IconSeg::L(0.0360, 0.4988),
-    IconSeg::L(0.0070, 0.5000),
-    IconSeg::L(-0.0221, 0.4996),
-    IconSeg::L(-0.0510, 0.4974),
-    IconSeg::L(-0.0798, 0.4936),
-    IconSeg::L(-0.1083, 0.4882),
-    IconSeg::L(-0.1365, 0.4811),
-    IconSeg::L(-0.1641, 0.4723),
-    IconSeg::L(-0.1913, 0.4620),
-    IconSeg::L(-0.2178, 0.4501),
-    IconSeg::L(-0.2435, 0.4367),
-    IconSeg::L(-0.2685, 0.4219),
-    IconSeg::L(-0.2925, 0.4056),
-    IconSeg::L(-0.3155, 0.3879),
-    IconSeg::L(-0.3375, 0.3689),
-    IconSeg::L(-0.3583, 0.3487),
-    IconSeg::L(-0.3780, 0.3274),
-    IconSeg::L(-0.3963, 0.3049),
-    IconSeg::L(-0.4134, 0.2814),
-    IconSeg::L(-0.4290, 0.2569),
-    IconSeg::L(-0.4432, 0.2316),
-    IconSeg::L(-0.4559, 0.2054),
-    IconSeg::L(-0.4670, 0.1786),
-    IconSeg::L(-0.4766, 0.1512),
-    IconSeg::L(-0.4846, 0.1233),
-    IconSeg::L(-0.4909, 0.0950),
-    IconSeg::L(-0.4956, 0.0663),
-    IconSeg::L(-0.4986, 0.0375),
-    IconSeg::L(-0.5000, 0.0085),
-    IconSeg::L(-0.4996, -0.0206),
-    IconSeg::L(-0.4976, -0.0495),
-    IconSeg::L(-0.4939, -0.0783),
-    IconSeg::L(-0.4885, -0.1068),
-    IconSeg::L(-0.4815, -0.1350),
-    IconSeg::L(-0.4728, -0.1627),
-    IconSeg::L(-0.4626, -0.1899),
-    IconSeg::L(-0.4508, -0.2164),
-    IconSeg::L(-0.4375, -0.2422),
-    IconSeg::L(-0.4227, -0.2672),
-    IconSeg::L(-0.4065, -0.2913),
-    IconSeg::L(-0.3889, -0.3144),
-    IconSeg::L(-0.3700, -0.3364),
-    IconSeg::L(-0.3498, -0.3573),
-    IconSeg::L(-0.3285, -0.3770),
-    IconSeg::L(-0.3061, -0.3955),
-    IconSeg::L(-0.2826, -0.4125),
-    IconSeg::L(-0.2582, -0.4283),
-    IconSeg::L(-0.2329, -0.4425),
-    IconSeg::L(-0.2069, -0.4553),
-    IconSeg::L(-0.1801, -0.4665),
-    IconSeg::L(-0.1527, -0.4762),
-    IconSeg::L(-0.1248, -0.4843),
-    IconSeg::L(-0.0965, -0.4907),
-    IconSeg::L(-0.0679, -0.4955),
-    IconSeg::L(-0.0390, -0.4986),
-    IconSeg::L(-0.0100, -0.5000),
-    IconSeg::L(0.0190, -0.4997),
-    IconSeg::L(0.0480, -0.4978),
-    IconSeg::L(0.0768, -0.4942),
-    IconSeg::L(0.1053, -0.4889),
-    IconSeg::L(0.1335, -0.4820),
-    IconSeg::L(0.1613, -0.4734),
-    IconSeg::L(0.1885, -0.4632),
-    IconSeg::L(0.2150, -0.4515),
-    IconSeg::L(0.2409, -0.4383),
-    IconSeg::L(0.2659, -0.4236),
-    IconSeg::L(0.2900, -0.4074),
-    IconSeg::L(0.3132, -0.3899),
-    IconSeg::L(0.3353, -0.3711),
-    IconSeg::L(0.3562, -0.3510),
-    IconSeg::L(0.3760, -0.3298),
-    IconSeg::L(0.3945, -0.3074),
-    IconSeg::L(0.4117, -0.2840),
-    IconSeg::L(0.4275, -0.2596),
-    IconSeg::L(0.4418, -0.2344),
-    IconSeg::L(0.4547, -0.2083),
-    IconSeg::L(0.4660, -0.1816),
-    IconSeg::L(0.4757, -0.1543),
-    IconSeg::L(0.4839, -0.1264),
-    IconSeg::L(0.4904, -0.0981),
-    IconSeg::L(0.4953, -0.0695),
-    IconSeg::L(0.4985, -0.0406),
-    IconSeg::L(0.5000, -0.0116),
-    IconSeg::L(0.4998, 0.0174),
-    IconSeg::L(0.4979, 0.0464),
-    IconSeg::L(0.4944, 0.0752),
-    IconSeg::L(0.4900, 0.0914),
-    IconSeg::C(0.4773, 0.1376, 0.4224, 0.1570, 0.3836, 0.1289),
-    IconSeg::L(0.3815, 0.1274),
-    IconSeg::L(0.3567, 0.1208),
-    IconSeg::L(0.3311, 0.1178),
-    IconSeg::L(0.3054, 0.1186),
-    IconSeg::L(0.2801, 0.1231),
-    IconSeg::L(0.2557, 0.1312),
-    IconSeg::L(0.2327, 0.1429),
-    IconSeg::L(0.2117, 0.1577),
-    IconSeg::L(0.1930, 0.1754),
-    IconSeg::L(0.1771, 0.1957),
-    IconSeg::L(0.1644, 0.2180),
-    IconSeg::L(0.1550, 0.2420),
-    IconSeg::L(0.1492, 0.2670),
-    IconSeg::L(0.1471, 0.2927),
-    IconSeg::L(0.1488, 0.3184),
-    IconSeg::L(0.1542, 0.3435),
-    IconSeg::L(0.1632, 0.3677),
-    IconSeg::L(0.1648, 0.3695),
-    IconSeg::C(0.1964, 0.4055, 0.1824, 0.4620, 0.1376, 0.4790),
-    IconSeg::Z,
-    IconSeg::M(-0.1127, -0.0785),
-    IconSeg::C(-0.1127, -0.1353, -0.1588, -0.1814, -0.2157, -0.1814),
-    IconSeg::C(-0.2725, -0.1814, -0.3186, -0.1353, -0.3186, -0.0785),
-    IconSeg::C(-0.3186, -0.0216, -0.2725, 0.0245, -0.2157, 0.0245),
-    IconSeg::C(-0.1588, 0.0245, -0.1127, -0.0216, -0.1127, -0.0785),
-    IconSeg::Z,
-    IconSeg::M(0.1226, -0.2501),
-    IconSeg::C(0.1226, -0.3069, 0.0765, -0.3530, 0.0196, -0.3530),
-    IconSeg::C(-0.0372, -0.3530, -0.0833, -0.3069, -0.0833, -0.2501),
-    IconSeg::C(-0.0833, -0.1932, -0.0372, -0.1471, 0.0196, -0.1471),
-    IconSeg::C(0.0765, -0.1471, 0.1226, -0.1932, 0.1226, -0.2501),
-    IconSeg::Z,
-    IconSeg::M(0.3481, -0.1177),
-    IconSeg::C(0.3481, -0.1746, 0.3020, -0.2206, 0.2452, -0.2206),
-    IconSeg::C(0.1883, -0.2206, 0.1422, -0.1746, 0.1422, -0.1177),
-    IconSeg::C(0.1422, -0.0608, 0.1883, -0.0147, 0.2452, -0.0147),
-    IconSeg::C(0.3020, -0.0147, 0.3481, -0.0608, 0.3481, -0.1177),
-    IconSeg::Z,
-    IconSeg::M(-0.0980, 0.1814),
-    IconSeg::C(-0.0980, 0.1245, -0.1441, 0.0784, -0.2010, 0.0784),
-    IconSeg::C(-0.2578, 0.0784, -0.3039, 0.1245, -0.3039, 0.1814),
-    IconSeg::C(-0.3039, 0.2382, -0.2578, 0.2843, -0.2010, 0.2843),
-    IconSeg::C(-0.1441, 0.2843, -0.0980, 0.2382, -0.0980, 0.1814),
+    IconSeg::M(-0.2919, -0.4530),
+    IconSeg::C(-0.2853, -0.4513, -0.2775, -0.4472, -0.2742, -0.4417),
+    IconSeg::C(-0.2709, -0.4362, -0.2725, -0.4273, -0.2721, -0.4200),
+    IconSeg::C(-0.2717, -0.4126, -0.2725, -0.4049, -0.2718, -0.3975),
+    IconSeg::C(-0.2711, -0.3901, -0.2699, -0.3828, -0.2680, -0.3757),
+    IconSeg::C(-0.2662, -0.3686, -0.2638, -0.3617, -0.2609, -0.3550),
+    IconSeg::C(-0.2580, -0.3482, -0.2547, -0.3415, -0.2507, -0.3352),
+    IconSeg::C(-0.2467, -0.3290, -0.2420, -0.3230, -0.2371, -0.3175),
+    IconSeg::C(-0.2321, -0.3121, -0.2268, -0.3071, -0.2211, -0.3026),
+    IconSeg::C(-0.2153, -0.2980, -0.2091, -0.2936, -0.2027, -0.2900),
+    IconSeg::C(-0.1963, -0.2863, -0.1895, -0.2833, -0.1826, -0.2808),
+    IconSeg::C(-0.1757, -0.2783, -0.1684, -0.2764, -0.1612, -0.2750),
+    IconSeg::C(-0.1539, -0.2736, -0.1464, -0.2727, -0.1391, -0.2723),
+    IconSeg::C(-0.1317, -0.2718, -0.1243, -0.2723, -0.1169, -0.2723),
+    IconSeg::C(-0.1096, -0.2723, -0.1022, -0.2723, -0.0948, -0.2723),
+    IconSeg::C(-0.0874, -0.2723, -0.0801, -0.2723, -0.0727, -0.2723),
+    IconSeg::C(-0.0653, -0.2723, -0.0579, -0.2723, -0.0506, -0.2723),
+    IconSeg::C(-0.0432, -0.2723, -0.0359, -0.2723, -0.0284, -0.2723),
+    IconSeg::C(-0.0210, -0.2723, -0.0134, -0.2723, -0.0060, -0.2723),
+    IconSeg::C(0.0014, -0.2723, 0.0088, -0.2723, 0.0161, -0.2723),
+    IconSeg::C(0.0235, -0.2723, 0.0309, -0.2723, 0.0383, -0.2723),
+    IconSeg::C(0.0456, -0.2723, 0.0530, -0.2723, 0.0604, -0.2723),
+    IconSeg::C(0.0678, -0.2723, 0.0751, -0.2723, 0.0825, -0.2723),
+    IconSeg::C(0.0899, -0.2723, 0.0975, -0.2723, 0.1050, -0.2723),
+    IconSeg::C(0.1124, -0.2723, 0.1197, -0.2721, 0.1271, -0.2723),
+    IconSeg::C(0.1345, -0.2724, 0.1419, -0.2721, 0.1492, -0.2729),
+    IconSeg::C(0.1565, -0.2737, 0.1639, -0.2751, 0.1710, -0.2770),
+    IconSeg::C(0.1781, -0.2790, 0.1851, -0.2815, 0.1917, -0.2845),
+    IconSeg::C(0.1984, -0.2875, 0.2050, -0.2910, 0.2111, -0.2951),
+    IconSeg::C(0.2173, -0.2991, 0.2231, -0.3040, 0.2285, -0.3090),
+    IconSeg::C(0.2339, -0.3141, 0.2390, -0.3195, 0.2435, -0.3254),
+    IconSeg::C(0.2480, -0.3312, 0.2519, -0.3376, 0.2554, -0.3441),
+    IconSeg::C(0.2588, -0.3505, 0.2619, -0.3572, 0.2642, -0.3642),
+    IconSeg::C(0.2666, -0.3711, 0.2684, -0.3787, 0.2697, -0.3859),
+    IconSeg::C(0.2710, -0.3932, 0.2717, -0.4004, 0.2721, -0.4077),
+    IconSeg::C(0.2725, -0.4150, 0.2708, -0.4228, 0.2721, -0.4298),
+    IconSeg::C(0.2734, -0.4369, 0.2750, -0.4461, 0.2799, -0.4499),
+    IconSeg::C(0.2848, -0.4538, 0.2944, -0.4531, 0.3017, -0.4530),
+    IconSeg::C(0.3089, -0.4529, 0.3164, -0.4512, 0.3235, -0.4492),
+    IconSeg::C(0.3305, -0.4472, 0.3376, -0.4444, 0.3442, -0.4411),
+    IconSeg::C(0.3508, -0.4378, 0.3571, -0.4340, 0.3629, -0.4295),
+    IconSeg::C(0.3687, -0.4250, 0.3740, -0.4197, 0.3789, -0.4142),
+    IconSeg::C(0.3838, -0.4087, 0.3885, -0.4028, 0.3922, -0.3965),
+    IconSeg::C(0.3959, -0.3902, 0.3990, -0.3833, 0.4014, -0.3764),
+    IconSeg::C(0.4038, -0.3695, 0.4056, -0.3622, 0.4068, -0.3550),
+    IconSeg::C(0.4080, -0.3477, 0.4083, -0.3402, 0.4085, -0.3328),
+    IconSeg::C(0.4088, -0.3255, 0.4085, -0.3182, 0.4085, -0.3107),
+    IconSeg::C(0.4085, -0.3033, 0.4085, -0.2957, 0.4085, -0.2883),
+    IconSeg::C(0.4085, -0.2808, 0.4085, -0.2735, 0.4085, -0.2661),
+    IconSeg::C(0.4085, -0.2588, 0.4085, -0.2514, 0.4085, -0.2440),
+    IconSeg::C(0.4085, -0.2366, 0.4085, -0.2293, 0.4085, -0.2219),
+    IconSeg::C(0.4085, -0.2145, 0.4085, -0.2071, 0.4085, -0.1998),
+    IconSeg::C(0.4085, -0.1924, 0.4085, -0.1851, 0.4085, -0.1777),
+    IconSeg::C(0.4085, -0.1702, 0.4085, -0.1626, 0.4085, -0.1552),
+    IconSeg::C(0.4085, -0.1478, 0.4085, -0.1404, 0.4085, -0.1331),
+    IconSeg::C(0.4085, -0.1257, 0.4085, -0.1183, 0.4085, -0.1109),
+    IconSeg::C(0.4085, -0.1036, 0.4085, -0.0962, 0.4085, -0.0888),
+    IconSeg::C(0.4085, -0.0815, 0.4085, -0.0741, 0.4085, -0.0667),
+    IconSeg::C(0.4085, -0.0593, 0.4085, -0.0517, 0.4085, -0.0442),
+    IconSeg::C(0.4085, -0.0368, 0.4085, -0.0295, 0.4085, -0.0221),
+    IconSeg::C(0.4085, -0.0147, 0.4085, -0.0074, 0.4085, 0.0000),
+    IconSeg::C(0.4085, 0.0074, 0.4085, 0.0147, 0.4085, 0.0221),
+    IconSeg::C(0.4085, 0.0295, 0.4085, 0.0368, 0.4085, 0.0442),
+    IconSeg::C(0.4085, 0.0517, 0.4085, 0.0593, 0.4085, 0.0667),
+    IconSeg::C(0.4085, 0.0741, 0.4085, 0.0815, 0.4085, 0.0888),
+    IconSeg::C(0.4085, 0.0962, 0.4085, 0.1036, 0.4085, 0.1109),
+    IconSeg::C(0.4085, 0.1183, 0.4085, 0.1257, 0.4085, 0.1331),
+    IconSeg::C(0.4085, 0.1404, 0.4085, 0.1478, 0.4085, 0.1552),
+    IconSeg::C(0.4085, 0.1626, 0.4085, 0.1699, 0.4085, 0.1773),
+    IconSeg::C(0.4085, 0.1847, 0.4085, 0.1923, 0.4085, 0.1998),
+    IconSeg::C(0.4085, 0.2072, 0.4085, 0.2145, 0.4085, 0.2219),
+    IconSeg::C(0.4085, 0.2293, 0.4085, 0.2366, 0.4085, 0.2440),
+    IconSeg::C(0.4085, 0.2514, 0.4085, 0.2588, 0.4085, 0.2661),
+    IconSeg::C(0.4085, 0.2735, 0.4085, 0.2808, 0.4085, 0.2883),
+    IconSeg::C(0.4085, 0.2957, 0.4085, 0.3033, 0.4085, 0.3107),
+    IconSeg::C(0.4085, 0.3182, 0.4085, 0.3255, 0.4085, 0.3328),
+    IconSeg::C(0.4085, 0.3402, 0.4087, 0.3476, 0.4085, 0.3550),
+    IconSeg::C(0.4084, 0.3623, 0.4087, 0.3698, 0.4079, 0.3771),
+    IconSeg::C(0.4071, 0.3844, 0.4057, 0.3918, 0.4038, 0.3989),
+    IconSeg::C(0.4018, 0.4060, 0.3993, 0.4129, 0.3963, 0.4196),
+    IconSeg::C(0.3932, 0.4263, 0.3895, 0.4329, 0.3854, 0.4390),
+    IconSeg::C(0.3813, 0.4452, 0.3765, 0.4510, 0.3714, 0.4564),
+    IconSeg::C(0.3664, 0.4617, 0.3609, 0.4665, 0.3551, 0.4710),
+    IconSeg::C(0.3493, 0.4755, 0.3429, 0.4798, 0.3364, 0.4833),
+    IconSeg::C(0.3299, 0.4867, 0.3229, 0.4894, 0.3160, 0.4918),
+    IconSeg::C(0.3090, 0.4941, 0.3018, 0.4959, 0.2945, 0.4972),
+    IconSeg::C(0.2873, 0.4985, 0.2798, 0.4992, 0.2724, 0.4996),
+    IconSeg::C(0.2650, 0.5000, 0.2577, 0.4996, 0.2503, 0.4996),
+    IconSeg::C(0.2429, 0.4996, 0.2355, 0.4996, 0.2282, 0.4996),
+    IconSeg::C(0.2208, 0.4996, 0.2134, 0.4996, 0.2060, 0.4996),
+    IconSeg::C(0.1987, 0.4996, 0.1913, 0.4996, 0.1839, 0.4996),
+    IconSeg::C(0.1765, 0.4996, 0.1689, 0.4996, 0.1615, 0.4996),
+    IconSeg::C(0.1540, 0.4996, 0.1467, 0.4996, 0.1393, 0.4996),
+    IconSeg::C(0.1320, 0.4996, 0.1246, 0.4996, 0.1172, 0.4996),
+    IconSeg::C(0.1098, 0.4996, 0.1025, 0.4996, 0.0951, 0.4996),
+    IconSeg::C(0.0877, 0.4996, 0.0804, 0.4996, 0.0730, 0.4996),
+    IconSeg::C(0.0655, 0.4996, 0.0579, 0.4996, 0.0505, 0.4996),
+    IconSeg::C(0.0431, 0.4996, 0.0358, 0.4996, 0.0284, 0.4996),
+    IconSeg::C(0.0210, 0.4996, 0.0136, 0.4996, 0.0063, 0.4996),
+    IconSeg::C(-0.0011, 0.4996, -0.0085, 0.4996, -0.0159, 0.4996),
+    IconSeg::C(-0.0232, 0.4996, -0.0306, 0.4996, -0.0380, 0.4996),
+    IconSeg::C(-0.0453, 0.4996, -0.0527, 0.4996, -0.0601, 0.4996),
+    IconSeg::C(-0.0675, 0.4996, -0.0751, 0.4996, -0.0826, 0.4996),
+    IconSeg::C(-0.0900, 0.4996, -0.0973, 0.4996, -0.1047, 0.4996),
+    IconSeg::C(-0.1121, 0.4996, -0.1194, 0.4996, -0.1268, 0.4996),
+    IconSeg::C(-0.1342, 0.4996, -0.1415, 0.4996, -0.1489, 0.4996),
+    IconSeg::C(-0.1563, 0.4996, -0.1636, 0.4996, -0.1710, 0.4996),
+    IconSeg::C(-0.1785, 0.4996, -0.1861, 0.4996, -0.1935, 0.4996),
+    IconSeg::C(-0.2009, 0.4996, -0.2083, 0.4996, -0.2156, 0.4996),
+    IconSeg::C(-0.2230, 0.4996, -0.2304, 0.4996, -0.2377, 0.4996),
+    IconSeg::C(-0.2451, 0.4996, -0.2525, 0.4998, -0.2599, 0.4996),
+    IconSeg::C(-0.2672, 0.4994, -0.2746, 0.4993, -0.2820, 0.4986),
+    IconSeg::C(-0.2894, 0.4979, -0.2970, 0.4972, -0.3041, 0.4955),
+    IconSeg::C(-0.3113, 0.4938, -0.3181, 0.4913, -0.3249, 0.4884),
+    IconSeg::C(-0.3316, 0.4855, -0.3384, 0.4821, -0.3446, 0.4782),
+    IconSeg::C(-0.3509, 0.4742, -0.3568, 0.4698, -0.3623, 0.4649),
+    IconSeg::C(-0.3678, 0.4600, -0.3730, 0.4546, -0.3776, 0.4489),
+    IconSeg::C(-0.3823, 0.4432, -0.3865, 0.4369, -0.3902, 0.4305),
+    IconSeg::C(-0.3939, 0.4241, -0.3972, 0.4173, -0.3997, 0.4104),
+    IconSeg::C(-0.4023, 0.4036, -0.4041, 0.3965, -0.4055, 0.3893),
+    IconSeg::C(-0.4069, 0.3821, -0.4078, 0.3746, -0.4083, 0.3672),
+    IconSeg::C(-0.4087, 0.3598, -0.4083, 0.3525, -0.4083, 0.3451),
+    IconSeg::C(-0.4083, 0.3377, -0.4083, 0.3303, -0.4083, 0.3230),
+    IconSeg::C(-0.4083, 0.3156, -0.4083, 0.3083, -0.4083, 0.3009),
+    IconSeg::C(-0.4083, 0.2934, -0.4083, 0.2858, -0.4083, 0.2784),
+    IconSeg::C(-0.4083, 0.2710, -0.4083, 0.2636, -0.4083, 0.2563),
+    IconSeg::C(-0.4083, 0.2489, -0.4083, 0.2415, -0.4083, 0.2341),
+    IconSeg::C(-0.4083, 0.2268, -0.4083, 0.2194, -0.4083, 0.2120),
+    IconSeg::C(-0.4083, 0.2047, -0.4083, 0.1973, -0.4083, 0.1899),
+    IconSeg::C(-0.4083, 0.1825, -0.4083, 0.1749, -0.4083, 0.1674),
+    IconSeg::C(-0.4083, 0.1600, -0.4083, 0.1527, -0.4083, 0.1453),
+    IconSeg::C(-0.4083, 0.1379, -0.4083, 0.1306, -0.4083, 0.1232),
+    IconSeg::C(-0.4083, 0.1158, -0.4083, 0.1085, -0.4083, 0.1011),
+    IconSeg::C(-0.4083, 0.0937, -0.4083, 0.0864, -0.4083, 0.0790),
+    IconSeg::C(-0.4083, 0.0715, -0.4083, 0.0639, -0.4083, 0.0565),
+    IconSeg::C(-0.4083, 0.0491, -0.4083, 0.0417, -0.4083, 0.0344),
+    IconSeg::C(-0.4083, 0.0270, -0.4083, 0.0196, -0.4083, 0.0123),
+    IconSeg::C(-0.4083, 0.0049, -0.4083, -0.0025, -0.4083, -0.0099),
+    IconSeg::C(-0.4083, -0.0172, -0.4083, -0.0246, -0.4083, -0.0320),
+    IconSeg::C(-0.4083, -0.0394, -0.4083, -0.0467, -0.4083, -0.0541),
+    IconSeg::C(-0.4083, -0.0615, -0.4083, -0.0691, -0.4083, -0.0766),
+    IconSeg::C(-0.4083, -0.0840, -0.4083, -0.0913, -0.4083, -0.0987),
+    IconSeg::C(-0.4083, -0.1061, -0.4083, -0.1134, -0.4083, -0.1208),
+    IconSeg::C(-0.4083, -0.1282, -0.4083, -0.1356, -0.4083, -0.1429),
+    IconSeg::C(-0.4083, -0.1503, -0.4083, -0.1576, -0.4083, -0.1651),
+    IconSeg::C(-0.4083, -0.1725, -0.4083, -0.1801, -0.4083, -0.1875),
+    IconSeg::C(-0.4083, -0.1950, -0.4083, -0.2023, -0.4083, -0.2096),
+    IconSeg::C(-0.4083, -0.2170, -0.4083, -0.2244, -0.4083, -0.2318),
+    IconSeg::C(-0.4083, -0.2391, -0.4083, -0.2465, -0.4083, -0.2539),
+    IconSeg::C(-0.4083, -0.2613, -0.4083, -0.2686, -0.4083, -0.2760),
+    IconSeg::C(-0.4083, -0.2834, -0.4083, -0.2907, -0.4083, -0.2981),
+    IconSeg::C(-0.4083, -0.3056, -0.4083, -0.3132, -0.4083, -0.3206),
+    IconSeg::C(-0.4083, -0.3280, -0.4088, -0.3354, -0.4083, -0.3427),
+    IconSeg::C(-0.4077, -0.3500, -0.4066, -0.3573, -0.4048, -0.3645),
+    IconSeg::C(-0.4031, -0.3716, -0.4008, -0.3789, -0.3977, -0.3856),
+    IconSeg::C(-0.3946, -0.3923, -0.3907, -0.3986, -0.3865, -0.4047),
+    IconSeg::C(-0.3822, -0.4107, -0.3775, -0.4166, -0.3722, -0.4217),
+    IconSeg::C(-0.3669, -0.4268, -0.3610, -0.4314, -0.3548, -0.4353),
+    IconSeg::C(-0.3486, -0.4392, -0.3419, -0.4424, -0.3351, -0.4452),
+    IconSeg::C(-0.3282, -0.4479, -0.3208, -0.4503, -0.3136, -0.4516),
+    IconSeg::C(-0.3064, -0.4529, -0.2984, -0.4546, -0.2919, -0.4530),
     IconSeg::Z,
 ];
 /// Info: an "i" cut from a disc; Settings window, About.
@@ -7215,6 +8339,158 @@ pub(crate) const GEAR: &[IconSeg] = &[
     IconSeg::C(0.0853, 0.1544, 0.1544, 0.0853, 0.1544, 0.0000),
     IconSeg::Z,
 ];
+/// General: a six-tooth gear, softly rounded; Settings window.
+pub(crate) const SOFT_GEAR: &[IconSeg] = &[
+    IconSeg::M(-0.1464, -0.3768),
+    IconSeg::L(-0.1349, -0.4419),
+    IconSeg::C(-0.1290, -0.4755, -0.0998, -0.5000, -0.0657, -0.5000),
+    IconSeg::L(0.0657, -0.5000),
+    IconSeg::C(0.0998, -0.5000, 0.1290, -0.4755, 0.1349, -0.4419),
+    IconSeg::L(0.1464, -0.3768),
+    IconSeg::C(0.1502, -0.3550, 0.1635, -0.3360, 0.1827, -0.3249),
+    IconSeg::L(0.1900, -0.3207),
+    IconSeg::C(0.2092, -0.3096, 0.2323, -0.3076, 0.2531, -0.3152),
+    IconSeg::L(0.3153, -0.3378),
+    IconSeg::C(0.3473, -0.3495, 0.3831, -0.3364, 0.4002, -0.3069),
+    IconSeg::L(0.4659, -0.1931),
+    IconSeg::C(0.4829, -0.1636, 0.4763, -0.1261, 0.4502, -0.1041),
+    IconSeg::L(0.3995, -0.0616),
+    IconSeg::C(0.3825, -0.0474, 0.3727, -0.0264, 0.3727, -0.0042),
+    IconSeg::L(0.3727, 0.0042),
+    IconSeg::C(0.3727, 0.0264, 0.3825, 0.0474, 0.3995, 0.0616),
+    IconSeg::L(0.4502, 0.1041),
+    IconSeg::C(0.4763, 0.1261, 0.4829, 0.1636, 0.4659, 0.1931),
+    IconSeg::L(0.4002, 0.3069),
+    IconSeg::C(0.3831, 0.3364, 0.3473, 0.3495, 0.3153, 0.3378),
+    IconSeg::L(0.2531, 0.3152),
+    IconSeg::C(0.2323, 0.3076, 0.2092, 0.3096, 0.1900, 0.3207),
+    IconSeg::L(0.1827, 0.3249),
+    IconSeg::C(0.1635, 0.3360, 0.1502, 0.3550, 0.1464, 0.3768),
+    IconSeg::L(0.1349, 0.4419),
+    IconSeg::C(0.1290, 0.4755, 0.0998, 0.5000, 0.0657, 0.5000),
+    IconSeg::L(-0.0657, 0.5000),
+    IconSeg::C(-0.0998, 0.5000, -0.1290, 0.4755, -0.1349, 0.4419),
+    IconSeg::L(-0.1464, 0.3768),
+    IconSeg::C(-0.1502, 0.3550, -0.1635, 0.3360, -0.1827, 0.3249),
+    IconSeg::L(-0.1900, 0.3207),
+    IconSeg::C(-0.2092, 0.3096, -0.2323, 0.3076, -0.2531, 0.3152),
+    IconSeg::L(-0.3153, 0.3378),
+    IconSeg::C(-0.3473, 0.3495, -0.3831, 0.3364, -0.4002, 0.3069),
+    IconSeg::L(-0.4659, 0.1931),
+    IconSeg::C(-0.4829, 0.1636, -0.4763, 0.1261, -0.4502, 0.1041),
+    IconSeg::L(-0.3995, 0.0616),
+    IconSeg::C(-0.3825, 0.0474, -0.3727, 0.0264, -0.3727, 0.0042),
+    IconSeg::L(-0.3727, -0.0042),
+    IconSeg::C(-0.3727, -0.0264, -0.3825, -0.0474, -0.3995, -0.0616),
+    IconSeg::L(-0.4502, -0.1041),
+    IconSeg::C(-0.4763, -0.1261, -0.4829, -0.1636, -0.4659, -0.1931),
+    IconSeg::L(-0.4002, -0.3069),
+    IconSeg::C(-0.3831, -0.3364, -0.3473, -0.3495, -0.3153, -0.3378),
+    IconSeg::L(-0.2531, -0.3152),
+    IconSeg::C(-0.2323, -0.3076, -0.2092, -0.3096, -0.1900, -0.3207),
+    IconSeg::L(-0.1827, -0.3249),
+    IconSeg::C(-0.1635, -0.3360, -0.1502, -0.3550, -0.1464, -0.3768),
+    IconSeg::Z,
+    IconSeg::M(0.1640, 0.0000),
+    IconSeg::C(0.1640, -0.0906, 0.0906, -0.1640, 0.0000, -0.1640),
+    IconSeg::C(-0.0906, -0.1640, -0.1640, -0.0906, -0.1640, 0.0000),
+    IconSeg::C(-0.1640, 0.0906, -0.0906, 0.1640, 0.0000, 0.1640),
+    IconSeg::C(0.0906, 0.1640, 0.1640, 0.0906, 0.1640, 0.0000),
+    IconSeg::Z,
+];
+/// Appearance: a ring with its left half filled; Settings window.
+pub(crate) const APPEARANCE: &[IconSeg] = &[
+    IconSeg::M(0.5000, 0.0000),
+    IconSeg::C(0.5000, 0.2761, 0.2761, 0.5000, 0.0000, 0.5000),
+    IconSeg::C(-0.2761, 0.5000, -0.5000, 0.2761, -0.5000, 0.0000),
+    IconSeg::C(-0.5000, -0.2761, -0.2761, -0.5000, 0.0000, -0.5000),
+    IconSeg::C(0.2761, -0.5000, 0.5000, -0.2761, 0.5000, 0.0000),
+    IconSeg::Z,
+    IconSeg::M(0.4118, 0.0000),
+    IconSeg::C(0.4118, -0.2274, 0.2274, -0.4118, 0.0000, -0.4118),
+    IconSeg::C(-0.2274, -0.4118, -0.4118, -0.2274, -0.4118, 0.0000),
+    IconSeg::C(-0.4118, 0.2274, -0.2274, 0.4118, 0.0000, 0.4118),
+    IconSeg::C(0.2274, 0.4118, 0.4118, 0.2274, 0.4118, 0.0000),
+    IconSeg::Z,
+    IconSeg::M(0.0000, 0.3137),
+    IconSeg::C(-0.1733, 0.3137, -0.3137, 0.1733, -0.3137, 0.0000),
+    IconSeg::C(-0.3137, -0.1733, -0.1733, -0.3137, 0.0000, -0.3137),
+    IconSeg::Z,
+];
+/// Clipboard: a soft board with a pill clip; Settings window.
+pub(crate) const SOFT_CLIPBOARD: &[IconSeg] = &[
+    IconSeg::M(-0.1837, -0.3776),
+    IconSeg::L(-0.2653, -0.3776),
+    IconSeg::C(-0.2428, -0.3776, -0.2245, -0.3593, -0.2245, -0.3367),
+    IconSeg::L(-0.2245, -0.3265),
+    IconSeg::C(-0.2245, -0.2814, -0.1879, -0.2449, -0.1429, -0.2449),
+    IconSeg::L(0.1429, -0.2449),
+    IconSeg::C(0.1879, -0.2449, 0.2245, -0.2814, 0.2245, -0.3265),
+    IconSeg::L(0.2245, -0.3367),
+    IconSeg::C(0.2245, -0.3593, 0.2428, -0.3776, 0.2653, -0.3776),
+    IconSeg::L(0.1837, -0.3776),
+    IconSeg::C(0.2964, -0.3776, 0.3878, -0.2862, 0.3878, -0.1735),
+    IconSeg::L(0.3878, 0.2959),
+    IconSeg::C(0.3878, 0.4086, 0.2964, 0.5000, 0.1837, 0.5000),
+    IconSeg::L(-0.1837, 0.5000),
+    IconSeg::C(-0.2964, 0.5000, -0.3878, 0.4086, -0.3878, 0.2959),
+    IconSeg::L(-0.3878, -0.1735),
+    IconSeg::C(-0.3878, -0.2862, -0.2964, -0.3776, -0.1837, -0.3776),
+    IconSeg::Z,
+    IconSeg::M(-0.0510, -0.5000),
+    IconSeg::L(0.0510, -0.5000),
+    IconSeg::C(0.1074, -0.5000, 0.1531, -0.4543, 0.1531, -0.3980),
+    IconSeg::L(0.1531, -0.3980),
+    IconSeg::C(0.1531, -0.3416, 0.1074, -0.2959, 0.0510, -0.2959),
+    IconSeg::L(-0.0510, -0.2959),
+    IconSeg::C(-0.1074, -0.2959, -0.1531, -0.3416, -0.1531, -0.3980),
+    IconSeg::L(-0.1531, -0.3980),
+    IconSeg::C(-0.1531, -0.4543, -0.1074, -0.5000, -0.0510, -0.5000),
+    IconSeg::Z,
+];
+/// Media: four round-ended level bars; Settings window.
+pub(crate) const WAVEFORM: &[IconSeg] = &[
+    IconSeg::M(-0.3882, -0.2647),
+    IconSeg::L(-0.3882, -0.2647),
+    IconSeg::C(-0.3395, -0.2647, -0.3000, -0.2252, -0.3000, -0.1765),
+    IconSeg::L(-0.3000, 0.1765),
+    IconSeg::C(-0.3000, 0.2252, -0.3395, 0.2647, -0.3882, 0.2647),
+    IconSeg::L(-0.3882, 0.2647),
+    IconSeg::C(-0.4370, 0.2647, -0.4765, 0.2252, -0.4765, 0.1765),
+    IconSeg::L(-0.4765, -0.1765),
+    IconSeg::C(-0.4765, -0.2252, -0.4370, -0.2647, -0.3882, -0.2647),
+    IconSeg::Z,
+    IconSeg::M(-0.1294, -0.5000),
+    IconSeg::L(-0.1294, -0.5000),
+    IconSeg::C(-0.0807, -0.5000, -0.0412, -0.4605, -0.0412, -0.4118),
+    IconSeg::L(-0.0412, 0.4118),
+    IconSeg::C(-0.0412, 0.4605, -0.0807, 0.5000, -0.1294, 0.5000),
+    IconSeg::L(-0.1294, 0.5000),
+    IconSeg::C(-0.1781, 0.5000, -0.2176, 0.4605, -0.2176, 0.4118),
+    IconSeg::L(-0.2176, -0.4118),
+    IconSeg::C(-0.2176, -0.4605, -0.1781, -0.5000, -0.1294, -0.5000),
+    IconSeg::Z,
+    IconSeg::M(0.1294, -0.3529),
+    IconSeg::L(0.1294, -0.3529),
+    IconSeg::C(0.1781, -0.3529, 0.2176, -0.3134, 0.2176, -0.2647),
+    IconSeg::L(0.2176, 0.2647),
+    IconSeg::C(0.2176, 0.3134, 0.1781, 0.3529, 0.1294, 0.3529),
+    IconSeg::L(0.1294, 0.3529),
+    IconSeg::C(0.0807, 0.3529, 0.0412, 0.3134, 0.0412, 0.2647),
+    IconSeg::L(0.0412, -0.2647),
+    IconSeg::C(0.0412, -0.3134, 0.0807, -0.3529, 0.1294, -0.3529),
+    IconSeg::Z,
+    IconSeg::M(0.3882, -0.1765),
+    IconSeg::L(0.3882, -0.1765),
+    IconSeg::C(0.4370, -0.1765, 0.4765, -0.1370, 0.4765, -0.0882),
+    IconSeg::L(0.4765, 0.0882),
+    IconSeg::C(0.4765, 0.1370, 0.4370, 0.1765, 0.3882, 0.1765),
+    IconSeg::L(0.3882, 0.1765),
+    IconSeg::C(0.3395, 0.1765, 0.3000, 0.1370, 0.3000, 0.0882),
+    IconSeg::L(0.3000, -0.0882),
+    IconSeg::C(0.3000, -0.1370, 0.3395, -0.1765, 0.3882, -0.1765),
+    IconSeg::Z,
+];
 /// Copy: a sheet in front of an outlined one; clipboard row copy button.
 const COPY: &[IconSeg] = &[
     IconSeg::M(0.3274, -0.4990),
@@ -7247,37 +8523,36 @@ const COPY: &[IconSeg] = &[
     IconSeg::C(0.3846, -0.3502, 0.3502, -0.3846, 0.3077, -0.3846),
     IconSeg::Z,
 ];
-/// Trash: a lid over a solid bin; clipboard row delete button.
+/// Trash: a solid tapered bin under a round-ended lid with a handle; clipboard
+/// row delete button.
 const TRASH: &[IconSeg] = &[
-    IconSeg::M(-0.3235, -0.3725),
-    IconSeg::L(0.3235, -0.3725),
-    IconSeg::C(0.3614, -0.3725, 0.3922, -0.3418, 0.3922, -0.3039),
-    IconSeg::L(0.3922, -0.3039),
-    IconSeg::C(0.3922, -0.2660, 0.3614, -0.2353, 0.3235, -0.2353),
-    IconSeg::L(-0.3235, -0.2353),
-    IconSeg::C(-0.3614, -0.2353, -0.3922, -0.2660, -0.3922, -0.3039),
-    IconSeg::L(-0.3922, -0.3039),
-    IconSeg::C(-0.3922, -0.3418, -0.3614, -0.3725, -0.3235, -0.3725),
+    IconSeg::M(-0.0947, -0.5000),
+    IconSeg::L(0.0947, -0.5000),
+    IconSeg::C(0.1164, -0.5000, 0.1355, -0.4861, 0.1423, -0.4655),
+    IconSeg::L(0.1800, -0.3500),
+    IconSeg::L(-0.1800, -0.3500),
+    IconSeg::L(-0.1423, -0.4655),
+    IconSeg::C(-0.1355, -0.4861, -0.1164, -0.5000, -0.0947, -0.5000),
     IconSeg::Z,
-    IconSeg::M(-0.0882, -0.5000),
-    IconSeg::L(0.0882, -0.5000),
-    IconSeg::C(0.1261, -0.5000, 0.1569, -0.4693, 0.1569, -0.4314),
-    IconSeg::L(0.1569, -0.3922),
-    IconSeg::C(0.1569, -0.3543, 0.1261, -0.3235, 0.0882, -0.3235),
-    IconSeg::L(-0.0882, -0.3235),
-    IconSeg::C(-0.1261, -0.3235, -0.1569, -0.3543, -0.1569, -0.3922),
-    IconSeg::L(-0.1569, -0.4314),
-    IconSeg::C(-0.1569, -0.4693, -0.1261, -0.5000, -0.0882, -0.5000),
+    IconSeg::M(-0.3574, -0.4171),
+    IconSeg::L(0.3574, -0.4171),
+    IconSeg::C(0.3944, -0.4171, 0.4244, -0.3871, 0.4244, -0.3501),
+    IconSeg::L(0.4244, -0.3499),
+    IconSeg::C(0.4244, -0.3129, 0.3944, -0.2829, 0.3574, -0.2829),
+    IconSeg::L(-0.3574, -0.2829),
+    IconSeg::C(-0.3944, -0.2829, -0.4244, -0.3129, -0.4244, -0.3499),
+    IconSeg::L(-0.4244, -0.3501),
+    IconSeg::C(-0.4244, -0.3871, -0.3944, -0.4171, -0.3574, -0.4171),
     IconSeg::Z,
-    IconSeg::M(-0.3039, -0.1373),
-    IconSeg::L(0.3039, -0.1373),
-    IconSeg::C(0.3310, -0.1373, 0.3529, -0.1153, 0.3529, -0.0882),
-    IconSeg::L(0.3529, 0.3824),
-    IconSeg::C(0.3529, 0.4473, 0.3003, 0.5000, 0.2353, 0.5000),
-    IconSeg::L(-0.2353, 0.5000),
-    IconSeg::C(-0.3003, 0.5000, -0.3529, 0.4473, -0.3529, 0.3824),
-    IconSeg::L(-0.3529, -0.0882),
-    IconSeg::C(-0.3529, -0.1153, -0.3310, -0.1373, -0.3039, -0.1373),
+    IconSeg::M(-0.3499, -0.1930),
+    IconSeg::L(0.3499, -0.1930),
+    IconSeg::C(0.3586, -0.1930, 0.3655, -0.1856, 0.3649, -0.1770),
+    IconSeg::L(0.3237, 0.4301),
+    IconSeg::C(0.3211, 0.4694, 0.2884, 0.5000, 0.2489, 0.5000),
+    IconSeg::L(-0.2489, 0.5000),
+    IconSeg::C(-0.2884, 0.5000, -0.3211, 0.4694, -0.3237, 0.4301),
+    IconSeg::L(-0.3649, -0.1770),
+    IconSeg::C(-0.3655, -0.1856, -0.3586, -0.1930, -0.3499, -0.1930),
     IconSeg::Z,
 ];
 /// Tray: an open tray with a dipped front; the drop page glyph.
@@ -9075,7 +10350,7 @@ mod tests {
                 let max_w = if control == MediaControl::PlayPause {
                     u
                 } else {
-                    (u * SKIP_GLYPH_HALF_WIDTH).round() * 2.0
+                    (u * SKIP_TRIANGLE_WIDTH).round() * 2.0
                 };
                 assert!(
                     b.width() <= max_w + 1.0 && b.height() <= u + 1.0,
@@ -10663,6 +11938,189 @@ mod tests {
     }
 
     #[test]
+    fn test_a_new_card_is_not_armed_until_it_is_drawn() {
+        use crate::nearby_ui::{Action, Button, Card, Model, Page};
+        let renderer = Renderer::new().expect("renderer");
+        let card = || Card {
+            id: crate::nearby::test_transfer_id(),
+            direction: crate::nearby::Direction::Receive,
+            asks: true,
+            decide_after: None,
+            title: String::new(),
+            identity: None,
+            note: String::new(),
+            warn: false,
+            code: None,
+            files: Vec::new(),
+            summary: String::new(),
+            progress: None,
+            buttons: vec![Button {
+                action: Action::Accept,
+                label: "Accept",
+                primary: true,
+            }],
+            finished: false,
+        };
+        let show = |c: &Card| {
+            renderer.set_nearby(NearbyPicture {
+                model: Some(Model {
+                    status: String::new(),
+                    page: Page::Transfer(Box::new(c.clone())),
+                }),
+                ..NearbyPicture::default()
+            });
+        };
+        let (a, b) = (card(), card());
+        show(&a);
+        let long_ago = std::time::Instant::now() - 2 * crate::nearby::ARMING;
+        *renderer.nearby_seen.borrow_mut() = Some((a.id.clone(), vec![Action::Accept], long_ago));
+        let now = std::time::Instant::now();
+        assert!(renderer.nearby_armed(now), "shown long enough");
+        // Replaced, no frame drawn yet: the old card's time does not count
+        show(&b);
+        assert_eq!(renderer.nearby_shown_at(), None);
+        assert!(!renderer.nearby_armed(now));
+        // The same transfer with other buttons (another question): not armed either
+        let mut other = a.clone();
+        other.buttons[0].action = Action::CodesMatch;
+        show(&other);
+        assert!(!renderer.nearby_armed(now));
+        // Clicks count only on the picture drawn last
+        assert!(!renderer.nearby_on_show(), "set, not drawn");
+        let dims = crate::layout::space_dimensions(NotchState::Expanded, 96, OecaSpace::Nearby);
+        render_custom_frame(&renderer, &dims, |rt| {
+            renderer.draw_nearby(rt, &dims).unwrap()
+        });
+        assert!(renderer.nearby_on_show());
+        show(&b);
+        assert!(!renderer.nearby_on_show(), "replaced before the next frame");
+        show(&b);
+        assert!(
+            !renderer.nearby_on_show(),
+            "the same picture again changes nothing"
+        );
+    }
+
+    #[test]
+    fn test_nearby_pages_draw_within_the_area_with_long_names() {
+        use crate::nearby_ui::{
+            Action, Button, Card, FileLine, FileState, Model, Page, PeerLine, Tone,
+        };
+        let renderer = Renderer::new().expect("renderer");
+        let long = "x".repeat(300);
+        let card = Card {
+            id: crate::nearby::test_transfer_id(),
+            direction: crate::nearby::Direction::Receive,
+            asks: true,
+            decide_after: None,
+            title: format!("\u{201C}{long}\u{201D} wants to send"),
+            identity: Some(("Identity changed", Tone::Warn)),
+            note: long.clone(),
+            warn: true,
+            code: None,
+            files: vec![
+                FileLine {
+                    stem: long.clone(),
+                    ext: ".exe".into(),
+                    size: "10 B".into(),
+                    state: FileState::Pending,
+                    dangerous: true,
+                },
+                FileLine {
+                    stem: "b".into(),
+                    ext: String::new(),
+                    size: "1.0 KB".into(),
+                    state: FileState::NotConfirmed,
+                    dangerous: false,
+                },
+            ],
+            summary: long.clone(),
+            progress: None,
+            buttons: vec![Button {
+                action: Action::Decline,
+                label: "Decline",
+                primary: true,
+            }],
+            finished: false,
+        };
+        let peer = crate::nearby::Peer {
+            id: "p".into(),
+            alias: long.clone(),
+            model: None,
+            kind: "mobile",
+        };
+        let pages = [
+            Page::Off,
+            Page::Unavailable("Test builds never connect to the signaling servers."),
+            Page::Message {
+                title: long.clone(),
+                note: long.clone(),
+            },
+            Page::Peers(
+                (0..6)
+                    .map(|_| PeerLine {
+                        peer: peer.clone(),
+                        name: long.clone(),
+                        detail: long.clone(),
+                    })
+                    .collect(),
+            ),
+            Page::Transfer(Box::new(card.clone())),
+            Page::Transfer(Box::new(Card {
+                code: Some("123456".into()),
+                ..card.clone()
+            })),
+            Page::Transfer(Box::new(Card {
+                progress: Some(0.4),
+                asks: false,
+                ..card
+            })),
+        ];
+        for dpi in [96, 144, 288] {
+            let dims =
+                crate::layout::space_dimensions(NotchState::Expanded, dpi, OecaSpace::Nearby);
+            let l = crate::layout::resolve_nearby_layout(&dims).unwrap();
+            for page in &pages {
+                renderer.set_nearby(NearbyPicture {
+                    model: Some(Model {
+                        status: long.clone(),
+                        page: page.clone(),
+                    }),
+                    scroll: 2,
+                    picking: false,
+                });
+                let (px, stride) = render_custom_frame(&renderer, &dims, |rt| {
+                    renderer.draw_nearby(rt, &dims).unwrap();
+                });
+                assert!(lit_in(&px, stride, l.area, 60), "{page:?} at {dpi}");
+                // Nothing spills below the area or past its sides
+                let below = RectF::new(
+                    l.area.left,
+                    l.area.bottom + 2.0,
+                    l.area.right,
+                    dims.height as f32 - 1.0,
+                );
+                assert!(
+                    !lit_in(&px, stride, below, 20),
+                    "below the area: {page:?} at {dpi}"
+                );
+                let past = RectF::new(
+                    l.area.right + 2.0,
+                    l.area.top,
+                    dims.width as f32 - 1.0,
+                    l.area.bottom,
+                );
+                assert!(
+                    !lit_in(&px, stride, past, 20),
+                    "past the area: {page:?} at {dpi}"
+                );
+            }
+            // Nobody is asked anything here: a never-shown card is not armed
+            assert!(renderer.nearby_shown_at().is_none());
+        }
+    }
+
+    #[test]
     fn test_music_empty_state_shows_no_stale_media() {
         let renderer = Renderer::new().expect("renderer");
         let dims = crate::layout::space_dimensions(NotchState::Expanded, 96, OecaSpace::Music);
@@ -11022,12 +12480,10 @@ mod tests {
                 "pause {u}: {:?} vs {qb:?}",
                 bbox(&pause, r1)
             );
-            // Bars: fully round ends (inset to centre lines)
-            assert!(
-                (pause[0][1].0 - pause[0][0].0).abs() < 1e-3,
-                "bar inset to its centre line"
-            );
-            assert!((2.0 * r1 - (pause[0][0].0 - qb.left) * 2.0).abs() < 1e-3);
+            // Bars: rounded corners (inset by their radius)
+            let bar_w = pause[0][1].0 - pause[0][0].0 + 2.0 * r1;
+            assert!((r1 - bar_w * BAR_ROUNDING).abs() < 1e-3, "bar corners");
+            assert!((r1 - (pause[0][0].0 - qb.left)).abs() < 1e-3);
             // In between: finite, inside the union of the two, continuous
             let union = RectF::new(
                 pb.left.min(qb.left) - 0.5,
@@ -11469,8 +12925,10 @@ mod tests {
             let (moving, stride) = player_frame(&renderer, &dims, &c);
             renderer.icons().step(16.0, now);
             let (settled, _) = player_frame(&renderer, &dims, &c);
+            // The glide settles within 1e-3 of its target: a sub-pixel sliver
+            // of edge anti-aliasing on the 27 DIP play glyph
             assert!(
-                diff(&moving, &settled, stride) <= 24,
+                diff(&moving, &settled, stride) <= 40,
                 "pop at the end at {dpi}"
             );
             // ...and back: pause -> play lands just as cleanly
@@ -11488,7 +12946,7 @@ mod tests {
             renderer.icons().step(16.0, now);
             let (settled, _) = player_frame(&renderer, &dims, &c);
             assert!(
-                diff(&moving, &settled, stride) <= 24,
+                diff(&moving, &settled, stride) <= 40,
                 "pop at the play end at {dpi}"
             );
             // A press easing back ends the same way
@@ -11593,12 +13051,28 @@ mod tests {
             (frac(played_to(&renderer)) - 0.5).abs() < 0.04,
             "session position"
         );
+        // The playhead's spring runs to rest (drawn, then stepped)
+        let settle = |renderer: &Renderer| {
+            let _ = player_frame(renderer, &dims, &c);
+            while renderer.step_scrub(16.0) {
+                let _ = player_frame(renderer, &dims, &c);
+            }
+        };
         renderer.set_scrub(Some(0.8));
+        let _ = player_frame(&renderer, &dims, &c);
+        renderer.step_scrub(16.0);
+        let first = frac(played_to(&renderer));
+        assert!(
+            first > 0.5 && first < 0.75,
+            "the playhead moves with weight, not a jump ({first})"
+        );
+        settle(&renderer);
         assert!(
             (frac(played_to(&renderer)) - 0.8).abs() < 0.04,
             "follows the drag"
         );
         renderer.set_scrub(Some(0.2));
+        settle(&renderer);
         assert!(
             (frac(played_to(&renderer)) - 0.2).abs() < 0.04,
             "continuously"
@@ -11606,6 +13080,11 @@ mod tests {
         // Released: held at the seek until the session reports back
         renderer.set_scrub(None);
         renderer.hold_seek(150_000);
+        settle(&renderer);
+        assert!(
+            renderer.scrub_glide.get().is_none(),
+            "the spring is dropped"
+        );
         assert!(
             (frac(played_to(&renderer)) - 0.75).abs() < 0.04,
             "held at the seek"
@@ -11722,7 +13201,7 @@ mod tests {
     fn test_all_bars_share_one_gradient_brightest_in_the_middle() {
         let renderer = Renderer::new().expect("renderer");
         let dims = NotchDimensions::from_state_and_dpi(NotchState::Collapsed, 288);
-        // One colour: red-orange throughout every bar, brightest in the middle
+        // One colour: a flat red-orange bar (no ramp, no shading)
         let (px, stride, slot) = bars_frame(&renderer, &dims, solid_cover([235, 60, 30]));
         let columns = bar_columns(&px, stride, &dims, slot);
         assert_one_gradient(&renderer, &columns, "single colour");
@@ -11734,13 +13213,18 @@ mod tests {
                 assert_eq!(a, 255, "on the notch's black");
                 assert!(r > g * 2 && r > b * 3, "one hue, never greyer: {p:08x}");
             }
-            let (mid, end) = (at_share(column, 0.5), at_share(column, 0.97));
-            assert!(mid[0] > 200, "rich at its heart (bar {i}): {mid:?}");
-            assert!(
-                mid[0] > end[0] + 10,
-                "a touch deeper toward the end (bar {i})"
+            let (top, mid, end) = (
+                at_share(column, 0.1),
+                at_share(column, 0.5),
+                at_share(column, 0.9),
             );
-            assert!(end[0] > mid[0] * 3 / 5, "restrained, not black (bar {i})");
+            assert!(mid[0] > 200, "rich (bar {i}): {mid:?}");
+            for p in [top, end] {
+                assert!(
+                    (p[0] - mid[0]).abs() <= 6,
+                    "flat, one colour (bar {i}): {p:?} vs {mid:?}"
+                );
+            }
         }
         // Two colours (blue and purple): every bar blue at the top to purple
         // at the bottom, the same in all four
@@ -12294,6 +13778,113 @@ mod tests {
         }
         unsafe {
             let _ = DestroyWindow(hwnd);
+        }
+    }
+
+    /// The lit edge's cost against the flat outline it replaced (release:
+    /// `cargo test --release bench_lit_edge -- --ignored --nocapture`).
+    /// Variants run interleaved, best of 30 rounds each, so drift and
+    /// background load cannot favour one.
+    #[test]
+    #[ignore]
+    fn bench_lit_edge_cost() {
+        let renderer = Renderer::new().expect("renderer");
+        let dims = space_dimensions(NotchState::Expanded, 144, OecaSpace::Clipboard);
+        let home = space_dimensions(NotchState::Expanded, 144, OecaSpace::Home);
+        renderer
+            .ensure_buffer(dims.width.max(home.width), dims.height.max(home.height))
+            .unwrap();
+        let mut history = ClipboardHistory::default();
+        for i in 0..6 {
+            history.add(ClipboardItem::Text(format!("copied text {i}")));
+        }
+        renderer.set_clipboard(&history);
+        let clock = ClockDateState::from_pure_components(2026, 10, 6, 2, 0, 47, 0, 0, false);
+        let tile = RectF::new(20.0, 50.0, 220.0, 130.0);
+        let path = renderer.smooth_rect_path(tile, 18.0, 6.0).unwrap();
+        let pill = RectF::new(60.0, 10.0, 105.0, 46.0);
+        let fill_pill = |rt: &ID2D1RenderTarget| unsafe {
+            let fill = rt
+                .CreateSolidColorBrush(&COLOR_SPACE_PILL_SELECTED, None)
+                .unwrap();
+            rt.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: pill.to_d2d_rect(),
+                    radiusX: 18.0,
+                    radiusY: 18.0,
+                },
+                &fill,
+            );
+        };
+        type Draw<'a> = Box<dyn Fn(&ID2D1RenderTarget) + 'a>;
+        let variants: Vec<(&str, Draw)> = vec![
+            ("empty frame", Box::new(|_| {})),
+            (
+                "6 tiles: old flat outline",
+                Box::new(|rt| unsafe {
+                    let outline = rt
+                        .CreateSolidColorBrush(&crate::config::COLOR_CLIPBOARD_ROW, None)
+                        .unwrap();
+                    for _ in 0..6 {
+                        rt.DrawGeometry(&path, &outline, 1.5, None);
+                    }
+                }),
+            ),
+            (
+                "6 tiles: new lit edge",
+                Box::new(|rt| {
+                    let edge = renderer.edge(rt).unwrap();
+                    for _ in 0..6 {
+                        edge_opacity(&edge, 1.0);
+                        unsafe { rt.DrawGeometry(&path, &edge, 1.5, None) };
+                    }
+                }),
+            ),
+            ("pill: old fill", Box::new(fill_pill)),
+            (
+                "pill: new fill + lit edge",
+                Box::new(|rt| {
+                    fill_pill(rt);
+                    let edge = renderer.edge(rt).unwrap();
+                    stroke_edge(rt, &edge, pill, 18.0, 1.5, 1.0);
+                }),
+            ),
+            (
+                "clipboard space frame (now)",
+                Box::new(|rt| renderer.draw_clipboard(rt, &dims).unwrap()),
+            ),
+            (
+                "home expanded frame (now)",
+                Box::new(|rt| renderer.draw_expanded(rt, &home, &clock).unwrap()),
+            ),
+        ];
+        let rt_ref = renderer.cached_rt.borrow();
+        let rt = rt_ref.as_ref().unwrap();
+        let frame = |draw: &Draw| unsafe {
+            let bind = RECT {
+                left: 0,
+                top: 0,
+                right: dims.width.max(home.width),
+                bottom: dims.height.max(home.height),
+            };
+            rt.BindDC(renderer.cached_mem_dc.get(), &bind).unwrap();
+            rt.BeginDraw();
+            rt.Clear(Some(&COLOR_TRANSPARENT));
+            draw(rt);
+            rt.EndDraw(None, None).unwrap();
+        };
+        let mut best = vec![f64::MAX; variants.len()];
+        for _ in 0..30 {
+            for (i, (_, draw)) in variants.iter().enumerate() {
+                let t0 = std::time::Instant::now();
+                for _ in 0..100 {
+                    frame(draw);
+                }
+                best[i] = best[i].min(t0.elapsed().as_secs_f64() * 1e4);
+            }
+        }
+        for ((name, _), us) in variants.iter().zip(&best) {
+            eprintln!("BENCH {name}: {us:.1} us/frame (+{:.1})", us - best[0]);
         }
     }
 
@@ -13182,10 +14773,11 @@ mod tests {
                     .max()
                     .unwrap()
             };
+            // The selected space white; the other dimmed, still clearly shown
             let (home, music) = (brightest(sel.home), brightest(sel.music));
             assert!(
-                home > 240 && music > 240,
-                "both icons white at {dpi}: {home}/{music}"
+                home > 240 && (100..200).contains(&music),
+                "selected white, other dimmed at {dpi}: {home}/{music}"
             );
             // Solid glyph: the house is filled, not just an outline (probed
             // above the door cut-out)
@@ -13325,10 +14917,11 @@ mod tests {
     }
 
     #[test]
-    fn test_every_notch_text_role_uses_the_ui_font() {
+    fn test_every_notch_text_role_uses_its_face_font() {
         let renderer = Renderer::new().expect("renderer");
         let font = ui_font(&renderer.dwrite_factory);
         for role in TextRole::ALL {
+            let font = face_font(&renderer.dwrite_factory, role.style().face);
             for scale in [1.0, 1.5, 2.0] {
                 let format = renderer
                     .role_format(role, scale, DWRITE_TEXT_ALIGNMENT_LEADING)

@@ -21,12 +21,15 @@ use std::cell::{Cell, RefCell};
 use windows::Win32::Foundation::{
     D2DERR_RECREATE_TARGET, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
-use windows::Win32::Graphics::Direct2D::Common::{D2D_SIZE_U, D2D1_COLOR_F};
+use windows::Win32::Graphics::Direct2D::Common::{D2D_SIZE_U, D2D1_COLOR_F, D2D1_GRADIENT_STOP};
 use windows::Win32::Graphics::Direct2D::{
     D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED,
     D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
     D2D1_ROUNDED_RECT, D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1RenderTarget,
     ID2D1SolidColorBrush,
+};
+use windows::Win32::Graphics::Direct2D::{
+    D2D1_EXTEND_MODE_CLAMP, D2D1_GAMMA_2_2, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
@@ -34,7 +37,9 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_PARAGRAPH_ALIGNMENT_FAR, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_WORD_WRAPPING_NO_WRAP,
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
 };
-use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
+};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT, ScreenToClient,
 };
@@ -61,7 +66,9 @@ use crate::config::{
     COLOR_TEXT_TERTIARY, ClipboardCapacity, CollapseDelay, NOTCH_BG_COLOR, TextRole,
 };
 use crate::layout::RectF;
-use crate::renderer::{CLIPBOARD, GEAR, INFO, IconSeg, MUSIC_ALT, PALETTE, fill_glyph};
+use crate::renderer::{
+    APPEARANCE, INFO, IconSeg, NEARBY, SOFT_CLIPBOARD, SOFT_GEAR, WAVEFORM, fill_glyph,
+};
 use crate::space::OecaSettings;
 use crate::window::WM_MOUSELEAVE;
 
@@ -83,6 +90,67 @@ pub const WM_APP_SETTINGS_DELAY: u32 = WM_APP + 33;
 /// Posted to the notch window from About's update row (wParam: the
 /// `UpdateRequest` index). The notch acts and calls `sync_update`.
 pub const WM_APP_SETTINGS_UPDATE: u32 = WM_APP + 34;
+
+/// Posted to the notch for a Nearby request from this window (lParam: a
+/// `Box<NearbyRequest>`, taken back with `take_request`).
+pub const WM_APP_SETTINGS_NEARBY: u32 = WM_APP + 35;
+/// Redraws the Nearby page when a question shown there arms (one-shot).
+const NEARBY_ARM_TIMER_ID: usize = 2;
+
+/// What the Nearby page asks the notch (which owns Nearby) to do.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NearbyRequest {
+    /// The privacy notice was accepted here: turn Nearby on.
+    Consent,
+    /// A transfer's button, for exactly the transfer it was shown for.
+    Act(crate::nearby::TransferId, crate::nearby_ui::Action),
+    /// Forget a trusted device (or save its forgetting again).
+    Forget(crate::nearby::Fingerprint),
+    ForgetAll,
+    ResetIdentity,
+}
+
+/// Takes back a request posted with `WM_APP_SETTINGS_NEARBY`.
+///
+/// # Safety
+/// `lparam` comes from that message and is taken exactly once.
+pub unsafe fn take_request(lparam: LPARAM) -> NearbyRequest {
+    *unsafe { Box::from_raw(lparam.0 as *mut NearbyRequest) }
+}
+
+/// What the Nearby page shows, from the notch (`sync_nearby`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct NearbyPage {
+    pub status: String,
+    /// The last thing that could not be done (shown instead of the status).
+    pub note: Option<String>,
+    pub card: Option<crate::nearby_ui::Card>,
+    pub devices: Vec<crate::nearby_ui::DeviceLine>,
+    pub store: Option<&'static str>,
+}
+
+/// Nearby's section headings.
+pub const NEARBY_SECTIONS: [&str; 2] = ["Sharing", "Trusted devices"];
+pub const NOTICE_LABEL: &str = "Privacy notice";
+pub const FORGET_ALL_LABEL: &str = "Forget all";
+pub const RESET_LABEL: &str = "Reset identity";
+pub const IDENTITY_TITLE: &str = "This PC's Hop identity";
+const NO_TRANSFER: &str = "No transfer in progress";
+const NO_TRANSFER_NOTE: &str = "Send files from the Hop space in the notch.";
+/// Trusted devices listed on the page (Forget all covers the rest).
+pub const DEVICE_ROWS: usize = 3;
+pub const CONSENT_TITLE: &str = "Turn on Oeca Hop?";
+pub const FORGET_ALL_QUESTION: &str = "Forget all trusted devices?\n\nEach device will have to be verified again with a code before it is trusted. This can't be undone.";
+pub const RESET_QUESTION: &str = "Reset this PC's Hop identity?\n\nEvery device that trusted this PC will ask you to verify it again. Your list of devices is kept.";
+
+/// The Nearby page's description of the identity row.
+fn identity_description(on: bool) -> &'static str {
+    if on {
+        "Turn Hop off to reset it."
+    } else {
+        "Resetting makes your devices verify this PC again."
+    }
+}
 
 /// What About's update row asks the notch for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +199,8 @@ fn checking(status: Option<crate::update::Status>) -> bool {
 /// The Settings window's switch-animation frame timer (runs only while a
 /// switch slides).
 const SWITCH_TIMER_ID: usize = 1;
+/// Oeca's icon in the exe (assets/windows/oeca.rc).
+const ICON_RESOURCE: u16 = 1;
 /// General's "Notch" section: the closing-delay row under the two switches.
 pub const CLOSING_TITLE: &str = "Notch closing behaviour";
 pub const CLOSING_DESCRIPTION: &str = "Delay after an outside click";
@@ -146,7 +216,13 @@ pub const MIN_CLIENT_SIZE: (f32, f32) = (640.0, 568.0);
 /// Sidebar (DIP): fixed width; category entries with an icon and a label.
 pub const SIDEBAR_WIDTH: f32 = 200.0;
 const SIDEBAR_TOP: f32 = 20.0;
-const SIDEBAR_INSET: f32 = 10.0;
+const SIDEBAR_INSET: f32 = 20.0;
+/// The sidebar floats: a raised panel inset from the window edges; its
+/// entries sit `SIDEBAR_INSET - SIDEBAR_FLOAT` inside it, so its radius is
+/// the entries' radius plus that padding (concentric).
+const SIDEBAR_FLOAT: f32 = 12.0;
+const ITEM_RADIUS: f32 = 10.0;
+const SIDEBAR_RADIUS: f32 = ITEM_RADIUS + (SIDEBAR_INSET - SIDEBAR_FLOAT);
 const ITEM_HEIGHT: f32 = 36.0;
 const ITEM_GAP: f32 = 2.0;
 const ITEM_ICON: f32 = 16.0;
@@ -156,28 +232,61 @@ const PAGE_PADDING: f32 = 36.0;
 /// Window background: a deep neutral, a step up from the notch's pure black;
 /// the sidebar sits a shade darker.
 const COLOR_BACKGROUND: D2D1_COLOR_F = D2D1_COLOR_F {
-    r: 0.071,
-    g: 0.071,
-    b: 0.078,
+    r: 0.020,
+    g: 0.020,
+    b: 0.023,
     a: 1.0,
 };
-const COLOR_SIDEBAR: D2D1_COLOR_F = D2D1_COLOR_F {
-    r: 0.051,
-    g: 0.051,
-    b: 0.057,
+/// The title bar in the background's colour (COLORREF, 0x00BBGGRR), so the
+/// window reads as one surface.
+const CAPTION_COLOR: u32 = 0x0006_0505;
+/// Raised graphite card holding a section's rows (lit edge on top of it).
+const COLOR_CARD: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 0.052,
+    g: 0.052,
+    b: 0.058,
     a: 1.0,
 };
+/// The floating sidebar: darker than the cards, a step above the window.
+const COLOR_PANEL: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 0.034,
+    g: 0.034,
+    b: 0.038,
+    a: 1.0,
+};
+/// A selected entry or segment: a flat white lift under the specular rim.
+const COLOR_SELECTED: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 1.0,
+    g: 1.0,
+    b: 1.0,
+    a: 0.075,
+};
+/// Specular rim (white alpha) at a surface's top, its middle and its bottom.
+const RIM: (f32, f32, f32) = (0.15, 0.035, 0.015);
+/// Recessed selector track: a shade below the card.
+const COLOR_WELL: D2D1_COLOR_F = D2D1_COLOR_F {
+    r: 0.0,
+    g: 0.0,
+    b: 0.0,
+    a: 0.45,
+};
+/// How far a card reaches past its rows' text on each side (DIP).
+const CARD_BLEED: f32 = 16.0;
+/// Kept modest so rows keep their padding: the pill controls sit
+/// `CARD_BLEED` (>= this radius) in from the edge, where the concentric rule
+/// (inner = outer - padding) asks nothing of them.
+const CARD_RADIUS: f32 = 16.0;
 const COLOR_SEPARATOR: D2D1_COLOR_F = D2D1_COLOR_F {
     r: 1.0,
     g: 1.0,
     b: 1.0,
-    a: 0.08,
+    a: 0.06,
 };
 const COLOR_HOVER: D2D1_COLOR_F = D2D1_COLOR_F {
     r: 1.0,
     g: 1.0,
     b: 1.0,
-    a: 0.06,
+    a: 0.05,
 };
 
 /// A settings page, in sidebar order. Typed identity: routing, drawing and
@@ -189,15 +298,17 @@ pub enum Category {
     Appearance,
     Clipboard,
     Media,
+    Nearby,
     About,
 }
 
 impl Category {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::General,
         Self::Appearance,
         Self::Clipboard,
         Self::Media,
+        Self::Nearby,
         Self::About,
     ];
 
@@ -212,6 +323,7 @@ impl Category {
             Self::Appearance => "Appearance",
             Self::Clipboard => "Clipboard",
             Self::Media => "Media",
+            Self::Nearby => "Oeca Hop",
             Self::About => "About",
         }
     }
@@ -224,6 +336,7 @@ impl Category {
             Self::Appearance => "How Oeca looks on your desktop.",
             Self::Clipboard => "How much copied history Oeca keeps.",
             Self::Media => "How detected Windows media sessions are shown.",
+            Self::Nearby => "Send files between this PC and your other devices.",
             Self::About => concat!("Oeca, version ", env!("CARGO_PKG_VERSION"), "."),
         }
     }
@@ -231,10 +344,11 @@ impl Category {
     /// Sidebar icon: Oeca's own glyphs (see renderer.rs).
     fn icon(self) -> &'static [IconSeg] {
         match self {
-            Self::General => GEAR,
-            Self::Appearance => PALETTE,
-            Self::Clipboard => CLIPBOARD,
-            Self::Media => MUSIC_ALT,
+            Self::General => SOFT_GEAR,
+            Self::Appearance => APPEARANCE,
+            Self::Clipboard => SOFT_CLIPBOARD,
+            Self::Media => WAVEFORM,
+            Self::Nearby => NEARBY,
             Self::About => INFO,
         }
     }
@@ -244,7 +358,8 @@ impl Category {
         match self {
             Self::General => &Control::ALL[..5],
             Self::Media => &Control::ALL[5..7],
-            Self::About => &Control::ALL[7..],
+            Self::About => &Control::ALL[7..8],
+            Self::Nearby => &Control::ALL[8..9],
             _ => &[],
         }
     }
@@ -292,6 +407,8 @@ pub enum Control {
     ShowVisualizer,
     /// About's opt-in daily update check.
     CheckForUpdates,
+    /// Nearby's own switch (asks for the privacy notice the first time).
+    Nearby,
 }
 
 /// General's sections: a heading over its rows (in `Control::ALL` order).
@@ -308,7 +425,7 @@ pub const SECTIONS: [(&str, &[Control]); 2] = [
 ];
 
 impl Control {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::AlwaysOnTop,
         Self::ReducedMotion,
         Self::CloseOnEscape,
@@ -317,6 +434,7 @@ impl Control {
         Self::ShowSourceApp,
         Self::ShowVisualizer,
         Self::CheckForUpdates,
+        Self::Nearby,
     ];
 
     pub fn index(self) -> usize {
@@ -337,6 +455,7 @@ impl Control {
             Self::ShowSourceApp => "Show source app",
             Self::ShowVisualizer => "Show visualizer",
             Self::CheckForUpdates => "Check for updates automatically",
+            Self::Nearby => "Oeca Hop",
         }
     }
 
@@ -350,6 +469,7 @@ impl Control {
             Self::ShowSourceApp => "App icon on the Home artwork",
             Self::ShowVisualizer => "Animated bars in the Music space",
             Self::CheckForUpdates => "Once a day, ask GitHub for a newer version",
+            Self::Nearby => "Find your devices and send files while Oeca is open",
         }
     }
 
@@ -363,6 +483,7 @@ impl Control {
             Self::ShowSourceApp => "ShowSourceApp",
             Self::ShowVisualizer => "ShowVisualizer",
             Self::CheckForUpdates => "AutoCheckForUpdates",
+            Self::Nearby => "Nearby",
         }
     }
 
@@ -377,6 +498,7 @@ impl Control {
             Self::ShowSourceApp => &mut settings.show_source_app,
             Self::ShowVisualizer => &mut settings.show_visualizer,
             Self::CheckForUpdates => &mut settings.check_for_updates,
+            Self::Nearby => &mut settings.nearby,
         };
         *value = !*value;
     }
@@ -392,6 +514,7 @@ impl Control {
             Self::ShowSourceApp => settings.show_source_app,
             Self::ShowVisualizer => settings.show_visualizer,
             Self::CheckForUpdates => settings.check_for_updates,
+            Self::Nearby => crate::nearby_ui::enabled(&settings),
         }
     }
 }
@@ -411,6 +534,13 @@ pub enum Target {
     UpdateCheck,
     /// About's "View release" button (only while an update is available).
     ViewRelease,
+    /// Nearby: the privacy notice, a transfer's buttons (left to right), a
+    /// listed device's Forget, Forget all, and Reset identity.
+    NearbyNotice,
+    NearbyButton(u8),
+    Forget(u8),
+    ForgetAll,
+    ResetIdentity,
 }
 
 /// Navigation state: the selected page and keyboard focus. Separate from the
@@ -423,6 +553,53 @@ pub struct Nav {
     pub focus_visible: bool,
     /// An update is available: About offers "View release".
     pub release: bool,
+    /// What the Nearby page offers right now.
+    pub nearby: NearbyNav,
+}
+
+/// The Nearby page's live controls: the transfer's buttons, which listed
+/// devices have an action (bit i: row i), Forget all, Reset identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NearbyNav {
+    pub buttons: u8,
+    pub forget: u8,
+    pub forget_all: bool,
+    pub reset: bool,
+}
+
+impl NearbyNav {
+    pub fn of(page: &NearbyPage, on: bool) -> Self {
+        Self {
+            buttons: page
+                .card
+                .as_ref()
+                .map_or(0, |c| c.buttons.len().min(3) as u8),
+            forget: page
+                .devices
+                .iter()
+                .take(DEVICE_ROWS)
+                .enumerate()
+                .filter(|(_, d)| d.action.is_some())
+                .fold(0, |m, (i, _)| m | 1 << i),
+            forget_all: !page.devices.is_empty()
+                || page.store == crate::nearby_ui::store_note(crate::nearby::Status::Paused),
+            reset: !on,
+        }
+    }
+
+    /// In page order.
+    fn targets(self) -> Vec<Target> {
+        std::iter::once(Target::NearbyNotice)
+            .chain((0..self.buttons).map(Target::NearbyButton))
+            .chain(self.forget_all.then_some(Target::ForgetAll))
+            .chain(
+                (0..DEVICE_ROWS as u8)
+                    .filter(|i| self.forget & 1 << i != 0)
+                    .map(Target::Forget),
+            )
+            .chain(self.reset.then_some(Target::ResetIdentity))
+            .collect()
+    }
 }
 
 impl Default for Nav {
@@ -432,6 +609,7 @@ impl Default for Nav {
             focus: Target::Category(Category::General),
             focus_visible: false,
             release: false,
+            nearby: NearbyNav::default(),
         }
     }
 }
@@ -467,6 +645,12 @@ impl Nav {
                     .map(|c| Target::Capacity(*c)),
             )
             .chain(self.update_buttons())
+            .chain(
+                (self.category == Category::Nearby)
+                    .then(|| self.nearby.targets())
+                    .into_iter()
+                    .flatten(),
+            )
             .collect()
     }
 
@@ -533,6 +717,17 @@ impl Nav {
                 let i = buttons.iter().position(|t| *t == self.focus).unwrap_or(0);
                 buttons[step(i, buttons.len())]
             }
+            Target::NearbyNotice
+            | Target::NearbyButton(_)
+            | Target::Forget(_)
+            | Target::ForgetAll
+            | Target::ResetIdentity => {
+                let targets = self.nearby.targets();
+                match targets.iter().position(|t| *t == self.focus) {
+                    Some(i) => targets[step(i, targets.len())],
+                    None => self.focus,
+                }
+            }
         };
         self.focus_visible = true;
         self.focus
@@ -554,14 +749,14 @@ pub struct Row {
 pub struct WindowLayout {
     pub sidebar: RectF,
     /// Sidebar entries, in `Category::ALL` order.
-    pub items: [RectF; 5],
+    pub items: [RectF; 6],
     pub page_title: RectF,
     pub page_description: RectF,
     /// General's section headings, in `SECTIONS` order.
     pub sections: [RectF; 2],
     /// The switch rows, in `Control::ALL` order: General's two sections,
     /// then Media's and About's (in General's first section's place).
-    pub rows: [Row; 8],
+    pub rows: [Row; 9],
     /// Appearance's section headings, in `APPEARANCE_SECTIONS` order.
     pub appearance_sections: [RectF; 2],
     /// Appearance's swatches (each a square hit target), in
@@ -592,6 +787,22 @@ pub struct WindowLayout {
     pub update_row: RectF,
     pub update_check: RectF,
     pub update_view: RectF,
+    /// Nearby (under its switch): the status line and the notice button;
+    /// the transfer (title, detail, buttons left to right); "Trusted
+    /// devices" with Forget all at its right, then the device rows (name,
+    /// detail, button); then the identity row with Reset at its right.
+    pub nearby_status: RectF,
+    pub nearby_notice: RectF,
+    pub transfer_title: RectF,
+    pub transfer_detail: RectF,
+    pub transfer_buttons: [RectF; 3],
+    pub devices_section: RectF,
+    pub forget_all: RectF,
+    pub device_rows: [Row; DEVICE_ROWS],
+    pub identity_row: RectF,
+    pub identity_title: RectF,
+    pub identity_description: RectF,
+    pub reset: RectF,
 }
 
 /// An `N`-segment selector at the right end of a row starting at `top`, and
@@ -602,7 +813,7 @@ fn segments<const N: usize>(right: f32, top: f32) -> ([RectF; N], f32) {
     let width = TRACK.0 / N as f32;
     let segs = std::array::from_fn(|i| {
         let x = right - (N - i) as f32 * width;
-        RectF::new(x, top + 18.0, x + width, top + 18.0 + TRACK.1)
+        RectF::new(x, top + 16.0, x + width, top + 16.0 + TRACK.1)
     });
     (segs, right - TRACK.0 - 16.0)
 }
@@ -612,8 +823,8 @@ fn segments<const N: usize>(right: f32, top: f32) -> ([RectF; N], f32) {
 pub fn layout(width: f32, height: f32) -> WindowLayout {
     const SECTION_TOP: f32 = 100.0;
     const SECTION_HEIGHT: f32 = 32.0;
-    const SECTION_GAP: f32 = 8.0;
-    const ROW_HEIGHT: f32 = 64.0;
+    const SECTION_GAP: f32 = 20.0;
+    const ROW_HEIGHT: f32 = 60.0;
     let items = std::array::from_fn(|i| {
         let top = SIDEBAR_TOP + i as f32 * (ITEM_HEIGHT + ITEM_GAP);
         RectF::new(
@@ -643,47 +854,52 @@ pub fn layout(width: f32, height: f32) -> WindowLayout {
             _ => (0, 0),
         };
         let top = section_top(section) + SECTION_HEIGHT + slot as f32 * ROW_HEIGHT;
-        let switch = RectF::new(right - 40.0, top + 21.0, right, top + 43.0);
+        let switch = RectF::new(right - 40.0, top + 19.0, right, top + 41.0);
         let text_right = switch.left - 16.0;
         Row {
             row: RectF::new(left, top, right, top + ROW_HEIGHT),
-            title: RectF::new(left, top + 12.0, text_right, top + 32.0),
-            description: RectF::new(left, top + 32.0, text_right, top + 52.0),
+            title: RectF::new(left, top + 10.0, text_right, top + 30.0),
+            description: RectF::new(left, top + 30.0, text_right, top + 50.0),
             switch,
         }
     });
-    // Appearance: "Accent color", a row of swatches and the chosen name,
-    // then "Preview" over a short strip
+    // Appearance: "Accent color" over a card holding the swatches and the
+    // chosen name, then "Preview" over a card the width of the others. The
+    // swatches' discs (22 DIP in a 36 DIP target) start at the text column
     const SWATCH: f32 = 36.0;
     const SWATCH_GAP: f32 = 8.0;
-    let appearance_sections = [
-        RectF::new(left, SECTION_TOP, right, SECTION_TOP + SECTION_HEIGHT),
-        RectF::new(left, 216.0, right, 216.0 + SECTION_HEIGHT),
-    ];
-    let swatch_top = SECTION_TOP + SECTION_HEIGHT + 8.0;
+    const SWATCH_DISC: f32 = 22.0;
+    let swatch_card_top = SECTION_TOP + SECTION_HEIGHT;
+    let swatch_top = swatch_card_top + 14.0;
+    let swatch_left = left - (SWATCH - SWATCH_DISC) / 2.0;
     let swatches = std::array::from_fn(|i| {
-        let x = left + i as f32 * (SWATCH + SWATCH_GAP);
+        let x = swatch_left + i as f32 * (SWATCH + SWATCH_GAP);
         RectF::new(x, swatch_top, x + SWATCH, swatch_top + SWATCH)
     });
     let accent_name = RectF::new(
         left,
-        swatch_top + SWATCH + 4.0,
+        swatch_top + SWATCH + 2.0,
         right,
-        swatch_top + SWATCH + 24.0,
+        swatch_top + SWATCH + 22.0,
     );
-    let preview_top = appearance_sections[1].bottom + 8.0;
-    let preview = RectF::new(
-        left,
-        preview_top,
-        right.min(left + 360.0),
-        preview_top + 56.0,
-    );
+    let swatch_card_bottom = accent_name.bottom + 12.0;
+    let appearance_sections = [
+        RectF::new(left, SECTION_TOP, right, swatch_card_top),
+        RectF::new(
+            left,
+            swatch_card_bottom + SECTION_GAP,
+            right,
+            swatch_card_bottom + SECTION_GAP + SECTION_HEIGHT,
+        ),
+    ];
+    let preview_top = appearance_sections[1].bottom;
+    let preview = RectF::new(left, preview_top, right, preview_top + ROW_HEIGHT);
     // Clipboard: "History", one row with a three-segment selector at its
     // right end, then two informational lines
     let row_top = SECTION_TOP + SECTION_HEIGHT;
     let (capacity, text_right) = segments(right, row_top);
-    let capacity_title = RectF::new(left, row_top + 12.0, text_right, row_top + 32.0);
-    let capacity_description = RectF::new(left, row_top + 32.0, text_right, row_top + 52.0);
+    let capacity_title = RectF::new(left, row_top + 10.0, text_right, row_top + 30.0);
+    let capacity_description = RectF::new(left, row_top + 30.0, text_right, row_top + 50.0);
     let notes_top = row_top + ROW_HEIGHT + 16.0;
     let clipboard_notes = std::array::from_fn(|i| {
         let top = notes_top + i as f32 * 20.0;
@@ -692,16 +908,16 @@ pub fn layout(width: f32, height: f32) -> WindowLayout {
     // General: the closing-delay row, third in "Notch"
     let closing_top = section_top(0) + SECTION_HEIGHT + 2.0 * ROW_HEIGHT;
     let (closing, closing_right) = segments(right, closing_top);
-    let closing_title = RectF::new(left, closing_top + 12.0, closing_right, closing_top + 32.0);
+    let closing_title = RectF::new(left, closing_top + 10.0, closing_right, closing_top + 30.0);
     let closing_description =
-        RectF::new(left, closing_top + 32.0, closing_right, closing_top + 52.0);
+        RectF::new(left, closing_top + 30.0, closing_right, closing_top + 50.0);
     let closing_row = RectF::new(left, closing_top, right, closing_top + ROW_HEIGHT);
     // About: under the automatic-check switch, one row (the version at its
     // left, two buttons at its right, the selectors' height), then the
     // status line
     const BUTTON_HEIGHT: f32 = 28.0;
     let update_top = row_top + ROW_HEIGHT;
-    let button_top = update_top + 18.0;
+    let button_top = update_top + 16.0;
     let update_check = RectF::new(right - 140.0, button_top, right, button_top + BUTTON_HEIGHT);
     let update_view = RectF::new(
         update_check.left - 8.0 - 104.0,
@@ -710,6 +926,67 @@ pub fn layout(width: f32, height: f32) -> WindowLayout {
         button_top + BUTTON_HEIGHT,
     );
     let update_text_right = update_view.left - 16.0;
+    // Nearby: under the switch row (in General's first section's place)
+    let switch_bottom = SECTION_TOP + SECTION_HEIGHT + ROW_HEIGHT;
+    let nearby_notice = RectF::new(
+        right - 140.0,
+        switch_bottom + 8.0,
+        right,
+        switch_bottom + 8.0 + BUTTON_HEIGHT,
+    );
+    let nearby_status = RectF::new(
+        left,
+        nearby_notice.top + 4.0,
+        nearby_notice.left - 16.0,
+        nearby_notice.bottom - 4.0,
+    );
+    let transfer_top = nearby_notice.bottom + 12.0;
+    let transfer_title = RectF::new(left, transfer_top, right, transfer_top + 20.0);
+    let transfer_detail = RectF::new(left, transfer_top + 20.0, right, transfer_top + 40.0);
+    let transfer_buttons = std::array::from_fn(|i| {
+        let x = left + i as f32 * (112.0 + 8.0);
+        let top = transfer_detail.bottom + 8.0;
+        RectF::new(x, top, x + 112.0, top + BUTTON_HEIGHT)
+    });
+    let devices_top = transfer_buttons[0].bottom + SECTION_GAP;
+    let devices_section = RectF::new(left, devices_top, right, devices_top + SECTION_HEIGHT);
+    let forget_all = RectF::new(
+        right - 112.0,
+        devices_top - 6.0,
+        right,
+        devices_top - 6.0 + BUTTON_HEIGHT,
+    );
+    const DEVICE_ROW: f32 = 44.0;
+    let device_rows = std::array::from_fn(|i| {
+        let top = devices_section.bottom + i as f32 * DEVICE_ROW;
+        let switch = RectF::new(right - 96.0, top + 8.0, right, top + 8.0 + BUTTON_HEIGHT);
+        Row {
+            row: RectF::new(left, top, right, top + DEVICE_ROW),
+            title: RectF::new(left, top + 3.0, switch.left - 16.0, top + 23.0),
+            description: RectF::new(left, top + 22.0, switch.left - 16.0, top + 40.0),
+            switch,
+        }
+    });
+    let identity_top = device_rows[DEVICE_ROWS - 1].row.bottom + 12.0;
+    let identity_row = RectF::new(left, identity_top, right, identity_top + 52.0);
+    let reset = RectF::new(
+        right - 140.0,
+        identity_top + 12.0,
+        right,
+        identity_top + 12.0 + BUTTON_HEIGHT,
+    );
+    let identity_title = RectF::new(
+        left,
+        identity_top + 6.0,
+        reset.left - 16.0,
+        identity_top + 26.0,
+    );
+    let identity_description = RectF::new(
+        left,
+        identity_top + 26.0,
+        reset.left - 16.0,
+        identity_top + 46.0,
+    );
     WindowLayout {
         sidebar: RectF::new(0.0, 0.0, SIDEBAR_WIDTH, height),
         items,
@@ -731,15 +1008,15 @@ pub fn layout(width: f32, height: f32) -> WindowLayout {
         closing,
         update_title: RectF::new(
             left,
-            update_top + 12.0,
+            update_top + 10.0,
             update_text_right,
-            update_top + 32.0,
+            update_top + 30.0,
         ),
         update_description: RectF::new(
             left,
-            update_top + 32.0,
+            update_top + 30.0,
             update_text_right,
-            update_top + 52.0,
+            update_top + 50.0,
         ),
         update_status: RectF::new(
             left,
@@ -750,6 +1027,18 @@ pub fn layout(width: f32, height: f32) -> WindowLayout {
         update_row: RectF::new(left, update_top, right, update_top + ROW_HEIGHT),
         update_check,
         update_view,
+        nearby_status,
+        nearby_notice,
+        transfer_title,
+        transfer_detail,
+        transfer_buttons,
+        devices_section,
+        forget_all,
+        device_rows,
+        identity_row,
+        identity_title,
+        identity_description,
+        reset,
     }
 }
 
@@ -791,6 +1080,24 @@ pub fn hit(width: f32, height: f32, category: Category, x: f32, y: f32) -> Optio
         // Only while shown (see `hit_px`)
         if l.update_view.contains(x, y) {
             return Some(Target::ViewRelease);
+        }
+    }
+    if category == Category::Nearby {
+        // Every place a Nearby control can be (`hit_px` keeps the live ones)
+        let buttons = (0..3u8).map(|i| (l.transfer_buttons[i as usize], Target::NearbyButton(i)));
+        let forget =
+            (0..DEVICE_ROWS as u8).map(|i| (l.device_rows[i as usize].switch, Target::Forget(i)));
+        if let Some((_, t)) = [
+            (l.nearby_notice, Target::NearbyNotice),
+            (l.forget_all, Target::ForgetAll),
+            (l.reset, Target::ResetIdentity),
+        ]
+        .into_iter()
+        .chain(buttons)
+        .chain(forget)
+        .find(|(r, _)| r.contains(x, y))
+        {
+            return Some(t);
         }
     }
     category
@@ -839,8 +1146,119 @@ struct View {
     corrections: u8,
     /// Each switch's slide (`Control::ALL` order), and the last frame of the
     /// switch timer (Some only while it runs).
-    switches: [crate::renderer::SwitchAnim; 8],
+    switches: [crate::renderer::SwitchAnim; 9],
     switch_tick: Option<std::time::Instant>,
+    /// The sidebar's hover highlight, gliding between entries; the entry
+    /// under the pointer (nearest, gaps included) and the last glide frame
+    /// (Some only while it moves).
+    side: SideGlide,
+    side_hover: Option<usize>,
+    side_tick: Option<std::time::Instant>,
+    /// Display copy of the notch's Nearby state (`sync_nearby`), and the
+    /// question shown on the page with when it was first painted (its
+    /// decisions count `ARMING` after that).
+    nearby: NearbyPage,
+    nearby_seen: Option<(
+        crate::nearby::TransferId,
+        Vec<crate::nearby_ui::Action>,
+        std::time::Instant,
+    )>,
+    /// What the Nearby page last painted (None: never painted): the
+    /// transfer on show and the listed devices' keys. A button acts only on
+    /// what was painted.
+    nearby_painted: Option<NearbyPainted>,
+}
+
+/// The Nearby page as last painted.
+#[derive(Debug, Clone, PartialEq)]
+struct NearbyPainted {
+    card: Option<crate::nearby::TransferId>,
+    devices: Vec<crate::nearby::Fingerprint>,
+}
+
+impl NearbyPainted {
+    fn of(page: &NearbyPage) -> Self {
+        Self {
+            card: page.card.as_ref().map(|c| c.id.clone()),
+            devices: page
+                .devices
+                .iter()
+                .take(DEVICE_ROWS)
+                .map(|d| d.fingerprint.clone())
+                .collect(),
+        }
+    }
+}
+
+/// The sidebar's hover highlight (top, DIP) and its opacity: one pill that
+/// glides from entry to entry as the pointer moves down the list, instead of
+/// stepping item to item. The selected pill does not glide: it pops to the
+/// clicked entry. Reduced motion snaps the hover too.
+struct SideGlide {
+    hover: crate::config::Glide,
+    hover_alpha: crate::config::Glide,
+}
+
+/// The hover's spring: critically damped and quick, so it follows the pointer
+/// without lag or overshoot.
+const HOVER_SPRING: crate::config::Spring = crate::config::Spring {
+    zeta: 1.0,
+    response: 0.16,
+};
+
+impl SideGlide {
+    fn new(top: f32) -> Self {
+        Self {
+            hover: crate::config::Glide::at(top),
+            hover_alpha: crate::config::Glide::at(0.0),
+        }
+    }
+
+    /// Aims at the hovered entry's top (`None`: the hover fades out where it
+    /// is). True while it moves.
+    fn retarget(&mut self, hover: Option<f32>, instant: bool) -> bool {
+        match hover {
+            Some(top) => {
+                // Appears in place, then glides between entries
+                if self.hover_alpha.value < 0.05 {
+                    self.hover.snap(top);
+                }
+                self.hover.target = top;
+                self.hover_alpha.target = 1.0;
+            }
+            None => self.hover_alpha.target = 0.0,
+        }
+        if instant {
+            for g in [&mut self.hover, &mut self.hover_alpha] {
+                g.snap(g.target);
+            }
+        }
+        self.is_animating()
+    }
+
+    fn is_animating(&self) -> bool {
+        self.hover.is_animating() || self.hover_alpha.is_animating()
+    }
+
+    /// Advances by `dt_ms`.
+    fn step(&mut self, dt_ms: f32) {
+        self.hover.step(HOVER_SPRING, dt_ms);
+        self.hover_alpha.step(HOVER_SPRING, dt_ms);
+    }
+}
+
+/// The sidebar entry nearest a client point (DIP) over the entries' column,
+/// gaps between entries included (so the hover never dips between them).
+fn side_item(width: f32, height: f32, x: f32, y: f32) -> Option<usize> {
+    let l = layout(width, height);
+    let (first, last) = (l.items[0], l.items[Category::ALL.len() - 1]);
+    let column = x >= first.left && x <= first.right;
+    let span = y >= first.top - ITEM_GAP && y <= last.bottom + ITEM_GAP;
+    (column && span).then(|| {
+        let step = ITEM_HEIGHT + ITEM_GAP;
+        (((y - first.top + ITEM_GAP / 2.0) / step).floor().max(0.0) as usize)
+            .min(Category::ALL.len() - 1)
+    })
 }
 
 thread_local! {
@@ -875,6 +1293,10 @@ pub fn open(notch: HWND, settings: OecaSettings) -> Result<()> {
         None => create(notch, settings)?,
     };
     sync(settings);
+    // Unit tests keep it hidden and leave the user's focus alone
+    if cfg!(test) {
+        return Ok(());
+    }
     unsafe {
         let _ = ShowWindow(
             hwnd,
@@ -899,6 +1321,8 @@ pub fn sync(settings: OecaSettings) {
     );
     let changed = with_view(|v| {
         let old = std::mem::replace(&mut v.settings, settings);
+        v.nav.nearby = NearbyNav::of(&v.nearby, crate::nearby_ui::enabled(&settings));
+        keep_focus(&mut v.nav);
         for c in Control::ALL {
             if c.is_on(old) != c.is_on(settings) {
                 v.switches[c.index()].set(c.is_on(settings), instant);
@@ -943,6 +1367,128 @@ pub fn sync_update(status: crate::update::Status) {
     }
 }
 
+/// Shows the notch's Nearby state on the Nearby page. Focus on a control
+/// that went away moves to the page's switch.
+pub fn sync_nearby(page: NearbyPage) {
+    let changed = with_view(|v| {
+        if v.nearby == page {
+            return None;
+        }
+        let status_changed = v.nearby.status != page.status || v.nearby.note != page.note;
+        let question = |p: &NearbyPage| {
+            p.card.as_ref().map(|c| {
+                (
+                    c.id.clone(),
+                    c.buttons.iter().map(|b| b.action).collect::<Vec<_>>(),
+                )
+            })
+        };
+        // Another question: focus on one of its buttons moves to its safe one
+        // (Decline, Cancel or Done), so a key meant for the last cannot decide it
+        if matches!(v.nav.focus, Target::NearbyButton(_)) && question(&v.nearby) != question(&page)
+        {
+            let safe = page.card.as_ref().and_then(|c| {
+                c.buttons.iter().take(3).position(|b| {
+                    matches!(
+                        b.action,
+                        crate::nearby_ui::Action::Decline
+                            | crate::nearby_ui::Action::Cancel
+                            | crate::nearby_ui::Action::Dismiss
+                    )
+                })
+            });
+            v.nav.focus = match safe {
+                Some(i) => Target::NearbyButton(i as u8),
+                None => Target::Control(Control::Nearby),
+            };
+        }
+        v.nav.nearby = NearbyNav::of(&page, crate::nearby_ui::enabled(&v.settings));
+        v.nearby = page;
+        keep_focus(&mut v.nav);
+        Some((v.hwnd, status_changed && v.nav.category == Category::Nearby))
+    })
+    .flatten();
+    if let Some((hwnd, announce)) = changed {
+        invalidate(hwnd);
+        if announce {
+            access::nearby_status_changed(hwnd);
+        }
+    }
+}
+
+/// Focus on a control that went away moves to the page's first control
+/// (Nearby: its switch), or else its sidebar entry.
+fn keep_focus(nav: &mut Nav) {
+    let order = nav.focus_order();
+    if !order.contains(&nav.focus) {
+        let first = nav.category.controls().first().map(|c| Target::Control(*c));
+        nav.focus = first
+            .filter(|t| order.contains(t))
+            .unwrap_or(Target::Category(nav.category));
+    }
+}
+
+/// Shows a page of an open Settings window (the notch's "Turn on in
+/// Settings" opens it on Nearby).
+pub fn show_category(category: Category) {
+    if let Some(hwnd) = window_handle() {
+        navigate(hwnd, category);
+    }
+}
+
+/// Asks the notch to do something for Nearby (it owns Nearby and syncs back).
+fn request_nearby(request: NearbyRequest) {
+    let Some(notch) = with_view(|v| v.notch) else {
+        return;
+    };
+    let raw = Box::into_raw(Box::new(request));
+    if unsafe {
+        PostMessageW(
+            Some(notch),
+            WM_APP_SETTINGS_NEARBY,
+            WPARAM(0),
+            LPARAM(raw as isize),
+        )
+    }
+    .is_err()
+    {
+        // SAFETY: never posted, so still owned here
+        drop(unsafe { Box::from_raw(raw) });
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: how the next question box is answered, and the titles asked.
+    static TEST_ANSWER: Cell<bool> = const { Cell::new(false) };
+    static TEST_ASKED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A native question box owned by this window: Yes / No (No is the
+/// default), or just OK. True for Yes. Tests answer it from `TEST_ANSWER`.
+fn ask(hwnd: HWND, title: &str, text: &str, question: bool) -> bool {
+    #[cfg(test)]
+    {
+        let _ = (hwnd, text, question);
+        TEST_ASKED.with(|a| a.borrow_mut().push(title.to_string()));
+        TEST_ANSWER.get()
+    }
+    #[cfg(not(test))]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            IDYES, MB_DEFBUTTON2, MB_ICONINFORMATION, MB_OK, MB_YESNO, MessageBoxW,
+        };
+        let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+        let (t, b) = (wide(title), wide(text));
+        let style = if question {
+            MB_YESNO | MB_DEFBUTTON2 | MB_ICONINFORMATION
+        } else {
+            MB_OK | MB_ICONINFORMATION
+        };
+        unsafe { MessageBoxW(Some(hwnd), PCWSTR(b.as_ptr()), PCWSTR(t.as_ptr()), style) == IDYES }
+    }
+}
+
 /// Asks the notch to check for updates or open the release (it owns the
 /// update state and syncs back).
 fn request_update(request: UpdateRequest) {
@@ -978,11 +1524,30 @@ fn navigate(hwnd: HWND, category: Category) {
 fn create(notch: HWND, settings: OecaSettings) -> Result<HWND> {
     let instance = unsafe { GetModuleHandleW(None)? };
     if !REGISTERED.get() {
+        // Oeca's icon (the exe's resource 1) for the title bar, the taskbar
+        // and Alt+Tab, large and small; missing, Windows shows its default
+        let icon = |w, h| unsafe {
+            windows::Win32::UI::WindowsAndMessaging::LoadImageW(
+                Some(instance.into()),
+                PCWSTR(ICON_RESOURCE as usize as *const u16),
+                windows::Win32::UI::WindowsAndMessaging::IMAGE_ICON,
+                windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(w),
+                windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(h),
+                windows::Win32::UI::WindowsAndMessaging::LR_DEFAULTCOLOR,
+            )
+            .map(|h| windows::Win32::UI::WindowsAndMessaging::HICON(h.0))
+            .unwrap_or_default()
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON,
+        };
         let class = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(wndproc),
             hInstance: instance.into(),
             hCursor: unsafe { LoadCursorW(None, IDC_ARROW)? },
+            hIcon: icon(SM_CXICON, SM_CYICON),
+            hIconSm: icon(SM_CXSMICON, SM_CYSMICON),
             lpszClassName: CLASS_NAME,
             ..Default::default()
         };
@@ -1025,6 +1590,14 @@ fn create(notch: HWND, settings: OecaSettings) -> Result<HWND> {
             DWMWA_USE_IMMERSIVE_DARK_MODE,
             &dark as *const _ as *const _,
             std::mem::size_of_val(&dark) as u32,
+        );
+        // Windows 11: the caption in the content's colour
+        let caption = CAPTION_COLOR;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CAPTION_COLOR,
+            &caption as *const _ as *const _,
+            std::mem::size_of_val(&caption) as u32,
         );
     }
     let view = (|| -> Result<View> {
@@ -1069,6 +1642,12 @@ fn create(notch: HWND, settings: OecaSettings) -> Result<HWND> {
             corrections: 0,
             switches: Control::ALL.map(|c| crate::renderer::SwitchAnim::settled(c.is_on(settings))),
             switch_tick: None,
+            side: SideGlide::new(layout(CLIENT_SIZE.0, CLIENT_SIZE.1).items[0].top),
+            side_hover: None,
+            side_tick: None,
+            nearby: NearbyPage::default(),
+            nearby_seen: None,
+            nearby_painted: None,
         })
     })();
     match view {
@@ -1201,7 +1780,7 @@ fn role_format(dwrite: &IDWriteFactory, role: TextRole) -> Result<IDWriteTextFor
     let style = role.style();
     text_format(
         dwrite,
-        &crate::renderer::ui_font(dwrite),
+        &crate::renderer::face_font(dwrite, style.face),
         style.size,
         DWRITE_FONT_WEIGHT(style.weight),
     )
@@ -1226,7 +1805,15 @@ fn hit_px(hwnd: HWND, x: f32, y: f32) -> Option<Target> {
     let s = scale(hwnd);
     let (w, h) = client_size(hwnd);
     let nav = with_view(|v| v.nav).unwrap_or_default();
-    hit(w, h, nav.category, x / s, y / s).filter(|t| *t != Target::ViewRelease || nav.release)
+    hit(w, h, nav.category, x / s, y / s).filter(|t| match t {
+        Target::ViewRelease => nav.release,
+        Target::NearbyNotice
+        | Target::NearbyButton(_)
+        | Target::Forget(_)
+        | Target::ForgetAll
+        | Target::ResetIdentity => nav.focus_order().contains(t),
+        _ => true,
+    })
 }
 
 /// Client point (physical px) of a mouse message.
@@ -1298,7 +1885,83 @@ fn request_delay(delay: CollapseDelay) {
 fn activate(hwnd: HWND, target: Target) {
     match target {
         Target::Category(c) => navigate(hwnd, c),
+        // Turning Nearby on the first time (or after the notice changed)
+        // shows the privacy notice; only "Yes" turns it on. Off never asks
+        Target::Control(Control::Nearby) => {
+            let Some(s) = with_view(|v| v.settings) else {
+                return;
+            };
+            if crate::nearby_ui::enabled(&s) || s.nearby_notice == crate::nearby_ui::notice_id() {
+                request_toggle(Control::Nearby);
+            } else {
+                let text = format!("{}\n\nTurn on Oeca Hop?", crate::nearby::privacy_notice());
+                if ask(hwnd, CONSENT_TITLE, &text, true) {
+                    request_nearby(NearbyRequest::Consent);
+                }
+            }
+        }
         Target::Control(c) => request_toggle(c),
+        Target::NearbyNotice => {
+            ask(
+                hwnd,
+                "Oeca Hop privacy",
+                &crate::nearby::privacy_notice(),
+                false,
+            );
+        }
+        Target::NearbyButton(i) => {
+            // The action of the card on show, for that card's transfer; a
+            // decision only once the card has been on the page long enough
+            let act = with_view(|v| {
+                let card = v.nearby.card.as_ref()?;
+                // The transfer painted (if the page was painted at all)
+                if v.nearby_painted
+                    .as_ref()
+                    .is_some_and(|p| p.card.as_ref() != Some(&card.id))
+                {
+                    return None;
+                }
+                let button = card.buttons.get(usize::from(i))?;
+                let shown = v
+                    .nearby_seen
+                    .as_ref()
+                    .filter(|s| s.0 == card.id)
+                    .map(|s| s.2);
+                let armed = card.armed(std::time::Instant::now(), shown);
+                (armed || !crate::nearby_ui::Card::is_decision(button.action))
+                    .then(|| NearbyRequest::Act(card.id.clone(), button.action))
+            })
+            .flatten();
+            if let Some(request) = act {
+                request_nearby(request);
+            }
+        }
+        Target::Forget(i) => {
+            // The device painted in that row (if the page was painted at all)
+            let device = with_view(|v| {
+                let d = v.nearby.devices.get(usize::from(i))?;
+                let painted = v
+                    .nearby_painted
+                    .as_ref()
+                    .map(|p| p.devices.get(usize::from(i)));
+                (painted.is_none() || painted == Some(Some(&d.fingerprint))).then(|| d.clone())
+            })
+            .flatten();
+            if let Some(d) = device.filter(|d| d.action.is_some()) {
+                request_nearby(NearbyRequest::Forget(d.fingerprint));
+            }
+        }
+        Target::ForgetAll => {
+            if ask(hwnd, "Forget all devices", FORGET_ALL_QUESTION, true) {
+                request_nearby(NearbyRequest::ForgetAll);
+            }
+        }
+        Target::ResetIdentity => {
+            let off = with_view(|v| !crate::nearby_ui::enabled(&v.settings)) == Some(true);
+            if off && ask(hwnd, "Reset identity", RESET_QUESTION, true) {
+                request_nearby(NearbyRequest::ResetIdentity);
+            }
+        }
         Target::Accent(a) => request_accent(a),
         Target::Capacity(c) => request_capacity(c),
         Target::Delay(d) => request_delay(d),
@@ -1368,6 +2031,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
+        windows::Win32::UI::WindowsAndMessaging::WM_TIMER if wparam.0 == NEARBY_ARM_TIMER_ID => {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(
+                    Some(hwnd),
+                    NEARBY_ARM_TIMER_ID,
+                );
+            }
+            invalidate(hwnd);
+            LRESULT(0)
+        }
         windows::Win32::UI::WindowsAndMessaging::WM_TIMER if wparam.0 == SWITCH_TIMER_ID => {
             let moving = with_view(|v| {
                 let now = std::time::Instant::now();
@@ -1401,7 +2074,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // Sent from another thread / process (Oeca moves its own window
             // on this thread only)
             let external = unsafe { InSendMessageEx(None) } & (ISMEX_SEND | ISMEX_NOTIFY) != 0;
-            if wp.flags & SWP_NOMOVE == SET_WINDOW_POS_FLAGS(0) {
+            // Minimizing (the taskbar, Win+D) moves the window off screen
+            // from another process: never "correct" that back
+            let minimized = unsafe { IsIconic(hwnd) }.as_bool();
+            if wp.flags & SWP_NOMOVE == SET_WINDOW_POS_FLAGS(0) && !minimized {
                 let back = with_view(|v| {
                     let back =
                         placement_correction(v.placement, v.corrections, (wp.x, wp.y), external);
@@ -1474,7 +2150,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_MOUSEMOVE => {
             let (x, y) = point(lparam);
             let target = hit_px(hwnd, x, y);
-            let changed = with_view(|v| std::mem::replace(&mut v.hover, target) != target);
+            let (w, h) = client_size(hwnd);
+            let s = scale(hwnd);
+            let side = side_item(w, h, x / s, y / s);
+            let changed = with_view(|v| {
+                let moved = std::mem::replace(&mut v.side_hover, side) != side;
+                (std::mem::replace(&mut v.hover, target) != target) | moved
+            });
             if changed == Some(true) {
                 let mut tme = TRACKMOUSEEVENT {
                     cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -1490,7 +2172,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_MOUSELEAVE => {
-            with_view(|v| v.hover = None);
+            with_view(|v| {
+                v.hover = None;
+                v.side_hover = None;
+            });
             invalidate(hwnd);
             LRESULT(0)
         }
@@ -1543,7 +2228,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     v.nav.focus_visible = true;
                     v.nav.focus
                 });
-                if let Some(focus) = focus {
+                // A held key repeats: never a Nearby action (decisions,
+                // forgetting), only a fresh press
+                let repeat = lparam.0 & (1 << 30) != 0;
+                let nearby = matches!(
+                    focus,
+                    Some(
+                        Target::NearbyNotice
+                            | Target::NearbyButton(_)
+                            | Target::Forget(_)
+                            | Target::ForgetAll
+                            | Target::ResetIdentity
+                    )
+                );
+                if let Some(focus) = focus.filter(|_| !(repeat && nearby)) {
                     activate(hwnd, focus);
                 }
                 invalidate(hwnd);
@@ -1619,6 +2317,22 @@ fn paint(v: &mut View) -> Result<()> {
     let (width, height) = client_size(v.hwnd);
     let l = layout(width, height);
     let category = v.nav.category;
+    // The sidebar hover aims at the entry under the pointer and advances by
+    // the time since its last frame. While it moves, each paint asks for the
+    // next: the target presents on vsync, so the glide runs at the display's
+    // rate (a WM_TIMER's uneven 15.6 ms steps read as jitter), and stops
+    // when it settles
+    let hovered = v.side_hover.map(|i| l.items[i].top);
+    let instant = !crate::window::motion_allowed(
+        v.settings.reduced_motion,
+        crate::window::is_client_animation_enabled(),
+    );
+    let now = std::time::Instant::now();
+    if let Some(t) = v.side_tick {
+        v.side.step(now.duration_since(t).as_secs_f32() * 1000.0);
+    }
+    let gliding = v.side.retarget(hovered, instant);
+    v.side_tick = gliding.then_some(now);
     unsafe {
         rt.BeginDraw();
         rt.Clear(Some(&COLOR_BACKGROUND));
@@ -1630,6 +2344,42 @@ fn paint(v: &mut View) -> Result<()> {
         let selected_fill = brush(&COLOR_SPACE_PILL_SELECTED)?;
         let hover_fill = brush(&COLOR_HOVER)?;
         let accent = brush(&v.settings.accent.color())?;
+        let lit = crate::renderer::create_edge_brush(rt)?;
+        // Edges and separators are one physical pixel at every DPI
+        let hair = 96.0 / dpi;
+        // Specular rim: a white hairline lit from above that fades out down
+        // the sides, so a surface catches light along its top instead of
+        // wearing a grey outline. Settings paints only on demand, so the
+        // gradient is cheap here
+        let stop = |position: f32, a: f32| D2D1_GRADIENT_STOP {
+            position,
+            color: D2D1_COLOR_F {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a,
+            },
+        };
+        let stops = rt.CreateGradientStopCollection(
+            &[stop(0.0, RIM.0), stop(0.5, RIM.1), stop(1.0, RIM.2)],
+            D2D1_GAMMA_2_2,
+            D2D1_EXTEND_MODE_CLAMP,
+        )?;
+        let raise = |r: RectF, radius: f32, fill: &ID2D1SolidColorBrush| {
+            rt.FillRoundedRectangle(&rounded(r, radius), fill);
+            // Points set through the properties struct (the brush's own
+            // Get*Point calls are mis-bound: struct returned by value)
+            let mut p = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES::default();
+            (p.startPoint.X, p.startPoint.Y) = (r.left, r.top);
+            (p.endPoint.X, p.endPoint.Y) = (r.left, r.bottom);
+            if let Ok(b) = rt.CreateLinearGradientBrush(&p, None, &stops) {
+                let h = hair / 2.0;
+                let inner = RectF::new(r.left + h, r.top + h, r.right - h, r.bottom - h);
+                rt.DrawRoundedRectangle(&rounded(inner, (radius - h).max(0.0)), &b, hair, None);
+            }
+        };
+        // The selected state: a flat lift with the specular rim
+        let lifted = brush(&COLOR_SELECTED)?;
         let text = |s: &str, f: &IDWriteTextFormat, r: RectF, b: &ID2D1SolidColorBrush| {
             let s: Vec<u16> = s.encode_utf16().collect();
             rt.DrawText(
@@ -1641,26 +2391,42 @@ fn paint(v: &mut View) -> Result<()> {
                 DWRITE_MEASURING_MODE_NATURAL,
             );
         };
+        // A section heading over its card, lifted clear of the card's lit top
+        let heading = |s: &str, r: RectF| {
+            let lifted = RectF::new(r.left, r.top - 8.0, r.right, r.bottom - 8.0);
+            text(s, &v.formats.section, lifted, &tertiary);
+        };
         let focus_ring = |r: RectF, radius: f32| {
             rt.DrawRoundedRectangle(&rounded(r, radius), &primary, 1.5, None);
         };
 
-        // Sidebar: darker panel with a hairline edge; the selected entry is
-        // filled, bold and marked by a leading bar (not by color alone)
-        rt.FillRectangle(&l.sidebar.to_d2d_rect(), &brush(&COLOR_SIDEBAR)?);
-        let edge = RectF::new(l.sidebar.right - 1.0, 0.0, l.sidebar.right, height);
-        rt.FillRectangle(&edge.to_d2d_rect(), &separator);
+        // Sidebar: a dark floating panel, inset from the window edges; the
+        // selected entry is a lifted pill with a bold label and a white
+        // icon (not by color alone)
+        let card = brush(&COLOR_CARD)?;
+        let pad = SIDEBAR_INSET - SIDEBAR_FLOAT;
+        let panel = RectF::new(
+            SIDEBAR_FLOAT,
+            SIDEBAR_FLOAT,
+            l.sidebar.right - SIDEBAR_INSET + pad,
+            height - SIDEBAR_FLOAT,
+        );
+        raise(panel, SIDEBAR_RADIUS, &brush(&COLOR_PANEL)?);
+        // The gliding hover (on whole pixels, so its edges stay crisp while
+        // it moves) under the selected pill, which sits on its entry
+        let snap = |v: f32| (v / hair).round() * hair;
+        let top = snap(v.side.hover.value);
+        let glide = RectF::new(l.items[0].left, top, l.items[0].right, top + ITEM_HEIGHT);
+        if v.side.hover_alpha.value > 0.0 {
+            hover_fill.SetOpacity(v.side.hover_alpha.value.min(1.0));
+            rt.FillRoundedRectangle(&rounded(glide, ITEM_RADIUS), &hover_fill);
+            hover_fill.SetOpacity(1.0);
+        }
+        raise(l.items[category.index()], ITEM_RADIUS, &lifted);
         for c in Category::ALL {
             let r = l.items[c.index()];
             let selected = c == category;
             let target = Target::Category(c);
-            if selected {
-                rt.FillRoundedRectangle(&rounded(r, 8.0), &selected_fill);
-                let bar = RectF::new(r.left + 3.0, r.top + 10.0, r.left + 6.0, r.bottom - 10.0);
-                rt.FillRoundedRectangle(&rounded(bar, 1.5), &accent);
-            } else if v.hover == Some(target) || v.pressed == Some(target) {
-                rt.FillRoundedRectangle(&rounded(r, 8.0), &hover_fill);
-            }
             let ink = if selected { &primary } else { &secondary };
             let icon_cx = r.left + 14.0 + ITEM_ICON / 2.0;
             fill_glyph(
@@ -1680,7 +2446,7 @@ fn paint(v: &mut View) -> Result<()> {
             };
             text(c.title(), format, label, ink);
             if v.nav.focus_visible && v.nav.focus == target {
-                focus_ring(r, 8.0);
+                focus_ring(r, ITEM_RADIUS);
             }
         }
 
@@ -1688,21 +2454,62 @@ fn paint(v: &mut View) -> Result<()> {
         text(category.title(), &v.formats.heading, l.page_title, &primary);
         text(
             category.description(),
-            &v.formats.body,
+            &v.formats.item,
             l.page_description,
-            &tertiary,
+            &secondary,
         );
-        // Segmented selector: a quiet track; the chosen segment is a filled
-        // pill with a bold label (not color alone)
+        // Cards: each run of touching rows sits on one raised graphite card;
+        // separators run between its rows only
+        let mut rows: Vec<RectF> = category
+            .controls()
+            .iter()
+            .map(|c| l.rows[c.index()].row)
+            .collect();
+        match category {
+            Category::General => rows.push(l.closing_row),
+            Category::Clipboard => rows.push(l.rows[0].row),
+            Category::About => rows.push(l.update_row),
+            Category::Nearby => {
+                let n = v.nearby.devices.len().clamp(1, DEVICE_ROWS);
+                rows.extend(l.device_rows[..n].iter().map(|r| r.row));
+                rows.push(l.identity_row);
+            }
+            _ => {}
+        }
+        rows.sort_by(|a, b| a.top.total_cmp(&b.top));
+        let mut i = 0;
+        while i < rows.len() {
+            let mut j = i;
+            while j + 1 < rows.len() && (rows[j + 1].top - rows[j].bottom).abs() < 1.0 {
+                j += 1;
+            }
+            let (first, last) = (rows[i], rows[j]);
+            let r = RectF::new(
+                first.left - CARD_BLEED,
+                first.top,
+                first.right + CARD_BLEED,
+                last.bottom,
+            );
+            raise(r, CARD_RADIUS, &card);
+            for row in &rows[i..j] {
+                let line = RectF::new(row.left, row.bottom - hair, row.right, row.bottom);
+                rt.FillRectangle(&line.to_d2d_rect(), &separator);
+            }
+            i = j + 1;
+        }
+        // Segmented selector: a recessed well; the chosen segment is a lifted
+        // pill with a bold label (not color alone), concentric with the
+        // well (radius = well radius - 2)
+        let well = brush(&COLOR_WELL)?;
         let segmented = |rects: &[RectF], labels: &[&str], chosen: usize, targets: &[Target]| {
             let (first, last) = (rects[0], rects[rects.len() - 1]);
             let track = RectF::new(first.left, first.top, last.right, last.bottom);
-            rt.FillRoundedRectangle(&rounded(track, track.height() / 2.0), &hover_fill);
+            rt.FillRoundedRectangle(&rounded(track, track.height() / 2.0), &well);
             for i in 0..rects.len() {
                 let (r, target) = (rects[i], targets[i]);
                 let pill = RectF::new(r.left + 2.0, r.top + 2.0, r.right - 2.0, r.bottom - 2.0);
                 if i == chosen {
-                    rt.FillRoundedRectangle(&rounded(pill, pill.height() / 2.0), &selected_fill);
+                    raise(pill, pill.height() / 2.0, &lifted);
                 } else if v.hover == Some(target) || v.pressed == Some(target) {
                     rt.FillRoundedRectangle(&rounded(pill, pill.height() / 2.0), &hover_fill);
                 }
@@ -1718,15 +2525,15 @@ fn paint(v: &mut View) -> Result<()> {
             }
         };
         if category == Category::General {
-            for ((heading, _), r) in SECTIONS.iter().zip(l.sections) {
-                text(heading, &v.formats.section, r, &secondary);
+            for ((name, _), r) in SECTIONS.iter().zip(l.sections) {
+                heading(name, r);
             }
             text(CLOSING_TITLE, &v.formats.body, l.closing_title, &primary);
             text(
                 CLOSING_DESCRIPTION,
                 &v.formats.caption,
                 l.closing_description,
-                &tertiary,
+                &secondary,
             );
             segmented(
                 &l.closing,
@@ -1734,26 +2541,18 @@ fn paint(v: &mut View) -> Result<()> {
                 v.settings.collapse_delay.index(),
                 &CollapseDelay::ALL.map(Target::Delay),
             );
-            let r = l.closing_row;
-            let line = RectF::new(r.left, r.bottom - 1.0, r.right, r.bottom);
-            rt.FillRectangle(&line.to_d2d_rect(), &separator);
         }
         if category == Category::Media {
-            text(MEDIA_SECTION, &v.formats.section, l.sections[0], &secondary);
+            heading(MEDIA_SECTION, l.sections[0]);
         }
         if category == Category::About {
-            text(
-                UPDATES_SECTION,
-                &v.formats.section,
-                l.sections[0],
-                &secondary,
-            );
+            heading(UPDATES_SECTION, l.sections[0]);
             text(INSTALLED_LABEL, &v.formats.body, l.update_title, &primary);
             text(
                 INSTALLED_DESCRIPTION,
                 &v.formats.caption,
                 l.update_description,
-                &tertiary,
+                &secondary,
             );
             text(
                 &status_line(v.update),
@@ -1761,11 +2560,8 @@ fn paint(v: &mut View) -> Result<()> {
                 l.update_status,
                 &tertiary,
             );
-            let r = l.update_row;
-            let line = RectF::new(r.left, r.bottom - 1.0, r.right, r.bottom);
-            rt.FillRectangle(&line.to_d2d_rect(), &separator);
-            // Quiet pill buttons (the selectors' track); hover / press
-            // lifts them; disabled while a check runs
+            // Raised graphite pill buttons; hover / press brightens them;
+            // disabled (flat, dim) while a check runs
             let checking = checking(Some(v.update));
             let mut buttons = vec![(Target::UpdateCheck, l.update_check, CHECK_LABEL, !checking)];
             if v.nav.release {
@@ -1774,7 +2570,11 @@ fn paint(v: &mut View) -> Result<()> {
             for (target, r, label, enabled) in buttons {
                 let active = enabled && (v.hover == Some(target) || v.pressed == Some(target));
                 let fill = if active { &selected_fill } else { &hover_fill };
-                rt.FillRoundedRectangle(&rounded(r, r.height() / 2.0), fill);
+                if enabled {
+                    raise(r, r.height() / 2.0, fill);
+                } else {
+                    rt.FillRoundedRectangle(&rounded(r, r.height() / 2.0), &well);
+                }
                 let ink = if enabled { &primary } else { &tertiary };
                 text(label, &v.formats.segment, r, ink);
                 if v.nav.focus_visible && v.nav.focus == target {
@@ -1782,19 +2582,146 @@ fn paint(v: &mut View) -> Result<()> {
                 }
             }
         }
-        if category == Category::Clipboard {
+        if category == Category::Nearby {
+            heading(NEARBY_SECTIONS[0], l.sections[0]);
+            let page = &v.nearby;
+            // A text button like About's: raised, brighter on hover / press;
+            // flat and dim while it cannot be used
+            let button = |target: Target, r: RectF, label: &str, enabled: bool| {
+                let active = enabled && (v.hover == Some(target) || v.pressed == Some(target));
+                let fill = if active { &selected_fill } else { &hover_fill };
+                if enabled {
+                    raise(r, r.height() / 2.0, fill);
+                } else {
+                    rt.FillRoundedRectangle(&rounded(r, r.height() / 2.0), &well);
+                }
+                text(
+                    label,
+                    &v.formats.segment,
+                    r,
+                    if enabled { &primary } else { &tertiary },
+                );
+                if v.nav.focus_visible && v.nav.focus == target {
+                    focus_ring(r, r.height() / 2.0);
+                }
+            };
+            match &page.note {
+                Some(note) => text(note, &v.formats.caption, l.nearby_status, &primary),
+                None => text(&page.status, &v.formats.caption, l.nearby_status, &tertiary),
+            }
+            button(Target::NearbyNotice, l.nearby_notice, NOTICE_LABEL, true);
+            let painted = NearbyPainted::of(page);
+            if v.nearby_painted.as_ref() != Some(&painted) {
+                v.nearby_painted = Some(painted);
+            }
+            match &page.card {
+                Some(card) => {
+                    let mut title = card.title.clone();
+                    if let Some((label, _)) = card.identity {
+                        title += &format!(" \u{00B7} {label}");
+                    }
+                    text(&title, &v.formats.body, l.transfer_title, &primary);
+                    text(
+                        &nearby_detail(card),
+                        &v.formats.caption,
+                        l.transfer_detail,
+                        &secondary,
+                    );
+                    // Its question arms `ARMING` after first painted here
+                    let now = std::time::Instant::now();
+                    let same = v.nearby_seen.as_ref().is_some_and(|(id, actions, _)| {
+                        *id == card.id && actions.iter().eq(card.buttons.iter().map(|b| &b.action))
+                    });
+                    if !same {
+                        let actions = card.buttons.iter().map(|b| b.action).collect();
+                        v.nearby_seen = Some((card.id.clone(), actions, now));
+                    }
+                    let shown = v.nearby_seen.as_ref().map_or(now, |s| s.2);
+                    if let Some(wait) = crate::nearby_ui::arm_delay(card, now, shown) {
+                        let ms = u32::try_from(wait.as_millis())
+                            .unwrap_or(u32::MAX)
+                            .saturating_add(1);
+                        let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
+                            Some(v.hwnd),
+                            NEARBY_ARM_TIMER_ID,
+                            ms,
+                            None,
+                        );
+                    }
+                    let armed = card.armed(now, Some(shown));
+                    for (i, b) in card.buttons.iter().take(3).enumerate() {
+                        let enabled = armed || !crate::nearby_ui::Card::is_decision(b.action);
+                        button(
+                            Target::NearbyButton(i as u8),
+                            l.transfer_buttons[i],
+                            b.label,
+                            enabled,
+                        );
+                    }
+                }
+                None => {
+                    v.nearby_seen = None;
+                    text(NO_TRANSFER, &v.formats.body, l.transfer_title, &tertiary);
+                    text(
+                        NO_TRANSFER_NOTE,
+                        &v.formats.caption,
+                        l.transfer_detail,
+                        &tertiary,
+                    );
+                }
+            }
+            let section = match page.devices.len() {
+                n if n > DEVICE_ROWS => format!("{} ({n})", NEARBY_SECTIONS[1]),
+                _ => NEARBY_SECTIONS[1].to_string(),
+            };
+            heading(&section, l.devices_section);
+            if v.nav.nearby.forget_all {
+                button(Target::ForgetAll, l.forget_all, FORGET_ALL_LABEL, true);
+            }
+            if page.devices.is_empty() {
+                let r = l.device_rows[0];
+                text(
+                    "No trusted devices yet",
+                    &v.formats.body,
+                    r.title,
+                    &tertiary,
+                );
+                let note = page
+                    .store
+                    .unwrap_or("Devices you verify with a code appear here.");
+                text(note, &v.formats.caption, r.description, &tertiary);
+            }
+            for (i, d) in page.devices.iter().take(DEVICE_ROWS).enumerate() {
+                let r = l.device_rows[i];
+                text(&d.name, &v.formats.body, r.title, &primary);
+                let detail = format!("{} \u{00B7} {}", d.state, d.detail);
+                text(&detail, &v.formats.caption, r.description, &secondary);
+                if let Some(label) = d.action {
+                    button(Target::Forget(i as u8), r.switch, label, true);
+                }
+            }
+            text(IDENTITY_TITLE, &v.formats.body, l.identity_title, &primary);
             text(
-                CLIPBOARD_SECTION,
-                &v.formats.section,
-                l.sections[0],
+                identity_description(crate::nearby_ui::enabled(&v.settings)),
+                &v.formats.caption,
+                l.identity_description,
                 &secondary,
             );
+            button(
+                Target::ResetIdentity,
+                l.reset,
+                RESET_LABEL,
+                !crate::nearby_ui::enabled(&v.settings),
+            );
+        }
+        if category == Category::Clipboard {
+            heading(CLIPBOARD_SECTION, l.sections[0]);
             text(CAPACITY_TITLE, &v.formats.body, l.capacity_title, &primary);
             text(
                 CAPACITY_DESCRIPTION,
                 &v.formats.caption,
                 l.capacity_description,
-                &tertiary,
+                &secondary,
             );
             segmented(
                 &l.capacity,
@@ -1802,21 +2729,22 @@ fn paint(v: &mut View) -> Result<()> {
                 v.settings.clipboard_capacity.index(),
                 &ClipboardCapacity::ALL.map(Target::Capacity),
             );
-            let separator_line = RectF::new(
-                l.rows[0].row.left,
-                l.rows[0].row.bottom - 1.0,
-                l.rows[0].row.right,
-                l.rows[0].row.bottom,
-            );
-            rt.FillRectangle(&separator_line.to_d2d_rect(), &separator);
             for (note, r) in CLIPBOARD_NOTES.iter().zip(l.clipboard_notes) {
                 text(note, &v.formats.caption, r, &tertiary);
             }
         }
         if category == Category::Appearance {
-            for (heading, r) in APPEARANCE_SECTIONS.iter().zip(l.appearance_sections) {
-                text(heading, &v.formats.section, r, &secondary);
+            for (name, r) in APPEARANCE_SECTIONS.iter().zip(l.appearance_sections) {
+                heading(name, r);
             }
+            // The swatches' card, like every other page's rows
+            let swatch_card = RectF::new(
+                l.appearance_sections[0].left - CARD_BLEED,
+                l.appearance_sections[0].bottom,
+                l.appearance_sections[0].right + CARD_BLEED,
+                l.accent_name.bottom + 12.0,
+            );
+            raise(swatch_card, CARD_RADIUS, &card);
             // Swatches: a filled disc each; the chosen one is ringed and named
             // below (not marked by color alone); hover lifts a soft halo
             let chosen = v.settings.accent;
@@ -1843,13 +2771,16 @@ fn paint(v: &mut View) -> Result<()> {
                 }
             }
             text(chosen.name(), &v.formats.caption, l.accent_name, &secondary);
-            // Preview: Oeca's black surface with an "on" switch and a
+            // Preview: a card of Oeca's black surface, as wide as the other
+            // cards, with an "on" switch where every row's switch sits and a
             // progress track in the accent (the real switch drawing)
             let p = l.preview;
-            rt.FillRoundedRectangle(&rounded(p, 14.0), &brush(&NOTCH_BG_COLOR)?);
-            let sw = RectF::new(p.right - 56.0, p.top + 17.0, p.right - 16.0, p.top + 39.0);
-            crate::renderer::draw_switch(rt, sw, 1.0, 3.0, 1.0, chosen)?;
-            let track = RectF::new(p.left + 18.0, p.top + 26.0, sw.left - 24.0, p.top + 30.0);
+            let surface = RectF::new(p.left - CARD_BLEED, p.top, p.right + CARD_BLEED, p.bottom);
+            raise(surface, CARD_RADIUS, &brush(&NOTCH_BG_COLOR)?);
+            let cy = (p.top + p.bottom) / 2.0;
+            let sw = RectF::new(p.right - 40.0, cy - 11.0, p.right, cy + 11.0);
+            crate::renderer::draw_switch(rt, sw, 1.0, 3.0, 1.0, chosen, &lit)?;
+            let track = RectF::new(p.left, cy - 2.0, sw.left - 24.0, cy + 2.0);
             rt.FillRoundedRectangle(&rounded(track, 2.0), &selected_fill);
             let played = RectF::new(
                 track.left,
@@ -1866,16 +2797,8 @@ fn paint(v: &mut View) -> Result<()> {
                 control.description(),
                 &v.formats.caption,
                 row.description,
-                &tertiary,
+                &secondary,
             );
-            // Separator under each row
-            let line = RectF::new(
-                row.row.left,
-                row.row.bottom - 1.0,
-                row.row.right,
-                row.row.bottom,
-            );
-            rt.FillRectangle(&line.to_d2d_rect(), &separator);
             // Hover: a soft halo; press: the knob tucks in a little
             let s = row.switch;
             let target = Target::Control(*control);
@@ -1891,6 +2814,7 @@ fn paint(v: &mut View) -> Result<()> {
                 3.0,
                 knob,
                 v.settings.accent,
+                &lit,
             )?;
             if v.nav.focus_visible && v.nav.focus == target {
                 let f = RectF::new(s.left - 4.0, s.top - 4.0, s.right + 4.0, s.bottom + 4.0);
@@ -1901,8 +2825,27 @@ fn paint(v: &mut View) -> Result<()> {
             Err(e) if e.code() == D2DERR_RECREATE_TARGET => v.target = None,
             r => r?,
         }
+        if gliding {
+            let _ = InvalidateRect(Some(v.hwnd), None, false);
+        }
     }
     Ok(())
+}
+
+/// A transfer's second line on the Nearby page: the code to compare (digit
+/// groups), the note, and the files' summary.
+fn nearby_detail(card: &crate::nearby_ui::Card) -> String {
+    let mut parts = Vec::new();
+    if let Some(code) = &card.code {
+        parts.push(format!("Code {}", crate::nearby_ui::code_text(code).0));
+    }
+    if !card.note.is_empty() {
+        parts.push(card.note.clone());
+    }
+    if !card.summary.is_empty() {
+        parts.push(card.summary.clone());
+    }
+    parts.join(" \u{00B7} ")
 }
 
 /// Screen rectangle (physical px) of an element, for UI Automation.
@@ -1946,6 +2889,18 @@ pub enum Element {
     /// About's update buttons (Invoke).
     UpdateCheck,
     ViewRelease,
+    /// Nearby: the status line (a live region), the notice button, the
+    /// transfer (text) and its buttons, a listed device (text) and its
+    /// button, Forget all, the identity row (text) and Reset.
+    NearbyStatus,
+    NearbyNotice,
+    NearbyTransfer,
+    NearbyButton(u8),
+    Device(u8),
+    Forget(u8),
+    ForgetAll,
+    Identity,
+    ResetIdentity,
 }
 
 impl From<Target> for Element {
@@ -1958,13 +2913,27 @@ impl From<Target> for Element {
             Target::Delay(d) => Self::Delay(d),
             Target::UpdateCheck => Self::UpdateCheck,
             Target::ViewRelease => Self::ViewRelease,
+            Target::NearbyNotice => Self::NearbyNotice,
+            Target::NearbyButton(i) => Self::NearbyButton(i),
+            Target::Forget(i) => Self::Forget(i),
+            Target::ForgetAll => Self::ForgetAll,
+            Target::ResetIdentity => Self::ResetIdentity,
         }
     }
 }
 
 impl Element {
-    /// Children of the root while `category` is showing.
+    /// Children of the root while `category` is showing (with the open
+    /// window's live controls).
     pub fn children(category: Category) -> Vec<Self> {
+        let mut nav = with_view(|v| v.nav).unwrap_or_default();
+        nav.category = category;
+        Self::children_in(nav)
+    }
+
+    /// Children of the root for `nav` (its page and live controls).
+    pub fn children_in(nav: Nav) -> Vec<Self> {
+        let category = nav.category;
         Category::ALL
             .into_iter()
             .map(Self::Category)
@@ -2015,7 +2984,7 @@ impl Element {
             .chain(
                 (category == Category::About)
                     .then(|| {
-                        let release = with_view(|v| v.nav.release) == Some(true);
+                        let release = nav.release;
                         [
                             Self::Section(6),
                             Self::Control(Control::CheckForUpdates),
@@ -2028,12 +2997,97 @@ impl Element {
                     .into_iter()
                     .flatten(),
             )
+            .chain(
+                (category == Category::Nearby)
+                    .then(|| {
+                        let n = nav.nearby;
+                        [
+                            Self::Section(7),
+                            Self::Control(Control::Nearby),
+                            Self::NearbyStatus,
+                            Self::NearbyNotice,
+                            Self::NearbyTransfer,
+                        ]
+                        .into_iter()
+                        .chain((0..n.buttons).map(Self::NearbyButton))
+                        .chain([Self::Section(8)])
+                        .chain(n.forget_all.then_some(Self::ForgetAll))
+                        .chain((0..DEVICE_ROWS as u8).flat_map(move |i| {
+                            let listed =
+                                with_view(|v| v.nearby.devices.len()).unwrap_or(0) > usize::from(i);
+                            listed
+                                .then_some(Self::Device(i))
+                                .into_iter()
+                                .chain((n.forget & 1 << i != 0).then_some(Self::Forget(i)))
+                        }))
+                        .chain([Self::Identity, Self::ResetIdentity])
+                    })
+                    .into_iter()
+                    .flatten(),
+            )
             .collect()
     }
 
-    /// Accessible name.
-    pub fn name(self, category: Category) -> &'static str {
-        match self {
+    /// Accessible name (Nearby's from the page's live state).
+    pub fn name(self, category: Category) -> std::borrow::Cow<'static, str> {
+        use std::borrow::Cow;
+        let nearby = |f: &dyn Fn(&NearbyPage) -> Option<String>| {
+            Cow::Owned(with_view(|v| f(&v.nearby)).flatten().unwrap_or_default())
+        };
+        Cow::Borrowed(match self {
+            Self::Section(7) => NEARBY_SECTIONS[0],
+            Self::Section(8) => NEARBY_SECTIONS[1],
+            Self::NearbyStatus => {
+                return nearby(&|p| Some(p.note.clone().unwrap_or_else(|| p.status.clone())));
+            }
+            Self::NearbyNotice => NOTICE_LABEL,
+            Self::NearbyTransfer => {
+                return nearby(&|p| {
+                    Some(match &p.card {
+                        Some(c) => {
+                            let mut s = c.title.clone();
+                            if let Some((label, _)) = c.identity {
+                                s += &format!(", {label}");
+                            }
+                            let mut detail = nearby_detail(c);
+                            if let Some(code) = &c.code {
+                                // Read the code digit by digit
+                                detail = detail.replace(
+                                    &crate::nearby_ui::code_text(code).0,
+                                    &crate::nearby_ui::code_text(code).1,
+                                );
+                            }
+                            format!("{s}. {detail}")
+                        }
+                        None => format!("{NO_TRANSFER}. {NO_TRANSFER_NOTE}"),
+                    })
+                });
+            }
+            Self::NearbyButton(i) => {
+                return nearby(&|p| {
+                    p.card
+                        .as_ref()
+                        .and_then(|c| c.buttons.get(usize::from(i)))
+                        .map(|b| b.label.to_string())
+                });
+            }
+            Self::Device(i) => {
+                return nearby(&|p| {
+                    p.devices
+                        .get(usize::from(i))
+                        .map(|d| format!("{}, {}, {}", d.name, d.state, d.detail))
+                });
+            }
+            Self::Forget(i) => {
+                return nearby(&|p| {
+                    p.devices
+                        .get(usize::from(i))
+                        .and_then(|d| d.action.map(|a| format!("{a} {}", d.name)))
+                });
+            }
+            Self::ForgetAll => FORGET_ALL_LABEL,
+            Self::Identity => IDENTITY_TITLE,
+            Self::ResetIdentity => RESET_LABEL,
             Self::Category(c) => c.title(),
             Self::PageTitle => category.title(),
             Self::Section(k) if k < SECTIONS.len() => SECTIONS[k].0,
@@ -2049,7 +3103,7 @@ impl Element {
             Self::UpdateVersion => INSTALLED_LABEL,
             Self::UpdateCheck => CHECK_LABEL,
             Self::ViewRelease => VIEW_LABEL,
-        }
+        })
     }
 
     /// Selected state (SelectionItem): the showing page's sidebar entry, and
@@ -2077,6 +3131,15 @@ impl Element {
             Self::UpdateVersion => 700,
             Self::UpdateCheck => 701,
             Self::ViewRelease => 702,
+            Self::NearbyStatus => 800,
+            Self::NearbyNotice => 801,
+            Self::NearbyTransfer => 802,
+            Self::ForgetAll => 803,
+            Self::Identity => 804,
+            Self::ResetIdentity => 805,
+            Self::NearbyButton(i) => 810 + i32::from(i),
+            Self::Device(i) => 820 + i32::from(i),
+            Self::Forget(i) => 830 + i32::from(i),
             Self::Control(c) => 200 + c.index() as i32,
         }
     }
@@ -2201,6 +3264,18 @@ mod access {
         }
     }
 
+    /// Nearby's status changed while its page shows: announced (live region).
+    pub(super) fn nearby_status_changed(hwnd: HWND) {
+        if listening() {
+            unsafe {
+                let _ = UiaRaiseAutomationEvent(
+                    &item(hwnd, Element::NearbyStatus),
+                    UIA_LiveRegionChangedEventId,
+                );
+            }
+        }
+    }
+
     /// A new page is showing: its entry is selected and the page's elements
     /// changed (screen readers announce the selection).
     pub(super) fn page_changed(hwnd: HWND, category: Category) {
@@ -2288,8 +3363,8 @@ mod access {
     /// now occupy) or of a closed window are unavailable: no bounds, no
     /// actions.
     pub(super) fn is_live(hwnd: HWND, element: Element) -> bool {
-        with_view(|v| v.hwnd == hwnd && Element::children(v.nav.category).contains(&element))
-            == Some(true)
+        let nav = with_view(|v| (v.hwnd == hwnd).then_some(v.nav)).flatten();
+        nav.is_some_and(|nav| Element::children_in(nav).contains(&element))
     }
 
     fn not_available<T>() -> Result<T> {
@@ -2387,7 +3462,13 @@ mod access {
                 (self.element, id),
                 (Element::Control(_), UIA_TogglePatternId)
                     | (
-                        Element::UpdateCheck | Element::ViewRelease,
+                        Element::UpdateCheck
+                            | Element::ViewRelease
+                            | Element::NearbyNotice
+                            | Element::NearbyButton(_)
+                            | Element::Forget(_)
+                            | Element::ForgetAll
+                            | Element::ResetIdentity,
                         UIA_InvokePatternId
                     )
                     | (
@@ -2409,7 +3490,41 @@ mod access {
             let e = self.element;
             let focus = with_view(|v| v.nav.focus);
             Ok(match (e, id) {
-                (_, UIA_NamePropertyId) => var_str(e.name(showing)),
+                (_, UIA_NamePropertyId) => var_str(&e.name(showing)),
+                (
+                    Element::NearbyStatus
+                    | Element::NearbyTransfer
+                    | Element::Device(_)
+                    | Element::Identity,
+                    UIA_ControlTypePropertyId,
+                ) => var_i32(UIA_TextControlTypeId.0),
+                (Element::NearbyStatus | Element::NearbyTransfer, UIA_LiveSettingPropertyId) => {
+                    var_i32(Polite.0)
+                }
+                (Element::Identity | Element::ResetIdentity, UIA_HelpTextPropertyId) => {
+                    var_str(identity_description(
+                        with_view(|v| crate::nearby_ui::enabled(&v.settings)) == Some(true),
+                    ))
+                }
+                (
+                    Element::NearbyNotice
+                    | Element::NearbyButton(_)
+                    | Element::Forget(_)
+                    | Element::ForgetAll
+                    | Element::ResetIdentity,
+                    UIA_ControlTypePropertyId,
+                ) => var_i32(UIA_ButtonControlTypeId.0),
+                (
+                    Element::NearbyNotice
+                    | Element::NearbyButton(_)
+                    | Element::Forget(_)
+                    | Element::ForgetAll
+                    | Element::ResetIdentity,
+                    UIA_HasKeyboardFocusPropertyId,
+                ) => var_bool(focus.map(Element::from) == Some(e)),
+                (Element::ResetIdentity, UIA_IsEnabledPropertyId) => {
+                    var_bool(with_view(|v| !crate::nearby_ui::enabled(&v.settings)) == Some(true))
+                }
                 (Element::Category(_), UIA_ControlTypePropertyId) => {
                     var_i32(UIA_TabItemControlTypeId.0)
                 }
@@ -2506,7 +3621,12 @@ mod access {
                     | Element::Capacity(_)
                     | Element::Delay(_)
                     | Element::UpdateCheck
-                    | Element::ViewRelease,
+                    | Element::ViewRelease
+                    | Element::NearbyNotice
+                    | Element::NearbyButton(_)
+                    | Element::Forget(_)
+                    | Element::ForgetAll
+                    | Element::ResetIdentity,
                     UIA_IsKeyboardFocusablePropertyId,
                 ) => var_bool(true),
                 (_, UIA_IsEnabledPropertyId) => var_bool(true),
@@ -2565,7 +3685,8 @@ mod access {
                 Element::Category(c) => l.items[c.index()],
                 Element::PageTitle => l.page_title,
                 Element::Section(k) if k < SECTIONS.len() => l.sections[k],
-                Element::Section(4..=6) => l.sections[0],
+                Element::Section(4..=7) => l.sections[0],
+                Element::Section(8) => l.devices_section,
                 Element::UpdateVersion => l.update_title,
                 Element::UpdateCheck => l.update_check,
                 Element::ViewRelease => l.update_view,
@@ -2575,6 +3696,20 @@ mod access {
                 Element::Section(k) => l.appearance_sections[k - SECTIONS.len()],
                 Element::Accent(a) => l.swatches[a.index()],
                 Element::Control(c) => l.rows[c.index()].row,
+                Element::NearbyStatus => l.nearby_status,
+                Element::NearbyNotice => l.nearby_notice,
+                Element::NearbyTransfer => RectF::new(
+                    l.transfer_title.left,
+                    l.transfer_title.top,
+                    l.transfer_detail.right,
+                    l.transfer_detail.bottom,
+                ),
+                Element::NearbyButton(i) => l.transfer_buttons[usize::from(i).min(2)],
+                Element::Device(i) => l.device_rows[usize::from(i).min(DEVICE_ROWS - 1)].row,
+                Element::Forget(i) => l.device_rows[usize::from(i).min(DEVICE_ROWS - 1)].switch,
+                Element::ForgetAll => l.forget_all,
+                Element::Identity => l.identity_row,
+                Element::ResetIdentity => l.reset,
             };
             let (left, top, width, height) = super::screen_rect(self.hwnd, r);
             Ok(UiaRect {
@@ -2599,10 +3734,19 @@ mod access {
                 Element::Delay(d) => Target::Delay(d),
                 Element::UpdateCheck => Target::UpdateCheck,
                 Element::ViewRelease => Target::ViewRelease,
+                Element::NearbyNotice => Target::NearbyNotice,
+                Element::NearbyButton(i) => Target::NearbyButton(i),
+                Element::Forget(i) => Target::Forget(i),
+                Element::ForgetAll => Target::ForgetAll,
+                Element::ResetIdentity => Target::ResetIdentity,
                 Element::PageTitle
                 | Element::Section(_)
                 | Element::Note(_)
-                | Element::UpdateVersion => return Ok(()),
+                | Element::UpdateVersion
+                | Element::NearbyStatus
+                | Element::NearbyTransfer
+                | Element::Device(_)
+                | Element::Identity => return Ok(()),
             };
             with_view(|v| v.nav.focus = target);
             super::invalidate(self.hwnd);
@@ -2620,7 +3764,8 @@ mod access {
             }
             match self.element {
                 Element::Control(c) => {
-                    super::request_toggle(c);
+                    // The same path as a click (Nearby asks for its notice)
+                    super::activate(self.hwnd, Target::Control(c));
                     Ok(())
                 }
                 _ => empty(),
@@ -2644,6 +3789,11 @@ mod access {
             match self.element {
                 Element::UpdateCheck => super::activate(self.hwnd, Target::UpdateCheck),
                 Element::ViewRelease => super::activate(self.hwnd, Target::ViewRelease),
+                Element::NearbyNotice => super::activate(self.hwnd, Target::NearbyNotice),
+                Element::NearbyButton(i) => super::activate(self.hwnd, Target::NearbyButton(i)),
+                Element::Forget(i) => super::activate(self.hwnd, Target::Forget(i)),
+                Element::ForgetAll => super::activate(self.hwnd, Target::ForgetAll),
+                Element::ResetIdentity => super::activate(self.hwnd, Target::ResetIdentity),
                 _ => return empty(),
             }
             Ok(())
@@ -2698,10 +3848,17 @@ mod tests {
     use windows::Win32::UI::WindowsAndMessaging::{MSG, PM_REMOVE, PeekMessageW, WM_QUIT};
 
     #[test]
-    fn test_five_categories_in_order_general_default() {
+    fn test_six_categories_in_order_general_default() {
         assert_eq!(
             Category::ALL.map(Category::title),
-            ["General", "Appearance", "Clipboard", "Media", "About"]
+            [
+                "General",
+                "Appearance",
+                "Clipboard",
+                "Media",
+                "Oeca Hop",
+                "About"
+            ]
         );
         assert_eq!(Category::default(), Category::General);
         assert_eq!(Nav::default().category, Category::General);
@@ -2717,6 +3874,7 @@ mod tests {
             [Control::ShowSourceApp, Control::ShowVisualizer]
         );
         assert_eq!(Category::About.controls(), [Control::CheckForUpdates]);
+        assert_eq!(Category::Nearby.controls(), [Control::Nearby]);
         for c in [Category::Appearance, Category::Clipboard] {
             assert!(c.controls().is_empty(), "{c:?} has no switches");
         }
@@ -2755,17 +3913,17 @@ mod tests {
             "focus leaves the hidden control"
         );
         // Tab order: sidebar entries, then the page's controls
-        assert_eq!(nav.focus_order().len(), 7, "Media: its two switches");
+        assert_eq!(nav.focus_order().len(), 8, "Media: its two switches");
         nav.select(Category::About);
         let switch = Target::Control(Control::CheckForUpdates);
         assert_eq!(
-            nav.focus_order()[5..],
+            nav.focus_order()[Category::ALL.len()..],
             [switch, Target::UpdateCheck],
             "About: the switch, then Check for updates"
         );
         nav.release = true;
         assert_eq!(
-            nav.focus_order()[5..],
+            nav.focus_order()[Category::ALL.len()..],
             [switch, Target::ViewRelease, Target::UpdateCheck],
             "About: View release while an update is available"
         );
@@ -2776,7 +3934,7 @@ mod tests {
         nav.release = false;
         nav.focus = Target::Category(Category::About);
         nav.select(Category::General);
-        assert_eq!(nav.focus_order().len(), 14, "5 switches + 4 closing delays");
+        assert_eq!(nav.focus_order().len(), 15, "5 switches + 4 closing delays");
         nav.focus = Target::Category(Category::About);
         assert_eq!(nav.tab(false), Target::Control(Control::AlwaysOnTop));
         assert_eq!(nav.tab(false), Target::Control(Control::ReducedMotion));
@@ -2926,15 +4084,22 @@ mod tests {
             let children = Element::children(category);
             let names: Vec<_> = children.iter().map(|e| e.name(category)).collect();
             assert_eq!(
-                &names[..5],
-                ["General", "Appearance", "Clipboard", "Media", "About"]
+                &names[..6],
+                [
+                    "General",
+                    "Appearance",
+                    "Clipboard",
+                    "Media",
+                    "Oeca Hop",
+                    "About"
+                ]
             );
             assert_eq!(
-                names[5],
+                names[6],
                 category.title(),
                 "page title follows the selection"
             );
-            let switches = &children[6..];
+            let switches = &children[7..];
             if category == Category::General {
                 assert_eq!(
                     switches,
@@ -3074,6 +4239,25 @@ mod tests {
                     "Check for updates automatically"
                 );
                 assert_eq!(Element::ViewRelease.name(category), "View release");
+            } else if category == Category::Nearby {
+                // No window open: nothing live but the switch, the notice
+                // and the (disabled) reset
+                assert_eq!(
+                    switches,
+                    [
+                        Element::Section(7),
+                        Element::Control(Control::Nearby),
+                        Element::NearbyStatus,
+                        Element::NearbyNotice,
+                        Element::NearbyTransfer,
+                        Element::Section(8),
+                        Element::Identity,
+                        Element::ResetIdentity,
+                    ]
+                );
+                assert_eq!(switches[0].name(category), "Sharing");
+                assert_eq!(switches[5].name(category), "Trusted devices");
+                assert_eq!(switches[7].name(category), RESET_LABEL);
             } else {
                 assert!(switches.is_empty(), "nothing on {category:?}");
             }
@@ -3091,10 +4275,15 @@ mod tests {
         let d = OecaSettings::default();
         assert_eq!(
             Control::ALL.map(|c| c.is_on(d)),
-            [true, false, true, true, false, true, true, false],
-            "Always on top on, Reduced motion off, Escape closes on, Confirm clear on, Start on launch off,              source app shown, visualizer shown, automatic update checks off (opt-in)"
+            [true, false, true, true, false, true, true, false, false],
+            "Always on top on, Reduced motion off, Escape closes on, Confirm clear on, Start on launch off,              source app shown, visualizer shown, automatic update checks off (opt-in), Oeca Hop off"
         );
-        // Each switch flips exactly its own value, and back
+        // Each switch flips exactly its own value, and back (Nearby reads as
+        // on only with the current notice accepted)
+        let d = OecaSettings {
+            nearby_notice: crate::nearby_ui::notice_id(),
+            ..d
+        };
         for c in Control::ALL {
             let mut s = d;
             c.toggle(&mut s);
@@ -3165,8 +4354,8 @@ mod tests {
     fn test_settings_text_uses_the_same_font_as_the_notch() {
         let dwrite: IDWriteFactory =
             unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }.unwrap();
-        let font = crate::renderer::ui_font(&dwrite);
         for role in TextRole::ALL {
+            let font = crate::renderer::face_font(&dwrite, role.style().face);
             let f = role_format(&dwrite, role).unwrap();
             let len = unsafe { f.GetFontFamilyNameLength() } as usize;
             let mut name = vec![0u16; len + 1];
@@ -3396,6 +4585,351 @@ mod tests {
             out.push(msg.wParam.0);
         }
         out
+    }
+
+    fn nearby_requests() -> Vec<NearbyRequest> {
+        use windows::Win32::UI::WindowsAndMessaging::{MSG, PM_REMOVE, PeekMessageW};
+        let mut out = Vec::new();
+        let mut msg = MSG::default();
+        while unsafe {
+            PeekMessageW(
+                &mut msg,
+                None,
+                WM_APP_SETTINGS_NEARBY,
+                WM_APP_SETTINGS_NEARBY,
+                PM_REMOVE,
+            )
+        }
+        .as_bool()
+        {
+            // SAFETY: from that message, taken once
+            out.push(unsafe { take_request(msg.lParam) });
+        }
+        out
+    }
+
+    fn asked() -> Vec<String> {
+        TEST_ASKED.with(|a| std::mem::take(&mut *a.borrow_mut()))
+    }
+
+    #[test]
+    fn test_nearby_switch_asks_for_the_notice_and_only_yes_turns_it_on() {
+        use windows::Win32::UI::Accessibility::IToggleProvider;
+        use windows::core::Interface;
+        let hwnd = create(HWND::default(), OecaSettings::default()).unwrap();
+        navigate(hwnd, Category::Nearby);
+        toggle_requests();
+        nearby_requests();
+        asked();
+        // Off, notice never accepted: the notice; No leaves it off
+        TEST_ANSWER.set(false);
+        activate(hwnd, Target::Control(Control::Nearby));
+        assert_eq!(asked(), [CONSENT_TITLE]);
+        assert!(toggle_requests().is_empty() && nearby_requests().is_empty());
+        // UI Automation's Toggle takes the same path
+        let p = access::provider(hwnd, Element::Control(Control::Nearby));
+        unsafe { p.cast::<IToggleProvider>().unwrap().Toggle().unwrap() };
+        assert_eq!(asked(), [CONSENT_TITLE]);
+        assert!(toggle_requests().is_empty() && nearby_requests().is_empty());
+        // Yes: consent, never a plain toggle (the notch records the notice)
+        TEST_ANSWER.set(true);
+        key(hwnd, VK_SPACE.0);
+        with_view(|v| v.nav.focus = Target::Control(Control::Nearby));
+        key(hwnd, VK_SPACE.0);
+        assert_eq!(nearby_requests(), [NearbyRequest::Consent]);
+        assert!(toggle_requests().is_empty());
+        asked();
+        // Accepted before: a plain toggle, no question
+        let accepted = OecaSettings {
+            nearby_notice: crate::nearby_ui::notice_id(),
+            ..OecaSettings::default()
+        };
+        sync(accepted);
+        activate(hwnd, Target::Control(Control::Nearby));
+        assert!(asked().is_empty());
+        assert_eq!(toggle_requests(), [Control::Nearby.index()]);
+        // On: off at once, no question
+        sync(OecaSettings {
+            nearby: true,
+            ..accepted
+        });
+        activate(hwnd, Target::Control(Control::Nearby));
+        assert!(asked().is_empty());
+        assert_eq!(toggle_requests(), [Control::Nearby.index()]);
+        // Saved "on" without the current notice (an older notice, or an
+        // edited file): shown off, and turning it on asks
+        let stale = OecaSettings {
+            nearby: true,
+            nearby_notice: 0,
+            ..OecaSettings::default()
+        };
+        sync(stale);
+        assert!(!Control::Nearby.is_on(stale));
+        TEST_ANSWER.set(false);
+        activate(hwnd, Target::Control(Control::Nearby));
+        assert_eq!(asked(), [CONSENT_TITLE]);
+        assert!(toggle_requests().is_empty() && nearby_requests().is_empty());
+        TEST_ANSWER.set(false);
+        close();
+    }
+
+    fn sample_card(buttons: &[(crate::nearby_ui::Action, &'static str)]) -> crate::nearby_ui::Card {
+        crate::nearby_ui::Card {
+            id: crate::nearby::test_transfer_id(),
+            direction: crate::nearby::Direction::Receive,
+            asks: true,
+            decide_after: None,
+            title: "From My phone".into(),
+            identity: Some(("Trusted", crate::nearby_ui::Tone::Good)),
+            note: String::new(),
+            warn: false,
+            code: None,
+            files: Vec::new(),
+            summary: "1 file, 3 B".into(),
+            progress: None,
+            buttons: buttons
+                .iter()
+                .map(|(action, label)| crate::nearby_ui::Button {
+                    action: *action,
+                    label,
+                    primary: false,
+                })
+                .collect(),
+            finished: false,
+        }
+    }
+
+    #[test]
+    fn test_nearby_page_decisions_are_bound_to_the_shown_transfer_and_armed() {
+        use crate::nearby_ui::Action;
+        let hwnd = create(HWND::default(), OecaSettings::default()).unwrap();
+        navigate(hwnd, Category::Nearby);
+        nearby_requests();
+        let card = sample_card(&[(Action::Decline, "Decline"), (Action::Accept, "Accept")]);
+        sync_nearby(NearbyPage {
+            card: Some(card.clone()),
+            ..NearbyPage::default()
+        });
+        let order = with_view(|v| v.nav.focus_order()).unwrap();
+        assert!(
+            order.contains(&Target::NearbyButton(0)) && order.contains(&Target::NearbyButton(1))
+        );
+        assert!(!order.contains(&Target::NearbyButton(2)));
+        // Never painted: a decision does not count yet
+        activate(hwnd, Target::NearbyButton(1));
+        assert!(nearby_requests().is_empty());
+        // On the page long enough: Accept goes to exactly that transfer
+        with_view(|v| {
+            v.nearby_seen = Some((
+                card.id.clone(),
+                vec![Action::Decline, Action::Accept],
+                std::time::Instant::now() - crate::nearby::ARMING,
+            ))
+        });
+        activate(hwnd, Target::NearbyButton(1));
+        assert_eq!(
+            nearby_requests(),
+            [NearbyRequest::Act(card.id.clone(), Action::Accept)]
+        );
+        // Another transfer replaced it: the same button is the new card's,
+        // which has not been on screen yet
+        let newer = sample_card(&[(Action::Decline, "Decline"), (Action::Accept, "Accept")]);
+        sync_nearby(NearbyPage {
+            card: Some(newer.clone()),
+            ..NearbyPage::default()
+        });
+        activate(hwnd, Target::NearbyButton(1));
+        assert!(
+            nearby_requests().is_empty(),
+            "an old approval never reaches a new transfer"
+        );
+        // Focus on Accept when another question replaces it: moved to its
+        // Decline, and a held Enter (auto-repeat) never decides
+        with_view(|v| v.nav.focus = Target::NearbyButton(1));
+        let third = sample_card(&[(Action::Decline, "Decline"), (Action::Accept, "Accept")]);
+        sync_nearby(NearbyPage {
+            card: Some(third.clone()),
+            ..NearbyPage::default()
+        });
+        assert_eq!(with_view(|v| v.nav.focus), Some(Target::NearbyButton(0)));
+        with_view(|v| {
+            v.nav.focus = Target::NearbyButton(1);
+            v.nearby_seen = Some((
+                third.id.clone(),
+                vec![Action::Decline, Action::Accept],
+                std::time::Instant::now() - crate::nearby::ARMING,
+            ))
+        });
+        let held = LPARAM(1 << 30);
+        unsafe { wndproc(hwnd, WM_KEYDOWN, WPARAM(usize::from(VK_RETURN.0)), held) };
+        assert!(nearby_requests().is_empty(), "auto-repeat");
+        unsafe {
+            wndproc(
+                hwnd,
+                WM_KEYDOWN,
+                WPARAM(usize::from(VK_RETURN.0)),
+                LPARAM(0),
+            )
+        };
+        assert_eq!(
+            nearby_requests(),
+            [NearbyRequest::Act(third.id.clone(), Action::Accept)],
+            "a fresh press"
+        );
+        // Painted with another transfer (a newer one synced since): its
+        // buttons do nothing until the page is painted again
+        with_view(|v| {
+            v.nearby_painted = Some(NearbyPainted {
+                card: Some(card.id.clone()),
+                devices: Vec::new(),
+            })
+        });
+        activate(hwnd, Target::NearbyButton(0));
+        assert!(nearby_requests().is_empty(), "not the transfer on screen");
+        with_view(|v| v.nearby_painted = None);
+        // Cancel never waits; focus on a button of the last question moves
+        // to the new one's safe button
+        with_view(|v| v.nav.focus = Target::NearbyButton(1));
+        let cancel = sample_card(&[(Action::Cancel, "Cancel")]);
+        sync_nearby(NearbyPage {
+            card: Some(cancel.clone()),
+            ..NearbyPage::default()
+        });
+        assert_eq!(with_view(|v| v.nav.focus), Some(Target::NearbyButton(0)));
+        activate(hwnd, Target::NearbyButton(0));
+        assert_eq!(
+            nearby_requests(),
+            [NearbyRequest::Act(cancel.id, Action::Cancel)]
+        );
+        close();
+    }
+
+    #[test]
+    fn test_nearby_device_management_and_identity_reset() {
+        let hwnd = create(HWND::default(), OecaSettings::default()).unwrap();
+        navigate(hwnd, Category::Nearby);
+        nearby_requests();
+        asked();
+        let (a, b) = (
+            crate::nearby::test_fingerprint(1),
+            crate::nearby::test_fingerprint(2),
+        );
+        let line = |name: &str, fp: &crate::nearby::Fingerprint, state, action| {
+            crate::nearby_ui::DeviceLine {
+                name: name.into(),
+                detail: "Verified 1 Jan 2026 \u{00B7} AB12".into(),
+                state,
+                fingerprint: fp.clone(),
+                action,
+            }
+        };
+        sync_nearby(NearbyPage {
+            devices: vec![
+                line("Phone", &a, "Trusted", Some("Forget")),
+                line("Old", &b, "Forgotten", None),
+            ],
+            ..NearbyPage::default()
+        });
+        let order = with_view(|v| v.nav.focus_order()).unwrap();
+        assert!(order.contains(&Target::Forget(0)) && !order.contains(&Target::Forget(1)));
+        assert!(order.contains(&Target::ForgetAll) && order.contains(&Target::ResetIdentity));
+        assert_eq!(Element::Forget(0).name(Category::Nearby), "Forget Phone");
+        // Forget: that device, by its key (works offline: the notch's store)
+        activate(hwnd, Target::Forget(0));
+        activate(hwnd, Target::Forget(1));
+        assert_eq!(nearby_requests(), [NearbyRequest::Forget(a.clone())]);
+        // Painted in another order (the list changed since): the row is no
+        // longer the device shown there, so nothing is forgotten
+        with_view(|v| {
+            v.nearby_painted = Some(NearbyPainted {
+                card: None,
+                devices: vec![b.clone(), a.clone()],
+            })
+        });
+        activate(hwnd, Target::Forget(0));
+        assert!(nearby_requests().is_empty(), "not the device on screen");
+        with_view(|v| v.nearby_painted = None);
+        // Forget all: asked first; No does nothing
+        TEST_ANSWER.set(false);
+        activate(hwnd, Target::ForgetAll);
+        assert!(nearby_requests().is_empty());
+        TEST_ANSWER.set(true);
+        activate(hwnd, Target::ForgetAll);
+        assert_eq!(nearby_requests(), [NearbyRequest::ForgetAll]);
+        assert_eq!(asked(), ["Forget all devices", "Forget all devices"]);
+        // Reset identity: only while Nearby is off, after asking
+        sync(OecaSettings {
+            nearby: true,
+            nearby_notice: crate::nearby_ui::notice_id(),
+            ..OecaSettings::default()
+        });
+        assert!(
+            !with_view(|v| v.nav.focus_order())
+                .unwrap()
+                .contains(&Target::ResetIdentity)
+        );
+        activate(hwnd, Target::ResetIdentity);
+        assert!(nearby_requests().is_empty() && asked().is_empty());
+        sync(OecaSettings::default());
+        activate(hwnd, Target::ResetIdentity);
+        assert_eq!(asked(), ["Reset identity"]);
+        assert_eq!(nearby_requests(), [NearbyRequest::ResetIdentity]);
+        TEST_ANSWER.set(false);
+        close();
+    }
+
+    #[test]
+    fn test_nearby_page_layout_fits_and_hits() {
+        let centre = |r: RectF| ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
+        for (w, h) in [MIN_CLIENT_SIZE, CLIENT_SIZE, (1200.0, 900.0)] {
+            let l = layout(w, h);
+            let page_right = w - PAGE_PADDING;
+            let rects = [
+                l.nearby_status,
+                l.nearby_notice,
+                l.transfer_title,
+                l.transfer_detail,
+                l.forget_all,
+                l.identity_row,
+                l.reset,
+            ]
+            .into_iter()
+            .chain(l.transfer_buttons)
+            .chain(
+                l.device_rows
+                    .iter()
+                    .flat_map(|r| [r.row, r.title, r.description, r.switch]),
+            );
+            for r in rects {
+                assert!(
+                    r.left >= SIDEBAR_WIDTH && r.right <= page_right + 0.5 && r.bottom <= h,
+                    "{r:?} in the page at {w}x{h}"
+                );
+            }
+            let switch = l.rows[Control::Nearby.index()];
+            assert!(switch.row.bottom <= l.nearby_notice.top);
+            assert!(l.nearby_status.right < l.nearby_notice.left);
+            assert!(l.transfer_buttons[0].right < l.transfer_buttons[1].left);
+            assert!(l.transfer_buttons[0].bottom < l.devices_section.top);
+            assert!(l.device_rows[DEVICE_ROWS - 1].row.bottom < l.identity_row.top);
+            for (r, t) in [
+                (switch.switch, Target::Control(Control::Nearby)),
+                (l.nearby_notice, Target::NearbyNotice),
+                (l.transfer_buttons[2], Target::NearbyButton(2)),
+                (l.device_rows[1].switch, Target::Forget(1)),
+                (l.forget_all, Target::ForgetAll),
+                (l.reset, Target::ResetIdentity),
+            ] {
+                let (x, y) = centre(r);
+                assert_eq!(hit(w, h, Category::Nearby, x, y), Some(t), "{w}x{h}");
+            }
+            // Nearby's controls exist only on its page
+            let (x, y) = centre(l.reset);
+            assert_ne!(
+                hit(w, h, Category::General, x, y),
+                Some(Target::ResetIdentity)
+            );
+        }
     }
 
     #[test]
@@ -3817,7 +5351,7 @@ mod tests {
         let live = rect(0, 0, 1920, 1080);
         assert_eq!(
             initial_position(live, outer_size(CLIENT_SIZE, 120), notch_clear_top(0, 120)),
-            ((1920 - outer_size(CLIENT_SIZE, 120).0) / 2, 281)
+            ((1920 - outer_size(CLIENT_SIZE, 120).0) / 2, 266)
         );
         // DPI scales the band: never physical-pixel constants
         assert!(notch_clear_top(0, 192) > notch_clear_top(0, 96));
@@ -3990,6 +5524,11 @@ mod tests {
         // Reopening an open window does not move it either
         open(HWND::default(), OecaSettings::default()).unwrap();
         assert_eq!(top_left(hwnd), (100, 120));
+        let shown = unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd) };
+        assert!(
+            !shown.as_bool(),
+            "a test never shows a window on the desktop"
+        );
         close();
     }
 

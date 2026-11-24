@@ -41,7 +41,9 @@ pub fn encode(s: &OecaSettings) -> String {
          start_on_launch={}\n\
          focus_seconds={}\n\
          break_seconds={}\n\
-         check_for_updates={}\n",
+         check_for_updates={}\n\
+         nearby={}\n\
+         nearby_notice={}\n",
         b(s.always_on_top),
         b(s.reduced_motion),
         b(s.close_settings_on_escape),
@@ -55,6 +57,8 @@ pub fn encode(s: &OecaSettings) -> String {
         s.focus_secs,
         s.break_secs,
         b(s.check_for_updates),
+        b(s.nearby),
+        s.nearby_notice,
     )
 }
 
@@ -117,6 +121,8 @@ pub fn decode(text: &str) -> Result<OecaSettings, LoadError> {
             "focus_seconds" => set(&mut s.focus_secs, timer_secs(value)),
             "break_seconds" => set(&mut s.break_secs, timer_secs(value)),
             "check_for_updates" => set(&mut s.check_for_updates, flag(value)),
+            "nearby" => set(&mut s.nearby, flag(value)),
+            "nearby_notice" => set(&mut s.nearby_notice, value.parse::<u32>().ok()),
             _ => {}
         }
     }
@@ -164,10 +170,10 @@ pub struct SettingsStore {
 }
 
 impl SettingsStore {
-    /// `%LOCALAPPDATA%\Oeca` (None if Windows will not say: nothing is read
-    /// or written, defaults apply).
+    /// The claimed data folder (None until claimed: nothing is read or
+    /// written, defaults apply).
     pub fn open() -> Self {
-        Self::at(crate::clipboard_store::local_app_data().map(|d| d.join("Oeca")))
+        Self::at(crate::data_dir::dir())
     }
 
     pub fn at(dir: Option<PathBuf>) -> Self {
@@ -230,14 +236,11 @@ impl SettingsStore {
             return Err(std::io::ErrorKind::NotFound.into());
         };
         std::fs::create_dir_all(dir)?;
-        let temp = dir.join(TEMP_NAME);
-        {
-            use std::io::Write;
-            let mut f = std::fs::File::create(&temp)?;
-            f.write_all(encode(s).as_bytes())?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&temp, dir.join(FILE_NAME))?;
+        crate::data_dir::replace(
+            &dir.join(FILE_NAME),
+            &dir.join(TEMP_NAME),
+            encode(s).as_bytes(),
+        )?;
         self.saved = Some(*s);
         self.keep_existing = false;
         Ok(())
@@ -263,13 +266,15 @@ mod tests {
             focus_secs: 50 * 60,
             break_secs: 30,
             check_for_updates: true,
+            nearby: true,
+            nearby_notice: 7,
         }
     }
 
     struct TempDir(PathBuf);
     impl TempDir {
         fn new(name: &str) -> Self {
-            let p = std::env::temp_dir()
+            let p = crate::data_dir::temp_dir()
                 .join(format!("oeca-settings-test-{}-{name}", std::process::id()));
             let _ = std::fs::remove_dir_all(&p);
             std::fs::create_dir_all(&p).unwrap();
@@ -321,6 +326,71 @@ mod tests {
     }
 
     #[test]
+    fn test_nearby_is_off_unless_saved_on() {
+        assert!(!OecaSettings::default().nearby, "a new user");
+        let on = |text: &str| decode(text).map(|s| s.nearby);
+        // An existing user's file has no such line
+        assert_eq!(on("version=1\naccent=rose\n"), Ok(false));
+        for bad in ["", "1", "on", "TRUE", "yes", "\u{FEFF}true"] {
+            assert_eq!(
+                on(&format!("version=1\nnearby={bad}\n")),
+                Ok(false),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(on("version=1\nnearby=true\n"), Ok(true));
+        // A file that cannot be used: the defaults, so off
+        for unusable in ["nearby=true\n", "version=2\nnearby=true\n"] {
+            assert!(!decode(unusable).unwrap_or_default().nearby, "{unusable:?}");
+        }
+        let dir = TempDir::new("nearby-unreadable");
+        std::fs::write(dir.0.join(FILE_NAME), [0xFF, 0xFE, 0x9C]).unwrap();
+        let loaded = SettingsStore::at(Some(dir.0.clone())).load();
+        assert!(!loaded.unwrap_or_default().nearby);
+    }
+
+    #[test]
+    fn test_nearby_notice_is_kept_and_bad_values_mean_none_accepted() {
+        let notice = |text: &str| decode(text).map(|s| (s.nearby, s.nearby_notice));
+        assert_eq!(notice("version=1\n"), Ok((false, 0)), "an existing user");
+        assert_eq!(
+            notice("version=1\nnearby_notice=123\n"),
+            Ok((false, 123)),
+            "accepted, still off"
+        );
+        for bad in ["", "-1", "abc", "99999999999"] {
+            assert_eq!(
+                notice(&format!("version=1\nnearby_notice={bad}\n")),
+                Ok((false, 0)),
+                "{bad:?}"
+            );
+        }
+        let s = OecaSettings {
+            nearby_notice: crate::nearby_ui::notice_id(),
+            ..OecaSettings::default()
+        };
+        assert_eq!(decode(&encode(&s)), Ok(s));
+    }
+
+    #[test]
+    fn test_nearby_and_start_on_launch_are_independent() {
+        for (nearby, start_on_launch) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let s = OecaSettings {
+                nearby,
+                start_on_launch,
+                ..OecaSettings::default()
+            };
+            assert_eq!(decode(&encode(&s)), Ok(s));
+        }
+        let launch_only = decode("version=1\nstart_on_launch=true\n").unwrap();
+        assert!(launch_only.start_on_launch && !launch_only.nearby);
+        let nearby_only = decode("version=1\nnearby=true\n").unwrap();
+        assert!(nearby_only.nearby && !nearby_only.start_on_launch);
+    }
+
+    #[test]
     fn test_new_user_defaults() {
         let d = OecaSettings::default();
         assert!(d.always_on_top && !d.reduced_motion);
@@ -368,7 +438,7 @@ mod tests {
         let flags = text
             .lines()
             .filter(|l| l.ends_with("=true") || l.ends_with("=false"));
-        assert_eq!(flags.count(), 8);
+        assert_eq!(flags.count(), 9);
         assert!(!text.contains("clipboard-history"), "no clipboard data");
     }
 
@@ -498,6 +568,17 @@ mod tests {
         assert_eq!(SettingsStore::at(Some(dir.0.clone())).load(), Ok(custom()));
         // A failed save is retried on the next change (not remembered as saved)
         assert!(bad.saved.is_none());
+        // A linked temporary file is never written through
+        let linked = TempDir::new("failure-linked");
+        let victim = blocked.0.join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        std::fs::hard_link(&victim, linked.0.join(TEMP_NAME)).unwrap();
+        assert!(
+            SettingsStore::at(Some(linked.0.clone()))
+                .save(&custom())
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
         // No folder known: an error, never a silent "saved"
         assert!(SettingsStore::at(None).save(&custom()).is_err());
     }

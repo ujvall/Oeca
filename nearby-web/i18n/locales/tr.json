@@ -1,0 +1,21 @@
+{
+  "index": {
+    "seo": {
+      "title": "LocalSend Web",
+      "description": "Tarayıcınız ve LocalSend çalıştıran diğer cihazlar arasında dosya paylaşın."
+    },
+    "connecting": "Bağlanıyor...",
+    "webCryptoNotSupported": "Tarayıcınız LocalSend'i desteklemiyor: Web Crypto API gereklidir.",
+    "empty": {
+      "title": "LocalSend'i başka bir cihazda açın.",
+      "deviceHint": "Bu siteyi başka bir tarayıcıda açın. Yerel uygulama desteği gelecekteki bir sürümde eklenecek.",
+      "lanHint": "Sadece aynı ağda bulunan cihazlar gösterilir."
+    },
+    "you": "Cihaz adı:",
+    "enterAlias": "Ad girin",
+    "progress": {
+      "titleSending": "Dosyalar gönderiliyor...",
+      "titleReceiving": "Dosyalar alınıyor..."
+    }
+  }
+}

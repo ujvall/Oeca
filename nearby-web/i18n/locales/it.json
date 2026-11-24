@@ -1,0 +1,21 @@
+{
+  "index": {
+    "seo": {
+      "title": "LocalSend Web",
+      "description": "Condividi file tra il browser e gli altri dispositivi con LocalSend aperto."
+    },
+    "connecting": "Connessione in corso...",
+    "webCryptoNotSupported": "Il tuo browser non supporta LocalSend: è richiesta la Web Crypto API.",
+    "empty": {
+      "title": "Apri LocalSend su un altro dispositivo.",
+      "deviceHint": "Apri questo sito su un altro browser. Il supporto per l'app nativa sarà aggiunto in una versione futura.",
+      "lanHint": "Vengono mostrati solo i dispositivi sulla stessa rete."
+    },
+    "you": "Tu sei:",
+    "enterAlias": "Inserisci nome",
+    "progress": {
+      "titleSending": "Invio file in corso...",
+      "titleReceiving": "Ricezione file in corso..."
+    }
+  }
+}

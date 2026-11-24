@@ -7,10 +7,10 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ujvall/Oeca/releases/download/v0.4.0/Oeca-Setup-0.4.0.exe"><img src="assets/readme/button-download.png" alt="Download for Windows" height="44"></a>
+  <a href="https://github.com/ujvall/Oeca/releases/download/v0.5.0/Oeca-Setup-0.5.0.exe"><img src="assets/readme/button-download.png" alt="Download for Windows" height="44"></a>
   <a href="https://github.com/ujvall/Oeca/releases"><img src="assets/readme/button-releases.png" alt="All releases" height="44"></a>
   <img src="assets/readme/chip-windows.png" alt="Windows 10 or later, 64-bit" height="44">
-  <img src="assets/readme/chip-version.png" alt="Version 0.4.0" height="44">
+  <img src="assets/readme/chip-version.png" alt="Version 0.5.0" height="44">
 </p>
 
 <br>
@@ -45,6 +45,15 @@ Drag files onto the notch and drop them on **Convert** (audio always goes there)
 - **Safe and offline:** everything runs on your PC, in the background. Originals are never modified, existing files are never overwritten (you get `name (2).ext`), and nothing is uploaded.
 - With Always on top off, Oeca comes forward while you drag files in and stays in front until you press Convert, collapse the notch or close the workspace.
 
+### Oeca Hop
+
+Send files between your PC and your phone, or any device running LocalSend, from the notch's **Hop** space. On a phone, open the Oeca Hop web page ([oeca-hop.vercel.app](https://oeca-hop.vercel.app)) in the browser: nothing to install.
+
+- **Off until you turn it on**, in **Settings → Oeca Hop**, after a privacy notice that says exactly what is shared. It runs only while Oeca is open, and starts with Oeca only if Start on launch is on.
+- **Verified devices:** the first time two devices connect, both show the same code; confirm it once and the device is remembered. You can reset this PC's Hop identity at any time.
+- **Nothing arrives unasked:** every incoming transfer waits for your approval. Received files go to `Downloads\Oeca Hop`, are marked as downloaded from the internet, and are never opened by Hop.
+- **Direct and encrypted:** files travel over WebRTC straight between the two devices. LocalSend's public signaling server only introduces them; see [Privacy](#privacy).
+
 ## How it is built
 
 <p>
@@ -56,7 +65,7 @@ Drag files onto the notch and drop them on **Convert** (audio always goes there)
   <img src="assets/readme/chip-noruntime.png" alt="No runtime" height="36">
 </p>
 
-Oeca is a free, open-source (MIT) single Rust executable: no runtime, UI framework or web view. The app itself uses only Microsoft's [`windows`](https://crates.io/crates/windows) and `windows-core` crates. The converter adds pure-Rust codecs ([`image`](https://crates.io/crates/image), [Symphonia](https://github.com/pdeljanov/Symphonia), `flacenc`, and a vendored copy of `avif-decode` with `rav1d`) plus `vorbis_rs`, which bundles the C libogg and libvorbis. All of them are listed, with their licences, in [`THIRD-PARTY-NOTICES.txt`](THIRD-PARTY-NOTICES.txt).
+Oeca is a free, open-source (MIT) single Rust executable: no runtime, UI framework or web view. The app itself uses only Microsoft's [`windows`](https://crates.io/crates/windows) and `windows-core` crates. The converter adds pure-Rust codecs ([`image`](https://crates.io/crates/image), [Symphonia](https://github.com/pdeljanov/Symphonia), `flacenc`, and a vendored copy of `avif-decode` with `rav1d`) plus `vorbis_rs`, which bundles the C libogg and libvorbis. Oeca Hop adds a vendored copy of [LocalSend](https://github.com/localsend/localsend)'s Rust core with `webrtc` and `tokio` (and a vendored `dtls`). All of them are listed, with their licences, in [`THIRD-PARTY-NOTICES.txt`](THIRD-PARTY-NOTICES.txt).
 
 - **Window.** One layered, per-monitor-DPI-aware Win32 window. Pixels outside the notch shape pass clicks through to the windows below.
 - **Rendering.** Direct2D and DirectWrite draw into a premultiplied 32-bit bitmap that is composited with `UpdateLayeredWindow`. Brushes, text formats and bitmaps are cached per artwork and DPI.
@@ -66,7 +75,7 @@ Oeca is a free, open-source (MIT) single Rust executable: no runtime, UI framewo
 
 ## Install
 
-1. Download `Oeca-Setup-0.4.0.exe` from [Releases](https://github.com/ujvall/Oeca/releases).
+1. Download `Oeca-Setup-0.5.0.exe` from [Releases](https://github.com/ujvall/Oeca/releases).
 2. Run it. Oeca installs for your Windows account only, to `%LOCALAPPDATA%\Programs\Oeca`; no administrator rights are needed.
 3. Look for the notch at the top of your screen and the Oeca icon in the notification area.
 
@@ -88,10 +97,10 @@ cargo build --release --locked
 
 ### Installer
 
-`installer/Oeca.iss` builds the setup with [Inno Setup](https://jrsoftware.org/isinfo.php) **6.7.0 or later** (its dark wizard style and colours need 6.7). Build the release executable first: the script refuses to package one that is older than the sources.
+`installer/Oeca.iss` builds the setup with [Inno Setup](https://jrsoftware.org/isinfo.php) **6.7.0 or later** (its dark wizard style and colours need 6.7). Build the release executable first, with `tools/release.ps1`: it is `cargo build --release --locked` without this computer's folders in the executable (Rust records where each crate's source was, which on a local build names your user folder), and it checks that none are left. The installer script refuses to package an executable that is older than the sources.
 
 ```powershell
-cargo build --release --locked
+powershell -ExecutionPolicy Bypass -File tools\release.ps1
 & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" installer\Oeca.iss
 ```
 
@@ -119,20 +128,27 @@ Oeca/
 │   ├── settings_window.rs     Settings window
 │   ├── settings_store.rs      Settings file
 │   ├── startup.rs             Start on launch
+│   ├── data_dir.rs            Data folder checks, writer lock, test isolation
+│   ├── nearby.rs, nearby/     Oeca Hop: connection, trusted devices, transfers
+│   ├── nearby_ui.rs           Oeca Hop space in the notch
 │   └── tray.rs                Notification area icon and menu
+├── nearby-web/                Oeca Hop web page for phones (Nuxt, static)
 ├── assets/                    Icon, version resource and README images
 ├── installer/                 Inno Setup script and wizard images
+├── tools/                     Release build script
 ├── vendor/avif-decode/        Vendored AVIF decoder (BSD-3-Clause)
+├── vendor/localsend-core/     Vendored LocalSend core (Apache-2.0)
+├── vendor/dtls/               Vendored DTLS for WebRTC (MIT or Apache-2.0)
 └── build.rs                   Embeds the icon and version information
 ```
 
 ## Privacy
 
-Oeca makes no network requests unless you ask it to check for updates: from version 0.3.0, Check for updates (Settings, About) and the optional Check for updates automatically setting, off by default, send one HTTPS request to GitHub's public releases API, with no account or personal data. Oeca never downloads or installs anything itself, and it has no telemetry, analytics or crash reporting. Its settings and its clipboard history are stored only on your PC, in `%LOCALAPPDATA%\Oeca`; the clipboard history is not encrypted and is discarded when you sign out or restart Windows. The full [privacy policy](website/app/privacy/page.tsx) covers the app, the installer and the website. It will also be published on the Oeca website once that is online.
+Oeca makes no network requests unless you turn on a feature that needs them. Check for updates (Settings, About) and the optional Check for updates automatically setting, off by default, send one HTTPS request to GitHub's public releases API, with no account or personal data. Oeca Hop, off by default, connects while it is on and Oeca is open to LocalSend's public signaling server (`public.localsend.org`) and STUN server (`stun.localsend.org`), run by the LocalSend project: they see this PC's public IP address, and the signaling server also sees its Hop name, device type and identity, and lists it to devices that share its public address (on public Wi-Fi or a shared VPN, that can include strangers). Files go directly between devices, encrypted, never through those servers. The notice in Settings says this in full before Hop starts. Oeca never downloads or installs updates itself, and it has no telemetry, analytics or crash reporting. Its settings and its clipboard history are stored only on your PC, in `%LOCALAPPDATA%\Oeca`; the clipboard history is not encrypted and is discarded when you sign out or restart Windows. The full [privacy policy](website/app/privacy/page.tsx) covers the app, the installer and the website. It will also be published on the Oeca website once that is online.
 
 ## Code signing policy
 
-**Status: pending.** Oeca is applying for free code signing from [SignPath Foundation](https://signpath.org). Current releases, including v0.4.0, are not signed. Once the application is accepted, releases will be built by the GitHub Actions workflow in this repository, signed through SignPath and published here, with this notice: Free code signing provided by SignPath.io, certificate by SignPath Foundation.
+**Status: pending.** Oeca is applying for free code signing from [SignPath Foundation](https://signpath.org). Current releases, including v0.5.0, are not signed. Once the application is accepted, releases will be built by the GitHub Actions workflow in this repository, signed through SignPath and published here, with this notice: Free code signing provided by SignPath.io, certificate by SignPath Foundation.
 
 - Authors, Reviewers and Approvers: [Ujval Sai (@ujvall)](https://github.com/ujvall), currently the only maintainer.
 - Every signing request is approved manually by the maintainer, for releases built from this repository only.

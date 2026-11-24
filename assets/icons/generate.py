@@ -1,5 +1,6 @@
 """Oeca's own icons, drawn from scratch: rounded polygons, circles and arcs
-on a 24 x 24 grid, emitted as cubic-Bezier outlines.
+on a 24 x 24 grid, emitted as cubic-Bezier outlines (Home, Music and
+Clipboard are traced from images: see trace.py and traced.py).
 
 Solid shapes run one way and holes the other, so the icons fill with the
 nonzero (winding) rule: overlapping solids merge, holes cut out.
@@ -10,6 +11,8 @@ Usage: python generate.py preview.html icons.rs
 """
 import math
 import sys
+
+import traced
 
 KAPPA = 4.0 / 3.0
 
@@ -48,6 +51,32 @@ def rounded_polygon(pts, radii, hole=False):
         if a != b:
             segs.append(("C", c1, c2, b))
     segs.append(("Z",))
+    return segs
+
+
+def spline(pts, hole=False):
+    """Smooth closed outline through `pts` (Catmull-Rom as cubic Beziers)."""
+    if (area(pts) < 0) != hole:
+        pts = pts[::-1]
+    n = len(pts)
+    segs = [("M", pts[0])]
+    for i in range(n):
+        p0, p1, p2, p3 = pts[i - 1], pts[i], pts[(i + 1) % n], pts[(i + 2) % n]
+        segs.append(("C",
+                     (p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6),
+                     (p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6),
+                     p2))
+    segs.append(("Z",))
+    return segs
+
+
+def from_trace(outlines):
+    """Outlines running the largest one's way are solids, the others holes
+    (see trace.py)."""
+    big = max(outlines, key=lambda o: abs(area(o)))
+    segs = []
+    for o in outlines:
+        segs += spline(o, hole=area(o) * area(big) < 0)
     return segs
 
 
@@ -187,29 +216,18 @@ def norm(a):
 # ── The icons ─────────────────────────────────────────────────────────────
 
 def home():
-    # A soft-roofed house with an arched door
-    return rounded_polygon(
-        [(12, 2.6), (21.2, 10.2), (21.2, 21.4), (14.6, 21.4), (14.6, 15.6),
-         (9.4, 15.6), (9.4, 21.4), (2.8, 21.4), (2.8, 10.2)],
-        [2.6, 1.9, 2.6, 1.1, 2.1, 2.1, 1.1, 2.6, 1.9],
-    )
+    # A soft-roofed house with an arched door (traced from the image)
+    return from_trace(traced.HOME)
 
 
 def music():
-    # Two beamed notes
-    beam = rounded_polygon([(8.4, 6.9), (21.0, 3.6), (21.0, 7.5), (8.4, 10.8)], 1.1)
-    return (circle(6.6, 17.8, 3.6) + circle(17.4, 15.2, 3.6)
-            + rrect(8.3, 7.2, 1.9, 10.6, 0.9) + rrect(19.1, 4.4, 1.9, 10.8, 0.9) + beam)
+    # One note: a round head, a stem and a slanted flag (traced from the image)
+    return from_trace(traced.MUSIC)
 
 
 def clipboard():
-    # A board with a notch at the top, and its clip resting in it
-    board = rounded_polygon(
-        [(3.6, 4.6), (6.6, 4.6), (6.6, 8.6), (17.4, 8.6), (17.4, 4.6), (20.4, 4.6),
-         (20.4, 22.2), (3.6, 22.2)],
-        [3.0, 0.9, 1.6, 1.6, 0.9, 3.0, 3.0, 3.0],
-    )
-    return board + rrect(8.8, 1.8, 6.4, 4.8, 1.8)
+    # A solid board with the clip resting in its notch (traced from the image)
+    return from_trace(traced.CLIPBOARD)
 
 
 def gear():
@@ -271,11 +289,14 @@ def copy():
 
 
 def trash():
-    # A lid with its handle, just wider than the straight-sided, solid bin
-    lid = rrect(4.0, 4.4, 16.0, 2.8, 1.4) + rrect(8.8, 1.8, 6.4, 3.6, 1.4)
-    body = rounded_polygon([(4.8, 9.2), (19.2, 9.2), (19.2, 22.2), (4.8, 22.2)],
-                           [1.0, 1.0, 2.4, 2.4])
-    return lid + body
+    # A round-ended lid with its handle over the solid, tapering bin
+    # (unit-ish coordinates measured from the image)
+    handle = rounded_polygon([(-0.131, -0.5), (0.131, -0.5), (0.18, -0.35), (-0.18, -0.35)],
+                             [0.05, 0.05, 0, 0])
+    lid = rrect(-0.4244, -0.4171, 0.8488, 0.1342, 0.067)
+    body = rounded_polygon([(-0.366, -0.193), (0.366, -0.193), (0.319, 0.5), (-0.319, 0.5)],
+                           [0.015, 0.015, 0.075, 0.075])
+    return handle + lid + body
 
 
 def tray():
@@ -347,21 +368,65 @@ def check():
     return rounded_polygon(pts, radii)
 
 
+def soft_gear():
+    # Settings window, General: six broad teeth, every corner well rounded
+    teeth, outer, root = 6, 11.0, 8.0
+    top, base = math.radians(14.0), math.radians(24.0)
+    pts, radii = [], []
+    for i in range(teeth):
+        a = i * 2 * math.pi / teeth - math.pi / 2
+        for ang, rad, rr in ((a - base, root, 1.6), (a - top, outer, 1.5),
+                             (a + top, outer, 1.5), (a + base, root, 1.6)):
+            pts.append((12 + rad * math.cos(ang), 12 + rad * math.sin(ang)))
+            radii.append(rr)
+    return rounded_polygon(pts, radii) + circle(12, 12, 3.5, hole=True)
+
+
+def appearance():
+    # Settings window, Appearance: a ring with its left half filled, a thin
+    # gap between (light and dark)
+    half = ([("M", (12, 12 + 6.4))] + arc(12, 12, 6.4, math.pi / 2, 3 * math.pi / 2)
+            + [("Z",)])
+    return circle(12, 12, 10.2) + circle(12, 12, 8.4, hole=True) + half
+
+
+def soft_clipboard():
+    # Settings window, Clipboard: a soft board with a notch in its top edge
+    # and a pill-shaped clip resting in it
+    board = rounded_polygon(
+        [(4.4, 4.4), (7.6, 4.4), (7.6, 7.0), (16.4, 7.0), (16.4, 4.4), (19.6, 4.4),
+         (19.6, 21.6), (4.4, 21.6)],
+        [4.0, 0.8, 1.6, 1.6, 0.8, 4.0, 4.0, 4.0],
+    )
+    return board + rrect(9.0, 2.0, 6.0, 4.0, 2.0)
+
+
+def waveform():
+    # Settings window, Media: four round-ended level bars
+    segs = []
+    for cx, h in ((5.4, 9.0), (9.8, 17.0), (14.2, 12.0), (18.6, 6.0)):
+        segs += rrect(cx - 1.5, 12 - h / 2, 3.0, h, 1.5)
+    return segs
+
+
 ICONS = [
     ("HOUSE_BLANK", "Home: a soft-roofed house with an arched door; the Home space.", home, False),
-    ("MUSIC_ALT", "Music: two beamed notes; the Music space.", music, True),
-    ("CLIPBOARD", "Clipboard: a board and its clip; the Clipboard space.", clipboard, True),
-    ("PALETTE", "Palette: three paint wells and a thumb notch; Settings window, Appearance.", palette, True),
+    ("MUSIC_ALT", "Music: a note with a slanted flag; the Music space.", music, True),
+    ("CLIPBOARD", "Clipboard: a solid board with its clip in a notch; the Clipboard space.", clipboard, True),
     ("INFO", "Info: an \"i\" cut from a disc; Settings window, About.", info, True),
     ("GEAR", "Settings: an eight-tooth gear; the header's Settings icon.", gear, True),
     ("COPY", "Copy: a sheet in front of an outlined one; clipboard row copy button.", copy, False),
-    ("TRASH", "Trash: a lid over a solid bin; clipboard row delete button.", trash, False),
+    ("TRASH", "Trash: a solid tapered bin under a round-ended lid with a handle; clipboard\n/// row delete button.", trash, False),
     ("INBOX", "Tray: an open tray with a dipped front; the drop page glyph.", tray, False),
     ("DONE", "Done: a check cut from a disc; a drop's success.", done, False),
     ("ALERT", "Alert: an exclamation mark cut from a disc; a drop that failed.", alert, False),
     ("PICTURE", "Picture: a rounded frame with a sun and a ridge; an image file in the conversion workspace.", picture, False),
     ("FOLDER", "Folder: a rounded folder with a tab; the conversion workspace's output folder.", folder, False),
     ("CHECK", "Check: a rounded check mark; a ticked box in the conversion workspace.", check, False),
+    ("SOFT_GEAR", "General: a six-tooth gear, softly rounded; Settings window.", soft_gear, True),
+    ("APPEARANCE", "Appearance: a ring with its left half filled; Settings window.", appearance, True),
+    ("SOFT_CLIPBOARD", "Clipboard: a soft board with a pill clip; Settings window.", soft_clipboard, True),
+    ("WAVEFORM", "Media: four round-ended level bars; Settings window.", waveform, True),
 ]
 
 

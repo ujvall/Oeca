@@ -44,7 +44,10 @@ use crate::config::{
     WINDOW_TITLE, calculate_notch_x,
 };
 use crate::config::{DROP_RESULT_MS, DROP_RESULT_TIMER_ID};
-use crate::config::{HUD_FLYOUT_TIMER_ID, HUD_HIDE_TIMER_ID, HUD_HOLD_MS, HUD_RELEASE_TIMER_ID};
+use crate::config::{
+    HUD_FLYOUT_TIMER_ID, HUD_HEADSET_TIMER_ID, HUD_HIDE_TIMER_ID, HUD_HOLD_MS, HUD_KEYS_TIMER_ID,
+    HUD_RELEASE_TIMER_ID,
+};
 use crate::convert_batch::{self, Batch};
 use crate::dragdrop::{self, DragEvent, DragSession, DropTarget};
 use crate::hud::VolumeKey;
@@ -64,7 +67,7 @@ use crate::timer::{Countdown, Phase, Presence};
 use windows::Win32::System::Ole::{
     OleInitialize, OleUninitialize, RegisterDragDrop, RevokeDragDrop,
 };
-use windows::Win32::System::SystemInformation::GetTickCount;
+use windows::Win32::System::SystemInformation::{GetTickCount, GetTickCount64};
 use windows::Win32::UI::WindowsAndMessaging::{
     GA_ROOT, GetAncestor, WM_INPUT, WM_MBUTTONDOWN, WM_RBUTTONDOWN, WindowFromPoint,
 };
@@ -428,6 +431,10 @@ struct WindowState {
     saver_watch: [Option<windows::Win32::System::Power::HPOWERNOTIFY>; 2],
     brightness_watch: Option<windows::Win32::System::Power::HPOWERNOTIFY>,
     flyout_hook: Option<windows::Win32::UI::Accessibility::HWINEVENTHOOK>,
+    /// Audio output device changes (default switched, plugged, Bluetooth).
+    device_watch: Option<crate::hud::DeviceWatch>,
+    /// Headset volume buttons told apart from the keyboard's.
+    headset: crate::hud::HeadsetKeys,
     /// The one update state (release, checks, the notice's dismissal), the
     /// notice's presence, the collapsed notch's update icon's presence, the
     /// notice's window (created on first use, owned by the notch), whether
@@ -438,6 +445,19 @@ struct WindowState {
     update_notice: Option<HWND>,
     update_shown: bool,
     update_drawn: Option<(i32, i32, u32, f32)>,
+    /// Nearby's worker: exists exactly while its setting is on (`apply_nearby`).
+    /// Dropped on WM_DESTROY, which stops and joins its thread.
+    nearby: Option<crate::nearby::Nearby>,
+    /// Nearby's last snapshot (what is shown; the runtime stays the source of
+    /// truth), the finished transfer the user dismissed, the device list's
+    /// scroll, the device a file dialog is open for, the last thing that
+    /// could not be done, and the incoming transfer last brought forward.
+    nearby_view: Option<crate::nearby::View>,
+    nearby_dismissed: Option<crate::nearby::TransferId>,
+    nearby_scroll: usize,
+    nearby_picking: Option<crate::nearby::Peer>,
+    nearby_note: Option<String>,
+    nearby_surfaced: Option<crate::nearby::TransferId>,
 }
 
 /// `SetWindowPos` z-order arguments for routine moves and resizes: topmost
@@ -445,7 +465,7 @@ struct WindowState {
 /// (`SWP_NOZORDER`), so windows that covered Oeca stay above it.
 fn z_order(always_on_top: bool) -> (Option<HWND>, SET_WINDOW_POS_FLAGS) {
     if always_on_top {
-        (Some(HWND_TOPMOST), SET_WINDOW_POS_FLAGS(0))
+        (Some(TOP_BAND), SET_WINDOW_POS_FLAGS(0))
     } else {
         (None, SWP_NOZORDER)
     }
@@ -456,11 +476,19 @@ fn z_order(always_on_top: bool) -> (Option<HWND>, SET_WINDOW_POS_FLAGS) {
 /// the window in use (see `normal_slot`), never above it.
 fn z_band(always_on_top: bool) -> HWND {
     if always_on_top {
-        HWND_TOPMOST
+        TOP_BAND
     } else {
         normal_slot(unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() })
     }
 }
+
+/// The band of a notch that is on top. A test instance stays in the normal
+/// one, so a running Oeca keeps the top of the screen and its clicks.
+const TOP_BAND: HWND = if crate::data_dir::TEST_INSTANCE {
+    windows::Win32::UI::WindowsAndMessaging::HWND_NOTOPMOST
+} else {
+    HWND_TOPMOST
+};
 
 /// The foreground window, as far as placing the notch below it goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -621,7 +649,7 @@ impl WindowState {
         if self.state != NotchState::Expanded
             || self.animation.is_some()
             || self.media_content.is_none()
-            || self.space == OecaSpace::Clipboard
+            || matches!(self.space, OecaSpace::Clipboard | OecaSpace::Nearby)
             || self.settings_open
             || self.renderer.convert_open()
         {
@@ -790,6 +818,9 @@ impl WindowState {
             // Controls move with the layout: drop stale hover/press
             self.reset_feedback(hwnd);
             self.resize_to_target(hwnd, before);
+            if space == OecaSpace::Nearby {
+                self.nearby_refresh(hwnd);
+            }
             notify_accessibility_state_changed(
                 hwnd,
                 self.state,
@@ -881,6 +912,308 @@ impl WindowState {
         self.persist_settings();
     }
 
+    /// Nearby follows its setting, and only that: at startup (however Oeca was
+    /// opened) and after the setting changes. Stopping is bounded.
+    fn apply_nearby(&mut self, hwnd: HWND) {
+        // On only with the current notice accepted (also at startup)
+        let on = crate::nearby_ui::enabled(&self.settings);
+        follow_setting(&mut self.nearby, on, || start_nearby(hwnd));
+        if self.nearby.is_none() {
+            // Nothing of a stopped runtime stays on screen
+            self.nearby_view = None;
+            self.nearby_picking = None;
+        }
+    }
+
+    /// The Nearby setting after a change from Settings (decided by
+    /// `nearby_ui::toggled`: on only with the notice accepted): saved,
+    /// applied (the runtime starts or stops at once), shown.
+    fn set_nearby_setting(&mut self, hwnd: HWND, next: OecaSettings) {
+        if next != self.settings {
+            self.settings = next;
+            self.persist_settings();
+            self.apply_nearby(hwnd);
+            self.nearby_note = None;
+        }
+        settings_window::sync(self.settings);
+        self.nearby_refresh(hwnd);
+    }
+
+    /// What Nearby shows now (the last snapshot), with a refusal to report
+    /// in the status line.
+    fn nearby_model(&self) -> crate::nearby_ui::Model {
+        let mut m = crate::nearby_ui::model(
+            crate::nearby_ui::enabled(&self.settings),
+            self.nearby.is_some(),
+            self.nearby_view.as_ref(),
+            self.nearby_dismissed.as_ref(),
+        );
+        if let Some(note) = &self.nearby_note {
+            m.status = note.clone();
+        }
+        if let Some(peer) = &self.nearby_picking {
+            m.status = crate::nearby_ui::picking_status(peer);
+        }
+        m
+    }
+
+    /// The device store: the runtime's, or Oeca's own while Nearby is off
+    /// (forgetting works offline).
+    fn nearby_devices(&self) -> crate::nearby::Devices {
+        self.nearby
+            .as_ref()
+            .map_or_else(crate::nearby::Devices::for_oeca, |n| n.devices().clone())
+    }
+
+    /// After anything Nearby shows changed: the notch's picture (redrawn if
+    /// on screen), its accessible text, and the Settings window's page.
+    fn nearby_refresh(&mut self, hwnd: HWND) {
+        let model = self.nearby_model();
+        let peers = match &model.page {
+            crate::nearby_ui::Page::Peers(p) => p.len(),
+            _ => 0,
+        };
+        self.nearby_scroll = self
+            .nearby_scroll
+            .min(peers.saturating_sub(crate::layout::NEARBY_ROWS));
+        let picture = crate::renderer::NearbyPicture {
+            model: Some(model),
+            scroll: self.nearby_scroll,
+            picking: self.nearby_picking.is_some(),
+        };
+        let on_screen = self.state == NotchState::Expanded && self.space == OecaSpace::Nearby;
+        if self.renderer.set_nearby(picture) && on_screen {
+            self.redraw(hwnd);
+        }
+        self.nearby_announce(hwnd);
+        if settings_window::is_open() {
+            settings_window::sync_nearby(self.nearby_page());
+        }
+    }
+
+    /// The Nearby space's accessible text, re-announced when it changes on
+    /// screen (also when its question arms).
+    fn nearby_announce(&self, hwnd: HWND) {
+        let text = {
+            let picture = self.renderer.nearby_picture();
+            picture.model.as_ref().map_or_else(String::new, |m| {
+                crate::nearby_ui::accessible(
+                    m,
+                    std::time::Instant::now(),
+                    self.renderer.nearby_shown_at(),
+                )
+            })
+        };
+        let changed = NEARBY_TITLE.with(|t| *t.borrow() != text);
+        if changed {
+            NEARBY_TITLE.with(|t| *t.borrow_mut() = text);
+            if self.state == NotchState::Expanded && self.space == OecaSpace::Nearby {
+                notify_accessibility_state_changed(
+                    hwnd,
+                    self.state,
+                    self.clock.state(),
+                    self.media_content.as_ref(),
+                    self.space,
+                    &self.clipboard,
+                    self.clear_pending,
+                    self.settings_title(),
+                    self.timer_title().as_deref(),
+                );
+            }
+        }
+    }
+
+    /// The Settings window's Nearby page.
+    fn nearby_page(&self) -> settings_window::NearbyPage {
+        let model = self.nearby_model();
+        let devices = self.nearby_devices();
+        settings_window::NearbyPage {
+            status: model.status,
+            note: self.nearby_note.clone(),
+            card: match model.page {
+                crate::nearby_ui::Page::Transfer(c) => Some(*c),
+                _ => None,
+            },
+            devices: crate::nearby_ui::device_lines(&devices.list().unwrap_or_default()),
+            store: crate::nearby_ui::store_note(devices.status()),
+        }
+    }
+
+    /// A new snapshot from the runtime.
+    fn nearby_changed(&mut self, hwnd: HWND) {
+        let Some(view) = self.nearby.as_ref().map(|n| n.snapshot()) else {
+            return;
+        };
+        let id = |v: &Option<crate::nearby::View>| {
+            v.as_ref()
+                .and_then(|v| v.transfer.as_ref())
+                .map(|t| t.id.clone())
+        };
+        let before = id(&self.nearby_view);
+        self.nearby_view = Some(view);
+        // A refusal is about the transfer it was for
+        if id(&self.nearby_view) != before {
+            self.nearby_note = None;
+        }
+        self.nearby_surface(hwnd);
+        self.nearby_refresh(hwnd);
+    }
+
+    /// An incoming transfer that asks (once per transfer): the Nearby space
+    /// comes forward and the notch opens if it is on screen, so the question
+    /// is seen. Nothing is decided by it.
+    fn nearby_surface(&mut self, hwnd: HWND) {
+        let Some(t) = self.nearby_view.as_ref().and_then(|v| v.transfer.as_ref()) else {
+            return;
+        };
+        if t.direction != crate::nearby::Direction::Receive
+            || !t.stage.asks()
+            || self.nearby_surfaced.as_ref() == Some(&t.id)
+        {
+            return;
+        }
+        self.nearby_surfaced = Some(t.id.clone());
+        if self.space != OecaSpace::Nearby || self.settings_open {
+            self.select_space(hwnd, OecaSpace::Nearby);
+        }
+        let visible = unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd) };
+        if visible.as_bool() && !self.expanded_or_expanding() {
+            self.reset_feedback(hwnd);
+            let _ = start_or_reverse_animation(hwnd, self);
+        }
+    }
+
+    /// A click on a Nearby control, resolved against the picture on show.
+    fn nearby_click(&mut self, hwnd: HWND, hit: crate::layout::NearbyHit) {
+        use crate::layout::NearbyHit;
+        use crate::nearby_ui::{Card, Page};
+        let page = self.renderer.nearby_picture().model.clone().map(|m| m.page);
+        // A row or button means the picture on screen: if a newer one is set
+        // but not drawn yet, the click is about something no longer there
+        if !matches!(hit, NearbyHit::OpenSettings) && !self.renderer.nearby_on_show() {
+            return;
+        }
+        match (hit, page) {
+            (NearbyHit::OpenSettings, _) => {
+                self.open_full_settings(hwnd);
+                settings_window::show_category(settings_window::Category::Nearby);
+            }
+            (NearbyHit::Send(i), Some(Page::Peers(peers))) => {
+                // One file dialog at a time; the device as shown
+                if self.nearby_picking.is_none()
+                    && let Some(p) = peers.get(self.nearby_scroll + i)
+                    && crate::nearby_ui::pick_files_async(hwnd, WM_APP_NEARBY_FILES, &p.peer)
+                {
+                    self.nearby_note = None;
+                    self.nearby_picking = Some(p.peer.clone());
+                }
+            }
+            (NearbyHit::Button(i), Some(Page::Transfer(card))) => {
+                if let Some(b) = card.buttons.get(i) {
+                    // A decision counts only once armed (on screen long enough)
+                    if Card::is_decision(b.action)
+                        && !self.renderer.nearby_armed(std::time::Instant::now())
+                    {
+                        return;
+                    }
+                    self.nearby_act(&card.id, b.action);
+                }
+            }
+            _ => {}
+        }
+        self.nearby_refresh(hwnd);
+    }
+
+    /// Runs a card's action for the transfer it was shown for.
+    fn nearby_act(&mut self, id: &crate::nearby::TransferId, action: crate::nearby_ui::Action) {
+        use crate::nearby_ui::Action;
+        self.nearby_note = None;
+        let shown = self
+            .nearby_view
+            .as_ref()
+            .and_then(|v| v.transfer.as_ref())
+            .filter(|t| t.id == *id);
+        match action {
+            Action::Dismiss => self.nearby_dismissed = Some(id.clone()),
+            Action::ShowFolder => {
+                // Explorer on the folder with the first saved file selected;
+                // nothing is opened
+                if let Some(path) = shown.and_then(|t| t.saved.first()) {
+                    crate::convert_batch::show_in_folder(path);
+                }
+            }
+            _ => {
+                if let Some(n) = &self.nearby {
+                    let peer = shown.map(|t| t.claimed.peer.clone());
+                    if let Err(r) = crate::nearby_ui::perform(n, id, action, peer.as_ref()) {
+                        self.nearby_note = crate::nearby_ui::refusal_text(&r).map(String::from);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The file dialog closed: send to the device it was opened for, exactly
+    /// as it was shown (the runtime refuses a device that left or changed).
+    fn nearby_send(&mut self, hwnd: HWND, paths: Option<Vec<std::path::PathBuf>>) {
+        let peer = self.nearby_picking.take();
+        if let (Some(paths), Some(peer), Some(n)) = (paths, peer, &self.nearby) {
+            self.nearby_note = match n.send_files(&peer, paths) {
+                Ok(_) => None,
+                Err(r) => crate::nearby_ui::refusal_text(&r).map(String::from),
+            };
+        }
+        self.nearby_refresh(hwnd);
+    }
+
+    /// A request from the Settings window's Nearby page.
+    fn nearby_request(&mut self, hwnd: HWND, request: settings_window::NearbyRequest) {
+        use settings_window::NearbyRequest;
+        self.nearby_note = None;
+        match request {
+            NearbyRequest::Consent => {
+                if !crate::nearby_ui::enabled(&self.settings) {
+                    let next = crate::nearby_ui::toggled(self.settings, true);
+                    return self.set_nearby_setting(hwnd, next);
+                }
+            }
+            NearbyRequest::Act(id, action) => self.nearby_act(&id, action),
+            NearbyRequest::Forget(key) => {
+                let devices = self.nearby_devices();
+                let pending = devices.list().unwrap_or_default().iter().any(|d| {
+                    d.fingerprint == key && d.state == crate::nearby::DeviceState::RevocationPending
+                });
+                let done = if pending {
+                    devices.retry()
+                } else {
+                    devices.forget(&key)
+                };
+                if let Err(e) = done {
+                    self.nearby_note = Some(crate::nearby_ui::trust_error_text(&e).into());
+                }
+            }
+            NearbyRequest::ForgetAll => {
+                if let Err(e) = self.nearby_devices().forget_all() {
+                    self.nearby_note = Some(crate::nearby_ui::trust_error_text(&e).into());
+                }
+            }
+            NearbyRequest::ResetIdentity => {
+                // Only while stopped (the runtime holds the identity)
+                if self.nearby.is_none() && !crate::nearby_ui::enabled(&self.settings) {
+                    self.nearby_note = Some(
+                        match crate::data_dir::dir().map(|d| crate::nearby::reset_identity(&d)) {
+                            Some(Ok(())) => "This PC's Hop identity was reset.",
+                            Some(Err(_)) => "Couldn't reset the identity. Try again.",
+                            None => "The identity isn't available in this build.",
+                        }
+                        .into(),
+                    );
+                }
+            }
+        }
+        self.nearby_refresh(hwnd);
+    }
+
     /// "Open Full Settings": opens (or focuses) the native Settings window.
     /// The notch and its Settings page stay as they are.
     fn open_full_settings(&mut self, hwnd: HWND) {
@@ -888,6 +1221,7 @@ impl WindowState {
         let _ = settings_window::open(hwnd, self.settings);
         // An update found before Settings opened shows there too
         settings_window::sync_update(self.updates.status());
+        settings_window::sync_nearby(self.nearby_page());
     }
 
     /// Tray "Open Oeca" (or a left click on the icon): the notch shown and
@@ -919,6 +1253,11 @@ impl WindowState {
                 self.persist_settings();
             }
             settings_window::Control::StartOnLaunch => self.toggle_start_on_launch(),
+            // On only with the current notice accepted (the window asks)
+            settings_window::Control::Nearby => {
+                let next = crate::nearby_ui::toggled(self.settings, false);
+                self.set_nearby_setting(hwnd, next);
+            }
             settings_window::Control::CheckForUpdates => self.toggle_update_checks(hwnd),
             // Presentation only: redraw; the live timer follows the
             // visualizer (fast with bars, slow for a lone scrubber)
@@ -1381,6 +1720,17 @@ impl WindowState {
                 held.push(PanelHit::Convert(H::Chosen(at)));
             }
         }
+        // The panel's shape: as many rows as there are files (up to three;
+        // the discard question needs the full height), checks only with two
+        // or more files
+        if let Some(v) = &view {
+            let rows = if v.confirming {
+                usize::MAX
+            } else {
+                v.rows.len()
+            };
+            crate::layout::set_convert_shape(rows, v.total > 1);
+        }
         self.renderer.set_convert(view);
         self.renderer.feedback().set_clip_held(held);
     }
@@ -1403,7 +1753,9 @@ impl WindowState {
         } else {
             self.kick_feedback(hwnd);
             if self.state == NotchState::Expanded {
-                self.redraw(hwnd);
+                // The panel steps with the file count: spring to the new
+                // height from where it is (a plain redraw when unchanged)
+                self.resize_to_target(hwnd, before);
             }
         }
     }
@@ -1475,7 +1827,8 @@ impl WindowState {
                 }
             }
             H::Format(i) => {
-                if let Some(f) = self.batch.formats().get(i).copied() {
+                // The selector shows every choice; `choose` takes only an offered one
+                if let Some(f) = self.batch.format_choices().get(i).copied() {
                     self.batch.choose(f);
                 }
             }
@@ -1710,6 +2063,12 @@ impl WindowState {
             .find(|(r, _)| r.contains(x, y))
             .map(|(_, hit)| hit);
         }
+        if self.space == OecaSpace::Nearby {
+            let l = crate::layout::resolve_nearby_layout(&self.dimensions)?;
+            return l
+                .hit(x, y, self.renderer.nearby_shown())
+                .map(PanelHit::Nearby);
+        }
         if self.space != OecaSpace::Clipboard {
             // Home: the timer's mode pills, its buttons and its scale
             let idle = self.timer.phase() == Phase::Idle;
@@ -1800,6 +2159,7 @@ impl WindowState {
             SetCapture(hwnd);
         }
         self.redraw(hwnd);
+        self.kick_scrub(hwnd);
     }
 
     /// The scrub follows the pointer (clamped to the track's ends).
@@ -1813,7 +2173,13 @@ impl WindowState {
         if self.scrub != Some(f) {
             self.scrub = Some(f);
             self.renderer.set_scrub(self.scrub);
-            self.redraw(hwnd);
+            // On springs the frames draw it (one per refresh, however fast
+            // the pointer reports); without motion it is drawn right here
+            if self.renderer.scrub_moving() {
+                self.kick_scrub(hwnd);
+            } else {
+                self.redraw(hwnd);
+            }
         }
     }
 
@@ -1842,6 +2208,15 @@ impl WindowState {
             }
         }
         self.redraw(hwnd);
+        self.kick_scrub(hwnd);
+    }
+
+    /// Starts the display-paced frames while the scrubber's playhead or grip
+    /// moves (`animation_frame` steps them and stops once they rest).
+    fn kick_scrub(&mut self, hwnd: HWND) {
+        if self.renderer.scrub_moving() && self.last_frame_time.is_none() {
+            self.start_frames(hwnd);
+        }
     }
 
     /// Home's timer panel on the settled expanded notch (None elsewhere: the
@@ -2242,12 +2617,32 @@ impl WindowState {
     /// a change. Without an audio endpoint the keys go back to Windows, this
     /// press included.
     fn volume_key(&mut self, hwnd: HWND, key: VolumeKey) {
+        self.headset.hotkey(unsafe { GetTickCount64() });
+        self.volume_press(hwnd, key, true);
+    }
+
+    /// A headset's volume button (see `HeadsetKeys`): Windows applies the
+    /// step itself, so only the HUD follows; the change arrives from the
+    /// endpoint. Never handed back to Windows.
+    fn headset_volume_key(&mut self, hwnd: HWND) {
+        if let Some(key) = self.headset.due() {
+            self.volume_press(hwnd, key, false);
+        }
+    }
+
+    /// `ours`: Oeca applies the step (a hotkey), else Windows already does.
+    fn volume_press(&mut self, hwnd: HWND, key: VolumeKey, ours: bool) {
         if self.volume.is_none() {
             self.volume = crate::hud::SystemVolume::open(hwnd, WM_APP_VOLUME_CHANGED).ok();
         }
+        // Read first: a press is queued only if the endpoint answers, else
+        // the worker and Windows (given the key back) would both apply it
         let current = self.volume.as_ref().map(|v| {
-            v.queue(key);
-            v.level()
+            v.level().inspect(|_| {
+                if ours {
+                    v.queue(key)
+                }
+            })
         });
         match current {
             Some(Ok((level, muted))) => {
@@ -2266,7 +2661,8 @@ impl WindowState {
                 }
                 self.show_hud(hwnd, level, muted);
             }
-            _ => self.give_back_volume_keys(hwnd, key),
+            _ if ours => self.give_back_volume_keys(hwnd, key),
+            _ => {}
         }
     }
 
@@ -2320,7 +2716,27 @@ impl WindowState {
     fn give_back_volume_keys(&mut self, hwnd: HWND, key: VolumeKey) {
         self.volume = None;
         crate::hud::release_volume_keys(hwnd);
+        crate::hud::volume_given_back();
         crate::hud::replay(key);
+        // Only this press goes to Windows: the keys are taken again shortly
+        // (the next press tries the endpoint anew), never left released
+        unsafe {
+            let _ = SetTimer(Some(hwnd), HUD_KEYS_TIMER_ID, 150, None);
+        }
+    }
+
+    /// The audio output devices changed: the held endpoint may be another
+    /// device's (or gone), so it is dropped and, while the HUD shows, read
+    /// again; keys lost to another app meanwhile are taken back.
+    fn audio_devices_changed(&mut self, hwnd: HWND) {
+        if let Some(watch) = &self.device_watch {
+            watch.seen();
+        }
+        crate::hud::take_volume_keys(hwnd);
+        if self.volume.take().is_some() && self.hud.is_shown() {
+            self.volume = crate::hud::SystemVolume::open(hwnd, WM_APP_VOLUME_CHANGED).ok();
+            self.volume_changed(hwnd);
+        }
     }
 
     /// The master volume changed (a step applied, or a change elsewhere):
@@ -2401,7 +2817,7 @@ impl WindowState {
                 if !self.notch_covered(hwnd) || fullscreen_app_active() {
                     self.hud_z = HudZ::Stay;
                 } else {
-                    self.set_band(hwnd, HWND_TOPMOST);
+                    self.set_band(hwnd, TOP_BAND);
                     self.hud.hold_base(true);
                     self.hud_z = HudZ::Raised;
                 }
@@ -2424,7 +2840,7 @@ impl WindowState {
     fn lift_apply(&self, hwnd: HWND, step: dragdrop::LiftStep) {
         use dragdrop::LiftStep;
         match step {
-            LiftStep::Raise => self.set_band(hwnd, HWND_TOPMOST),
+            LiftStep::Raise => self.set_band(hwnd, TOP_BAND),
             LiftStep::Lower if !self.settings.always_on_top && self.hud_z != HudZ::Raised => {
                 self.set_band(hwnd, z_band(false));
             }
@@ -2873,6 +3289,11 @@ const WM_APP_VOLUME_CHANGED: u32 = WM_APP + 45;
 const WM_APP_HUD_HIDE: u32 = WM_APP + 47;
 /// Posted when a volume key stopped repeating (released).
 const WM_APP_VOLUME_RELEASED: u32 = WM_APP + 48;
+/// Posted when the audio output devices changed (an audio thread).
+const WM_APP_VOLUME_DEVICE: u32 = WM_APP + 57;
+/// Posted for a consumer-control volume report (wParam: the key's code), and
+/// again, with wParam 0, once the wait for a hotkey beside it is over.
+const WM_APP_HEADSET_VOLUME: u32 = WM_APP + 58;
 /// Posted when Battery / Energy Saver turned on or off (effective motion).
 const WM_APP_POWER_SAVER: u32 = WM_APP + 49;
 /// Posted for a brightness change with Windows' flyout (wParam: the level,
@@ -2886,6 +3307,41 @@ const WM_APP_UPDATE_CLICK: u32 = WM_APP + 52;
 /// Posted when the daily update check is due (applied through the state,
 /// so a busy state replays it).
 const WM_APP_UPDATE_CHECK: u32 = WM_APP + 53;
+/// Posted by Nearby's worker when its view changed (coalesced until read).
+const WM_APP_NEARBY: u32 = WM_APP + 59;
+/// Posted by Nearby's file dialog (lParam: `Box<Option<Vec<PathBuf>>>`).
+const WM_APP_NEARBY_FILES: u32 = WM_APP + 60;
+
+thread_local! {
+    /// The Nearby space's accessible text (`nearby_announce`), read by
+    /// `accessible_title`.
+    static NEARBY_TITLE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// `running` exists exactly while `on`. Off: no thread, no connection.
+fn follow_setting<T>(running: &mut Option<T>, on: bool, start: impl FnOnce() -> Option<T>) {
+    if !on {
+        *running = None;
+    } else if running.is_none() {
+        *running = start();
+    }
+}
+
+/// Nearby's worker, posting `WM_APP_NEARBY` to the notch (None in test
+/// builds). Only `apply_nearby` calls it.
+fn start_nearby(hwnd: HWND) -> Option<crate::nearby::Nearby> {
+    let config = crate::nearby::Config::for_oeca()?;
+    let hwnd_raw = hwnd.0 as usize;
+    crate::nearby::Nearby::start(config, move || unsafe {
+        let _ = PostMessageW(
+            Some(HWND(hwnd_raw as _)),
+            WM_APP_NEARBY,
+            WPARAM(0),
+            LPARAM(0),
+        );
+    })
+    .ok()
+}
 
 /// The update notice and the collapsed notch's icon, from the shared update
 /// state: the notice while it is due (under the collapsed notch only), the
@@ -2928,6 +3384,9 @@ fn scrub_position(fraction: f32, duration_ms: i64) -> i64 {
 /// presses are reported to `hwnd` even while another app is in front.
 /// Read-only (input still reaches its target unchanged); true on success.
 fn watch_outside_clicks(hwnd: HWND, on: bool) -> bool {
+    if crate::data_dir::ISOLATED {
+        return false; // a test build never sees the desktop's clicks
+    }
     use windows::Win32::UI::Input::{
         RAWINPUTDEVICE, RIDEV_INPUTSINK, RIDEV_REMOVE, RegisterRawInputDevices,
     };
@@ -3078,6 +3537,9 @@ fn watch_power_saving(hwnd: HWND) -> [Option<windows::Win32::System::Power::HPOW
     use windows::Win32::System::Power::{
         GetSystemPowerStatus, RegisterPowerSettingNotification, SYSTEM_POWER_STATUS,
     };
+    if crate::data_dir::ISOLATED {
+        return [None, None];
+    }
     let mut status = SYSTEM_POWER_STATUS::default();
     if unsafe { GetSystemPowerStatus(&mut status) }.is_ok() {
         BATTERY_SAVER.store(
@@ -3117,7 +3579,7 @@ pub(crate) fn is_client_animation_enabled() -> bool {
 }
 
 /// Accessible description of the space selector, e.g. "Home space selected
-/// (spaces: Home, Music, Clipboard)".
+/// (spaces: Home, Music, Clipboard, Hop)".
 fn accessible_space(space: OecaSpace) -> String {
     let all: Vec<&str> = OecaSpace::ALL.iter().map(|s| s.label()).collect();
     format!(
@@ -3151,6 +3613,15 @@ fn accessible_title(
             enabled(s.reduced_motion),
             switch(s.always_on_top),
             switch(s.reduced_motion),
+            clock.formatted_time,
+            clock.formatted_date,
+            accessible_space(space)
+        );
+    }
+    if state == NotchState::Expanded && space == OecaSpace::Nearby {
+        let nearby = NEARBY_TITLE.with(|t| t.borrow().clone());
+        return format!(
+            "{nearby} - {} - {} - {}",
             clock.formatted_time,
             clock.formatted_date,
             accessible_space(space)
@@ -3580,7 +4051,9 @@ fn animation_frame(hwnd: HWND, state: &mut WindowState) {
     if timer_moving {
         state.push_timer_view();
     }
-    let hud_active = hud_active || timer_active;
+    // ...and the scrubber's playhead and grip
+    let scrub_active = state.renderer.step_scrub(delta_ms);
+    let hud_active = hud_active || timer_active || scrub_active;
     if state.animation.is_none() {
         hud_frame(hwnd, state, hud_active);
         return;
@@ -3932,6 +4405,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                 }
             }
+            // A headset's (or keyboard's) volume button: settled as a
+            // message, the raw handle being valid only here
+            if let Some(key) = unsafe { crate::hud::raw_volume_key(lparam) } {
+                unsafe {
+                    let _ = PostMessageW(
+                        Some(hwnd),
+                        WM_APP_HEADSET_VOLUME,
+                        WPARAM(usize::from(key.vk().0)),
+                        LPARAM(0),
+                    );
+                }
+            }
             // Required for Raw Input cleanup
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
@@ -3979,6 +4464,44 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
                 state.check_for_updates(hwnd);
             });
+            LRESULT(0)
+        }
+
+        WM_APP_NEARBY => {
+            // Taking the snapshot re-arms the notification
+            with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                state.nearby_changed(hwnd);
+            });
+            LRESULT(0)
+        }
+
+        WM_APP_NEARBY_FILES => {
+            let ptr = lparam.0 as *mut Option<Vec<std::path::PathBuf>>;
+            let take = || unsafe { *Box::from_raw(ptr) };
+            match with_state(hwnd, |state| state.nearby_send(hwnd, take())) {
+                Access::Ran(()) => {}
+                Access::Busy => unsafe {
+                    if PostMessageW(Some(hwnd), msg, wparam, lparam).is_err() {
+                        drop(take());
+                    }
+                },
+                Access::Missing => drop(take()),
+            }
+            LRESULT(0)
+        }
+
+        settings_window::WM_APP_SETTINGS_NEARBY => {
+            // SAFETY: from that message, taken once on every path
+            let take = || unsafe { settings_window::take_request(lparam) };
+            match with_state(hwnd, |state| state.nearby_request(hwnd, take())) {
+                Access::Ran(()) => {}
+                Access::Busy => unsafe {
+                    if PostMessageW(Some(hwnd), msg, wparam, lparam).is_err() {
+                        drop(take());
+                    }
+                },
+                Access::Missing => drop(take()),
+            }
             LRESULT(0)
         }
 
@@ -4074,6 +4597,33 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
 
+        WM_APP_HEADSET_VOLUME => {
+            with_state_or_defer(
+                hwnd,
+                msg,
+                wparam,
+                lparam,
+                |state| match VolumeKey::from_hotkey(wparam.0) {
+                    Some(key) => {
+                        if state.headset.report(key, unsafe { GetTickCount64() }) {
+                            unsafe {
+                                let _ = SetTimer(Some(hwnd), HUD_HEADSET_TIMER_ID, 50, None);
+                            }
+                        }
+                    }
+                    None => state.headset_volume_key(hwnd),
+                },
+            );
+            LRESULT(0)
+        }
+
+        WM_APP_VOLUME_DEVICE => {
+            with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                state.audio_devices_changed(hwnd);
+            });
+            LRESULT(0)
+        }
+
         WM_APP_VOLUME_CHANGED => {
             with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
                 state.volume_changed(hwnd);
@@ -4123,6 +4673,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let (cx, cy) = state.renderer.content_offset();
                 pt.x -= cx as i32;
                 pt.y -= cy as i32;
+                // Nearby's device list scrolls a row per notch
+                if state.space == OecaSpace::Nearby
+                    && state.state == NotchState::Expanded
+                    && state.animation.is_none()
+                    && !state.settings_open
+                    && !state.renderer.convert_open()
+                    && delta != 0
+                {
+                    let step = -isize::from(delta.signum());
+                    let next = state.nearby_scroll.saturating_add_signed(step);
+                    if next != state.nearby_scroll {
+                        state.nearby_scroll = next;
+                        state.nearby_refresh(hwnd);
+                    }
+                    return;
+                }
                 // The workspace's file list scrolls a row per notch
                 if state.renderer.convert_open()
                     && state.animation.is_none()
@@ -4169,6 +4735,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
 
         WM_TIMER => {
+            if wparam.0 == crate::renderer::NEARBY_ARM_TIMER_ID {
+                // A shown question armed: its buttons light up (one-shot)
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), crate::renderer::NEARBY_ARM_TIMER_ID);
+                }
+                let _ = with_state(hwnd, |state| {
+                    state.redraw(hwnd);
+                    state.nearby_announce(hwnd);
+                });
+                return LRESULT(0);
+            }
             if wparam.0 == AUTO_COLLAPSE_TIMER_ID {
                 // One-shot; applied as a message so a busy state replays it
                 // (timer messages would be dropped)
@@ -4202,6 +4779,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let _ = KillTimer(Some(hwnd), wparam.0);
                     let _ = PostMessageW(Some(hwnd), posted, WPARAM(0), LPARAM(0));
                 }
+                return LRESULT(0);
+            }
+            if wparam.0 == HUD_HEADSET_TIMER_ID {
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), HUD_HEADSET_TIMER_ID);
+                    let _ = PostMessageW(Some(hwnd), WM_APP_HEADSET_VOLUME, WPARAM(0), LPARAM(0));
+                }
+                return LRESULT(0);
+            }
+            if wparam.0 == HUD_KEYS_TIMER_ID {
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), HUD_KEYS_TIMER_ID);
+                }
+                crate::hud::take_volume_keys(hwnd);
                 return LRESULT(0);
             }
             if wparam.0 == HUD_FLYOUT_TIMER_ID {
@@ -4428,7 +5019,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     | PanelHit::TimerCancel
                     | PanelHit::TimerScale
                     | PanelHit::TimerMode(_)
-                    | PanelHit::Convert(_) => None,
+                    | PanelHit::Convert(_)
+                    | PanelHit::Nearby(_) => None,
                 });
                 let changed = {
                     let mut feedback = state.renderer.feedback();
@@ -4585,6 +5177,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         PanelHit::TimerScale => return,
                         PanelHit::Convert(h) => {
                             state.convert_click(hwnd, h);
+                            return;
+                        }
+                        PanelHit::Nearby(h) => {
+                            state.nearby_click(hwnd, h);
                             return;
                         }
                         PanelHit::TimerMode(mode) => {
@@ -4809,6 +5405,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             if event == PBT_APMRESUMEAUTOMATIC || event == PBT_APMRESUMESUSPEND {
                 with_state_or_defer(hwnd, msg, wparam, lparam, |state| {
+                    // The signaling socket rarely survives sleep; do not wait for it to time out
+                    if let Some(nearby) = &state.nearby {
+                        nearby.reconnect();
+                    }
                     let changed = state.clock.refresh();
                     if changed {
                         notify_accessibility_clock_changed(
@@ -5007,6 +5607,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = KillTimer(Some(hwnd), HUD_HIDE_TIMER_ID);
                 let _ = KillTimer(Some(hwnd), HUD_RELEASE_TIMER_ID);
                 let _ = KillTimer(Some(hwnd), HUD_FLYOUT_TIMER_ID);
+                let _ = KillTimer(Some(hwnd), HUD_KEYS_TIMER_ID);
+                let _ = KillTimer(Some(hwnd), HUD_HEADSET_TIMER_ID);
+                let _ = KillTimer(Some(hwnd), crate::renderer::NEARBY_ARM_TIMER_ID);
                 PostQuitMessage(0);
             }
             // Stop reporting outside clicks (no-op if never registered)
@@ -5021,10 +5624,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // The countdown bubble goes too (owned by the notch, it would be
             // destroyed with it anyway)
             crate::hud::release_volume_keys(hwnd);
+            crate::hud::watch_consumer_keys(hwnd, false);
             let _ = with_state(hwnd, |state| {
+                // Stops Nearby's thread, waiting at most its shutdown deadline
+                state.nearby = None;
                 state.stop_frames(hwnd);
                 state.tray.remove();
                 state.volume = None;
+                state.device_watch = None;
                 if let Some(hook) = state.flyout_hook.take() {
                     crate::hud::stop_hiding_native_flyout(hook);
                 }
@@ -5245,13 +5852,18 @@ fn handle_drag(hwnd: HWND, event: DragEvent) -> bool {
 }
 
 pub fn run() -> Result<()> {
+    // Before anything is written, registered or even asked of a running Oeca
+    let place = crate::data_dir::validate()?;
     // One Oeca per sign-in session: a second launch (Start on launch plus a
     // manual start, a double click) opens the running one and exits, so
     // there is never a second notch or tray icon
-    let Some(_instance) = SingleInstance::acquire() else {
+    let Some(_instance) = SingleInstance::acquire()? else {
         SingleInstance::open_existing();
         return Ok(());
     };
+    // One writer per data folder, across sessions and elevation: without it
+    // Oeca does not start, so there are no saves and no cleanup
+    place.claim()?;
     // OLE drag-and-drop needs this (UI) thread in a single-threaded apartment.
     // Failure is non-fatal: Oeca simply runs without being a drop target.
     let ole = unsafe { OleInitialize(None) }.is_ok();
@@ -5266,13 +5878,17 @@ pub fn run() -> Result<()> {
 struct SingleInstance(windows::Win32::Foundation::HANDLE);
 
 impl SingleInstance {
-    const NAME: windows::core::PCWSTR = windows::core::w!("Local\\Oeca.SingleInstance");
+    const NAME: windows::core::PCWSTR = if crate::data_dir::ISOLATED {
+        windows::core::w!("Local\\Oeca.Test.SingleInstance")
+    } else {
+        windows::core::w!("Local\\Oeca.SingleInstance")
+    };
 
     /// The mutex if this is the first Oeca in the session; None if another
-    /// one already holds it. If the mutex cannot be made at all, Oeca runs
-    /// (as before) rather than refusing to start.
-    fn acquire() -> Option<Self> {
-        use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+    /// one already holds it (access denied: one running as administrator).
+    /// Any other failure stops this launch.
+    fn acquire() -> Result<Option<Self>> {
+        use windows::Win32::Foundation::{E_ACCESSDENIED, ERROR_ALREADY_EXISTS, GetLastError};
         let handle =
             unsafe { windows::Win32::System::Threading::CreateMutexW(None, false, Self::NAME) };
         match handle {
@@ -5280,10 +5896,11 @@ impl SingleInstance {
                 unsafe {
                     let _ = windows::Win32::Foundation::CloseHandle(h);
                 }
-                None
+                Ok(None)
             }
-            Ok(h) => Some(Self(h)),
-            Err(_) => Some(Self(windows::Win32::Foundation::HANDLE::default())),
+            Ok(h) => Ok(Some(Self(h))),
+            Err(e) if e.code() == E_ACCESSDENIED => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
@@ -5358,7 +5975,7 @@ fn run_window(ole: bool) -> Result<()> {
         let mut settings = settings_store.load().unwrap_or_default();
         settings.start_on_launch = crate::startup::is_enabled();
         let always_on_top = settings.always_on_top;
-        let ex_style = if always_on_top {
+        let ex_style = if always_on_top && !crate::data_dir::TEST_INSTANCE {
             WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
         } else {
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
@@ -5493,12 +6110,21 @@ fn run_window(ole: bool) -> Result<()> {
             saver_watch: [None, None],
             brightness_watch: None,
             flyout_hook: None,
+            device_watch: None,
+            headset: Default::default(),
             updates: crate::update::UpdateState::default(),
             update_presence: Presence::default(),
             update_icon: Presence::default(),
             update_notice: None,
             update_shown: false,
             update_drawn: None,
+            nearby: None,
+            nearby_view: None,
+            nearby_dismissed: None,
+            nearby_scroll: 0,
+            nearby_picking: None,
+            nearby_note: None,
+            nearby_surfaced: None,
         });
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
 
@@ -5506,11 +6132,17 @@ fn run_window(ole: bool) -> Result<()> {
         // message) and draw the first frame, through the same guarded access as
         // the window procedure (rendering can re-enter it synchronously).
         let initial = with_state(hwnd, |state| {
+            state.apply_nearby(hwnd);
             let _ = state.media.initialize(hwnd);
             // Event-driven clipboard history (no polling)
             let _ = clipboard::start_listening(hwnd);
             // The volume keys show the HUD
             crate::hud::take_volume_keys(hwnd);
+            // Headset volume buttons (Windows applies those itself)
+            crate::hud::watch_consumer_keys(hwnd, true);
+            // A new default output (earbuds in or out) re-reads the endpoint
+            // and wins back keys lost meanwhile
+            state.device_watch = crate::hud::DeviceWatch::start(hwnd, WM_APP_VOLUME_DEVICE).ok();
             // Battery / Energy Saver: Oeca moves as if Reduced motion were on
             state.saver_watch = watch_power_saving(hwnd);
             // Brightness keys (handled below Windows): the level shows in the
@@ -5600,6 +6232,119 @@ fn run_window(ole: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_one_instance_per_session_under_a_test_only_name() {
+        let name = unsafe { SingleInstance::NAME.to_string() }.unwrap();
+        assert_eq!(name, "Local\\Oeca.Test.SingleInstance");
+        let class = unsafe { WINDOW_CLASS_NAME.to_string() }.unwrap();
+        assert_eq!(class, "OecaTestWindowClass", "never finds the real notch");
+        let first = SingleInstance::acquire().unwrap().expect("the first");
+        assert!(SingleInstance::acquire().unwrap().is_none(), "a second");
+        drop(first);
+        assert!(SingleInstance::acquire().unwrap().is_some(), "free again");
+    }
+
+    /// Everything `run_window` takes on the desktop, tried for real on a
+    /// message-only window: a test build gets none of it.
+    #[test]
+    fn test_nearby_runs_exactly_while_its_setting_is_on() {
+        let mut running = None;
+        follow_setting(&mut running, false, || -> Option<u8> {
+            panic!("off: never started")
+        });
+        assert_eq!(running, None);
+        follow_setting(&mut running, true, || Some(1));
+        assert_eq!(running, Some(1));
+        follow_setting(&mut running, true, || panic!("already running"));
+        assert_eq!(running, Some(1));
+        follow_setting(&mut running, false, || panic!("off: never started"));
+        assert_eq!(running, None, "stopped at once");
+    }
+
+    #[test]
+    fn test_test_builds_take_nothing_on_the_desktop() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::UnregisterHotKey;
+        use windows::Win32::UI::Input::{GetRegisteredRawInputDevices, RAWINPUTDEVICE};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE,
+        };
+        // First: were this false, the calls below would touch the real desktop
+        const { assert!(crate::data_dir::ISOLATED) };
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                windows::core::w!("STATIC"),
+                None,
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+
+        // Volume hotkeys: unregistering fails only if none was registered
+        assert_eq!(crate::hud::take_volume_keys(hwnd), 0);
+        for key in [VolumeKey::Up, VolumeKey::Down, VolumeKey::Mute] {
+            let id = i32::from(key.vk().0);
+            assert!(
+                unsafe { UnregisterHotKey(Some(hwnd), id) }.is_err(),
+                "{key:?}"
+            );
+        }
+        // Raw input: media / headset buttons and outside clicks
+        assert!(!crate::hud::watch_consumer_keys(hwnd, true));
+        assert!(!watch_outside_clicks(hwnd, true));
+        let mut devices = 0u32;
+        unsafe {
+            GetRegisteredRawInputDevices(
+                None,
+                &mut devices,
+                std::mem::size_of::<RAWINPUTDEVICE>() as u32,
+            );
+        }
+        assert_eq!(devices, 0, "raw input");
+        // Audio: the devices, and the endpoint with its callback and steps
+        assert!(crate::hud::DeviceWatch::start(hwnd, 0).is_err());
+        assert!(crate::hud::SystemVolume::open(hwnd, 0).is_err());
+        // Global hook and power registrations
+        assert!(crate::hud::hide_native_flyout(hwnd, 0).is_none());
+        assert!(crate::hud::watch_brightness(hwnd).is_none());
+        assert!(watch_power_saving(hwnd).iter().all(Option::is_none));
+        // Media: no manager means no events and no commands
+        let mut media = MediaEngine::new();
+        assert!(!media.initialize(hwnd));
+        for control in [
+            MediaControl::Previous,
+            MediaControl::PlayPause,
+            MediaControl::Next,
+        ] {
+            assert!(!media.send_command(control), "{control:?}");
+        }
+        assert!(!media.send_seek(0));
+        // The public signaling server
+        assert!(start_nearby(hwnd).is_none());
+        // The clipboard and the notification area
+        assert!(!clipboard::start_listening(hwnd));
+        let mut tray = crate::tray::TrayIcon::default();
+        assert!(!tray.add(hwnd) && !tray.restore(hwnd) && !tray.is_shown());
+
+        // Shutdown gives back only what was taken: harmless with nothing
+        crate::hud::release_volume_keys(hwnd);
+        crate::hud::watch_consumer_keys(hwnd, false);
+        watch_outside_clicks(hwnd, false);
+        clipboard::stop_listening(hwnd);
+        tray.remove();
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
 
     #[test]
     fn test_update_notice_then_icon_never_both() {
@@ -6014,7 +6759,7 @@ mod tests {
         assert_eq!(
             accessible_title_for_clock(NotchState::Expanded, &clock, Some(&playing), home),
             format!(
-                "Song - Artist - Previous track, Pause, Next track - {time} - {date} - Home space selected (spaces: Home, Music, Clipboard)"
+                "Song - Artist - Previous track, Pause, Next track - {time} - {date} - Home space selected (spaces: Home, Music, Clipboard, Hop)"
             )
         );
         let paused = MediaContent {
@@ -6034,7 +6779,7 @@ mod tests {
         }
         assert_eq!(
             accessible_title_for_clock(NotchState::Expanded, &clock, None, home),
-            format!("{time} - {date} - Home space selected (spaces: Home, Music, Clipboard)")
+            format!("{time} - {date} - Home space selected (spaces: Home, Music, Clipboard, Hop)")
         );
     }
 
@@ -6063,7 +6808,7 @@ mod tests {
         assert_eq!(
             title(&history, NotchState::Expanded),
             format!(
-                "Clipboard history, empty - {time} - {date} - Clipboard space selected (spaces: Home, Music, Clipboard)"
+                "Clipboard history, empty - {time} - {date} - Clipboard space selected (spaces: Home, Music, Clipboard, Hop)"
             )
         );
         history.add(ClipboardItem::Text("secret password".into()));
@@ -6276,8 +7021,8 @@ mod tests {
                 );
             }
         }
-        // Still exactly three product spaces
-        assert_eq!(OecaSpace::ALL.len(), 3);
+        // Exactly four product spaces
+        assert_eq!(OecaSpace::ALL.len(), 4);
     }
 
     #[test]
@@ -6341,9 +7086,13 @@ mod tests {
         };
         let mut space = OecaSpace::default();
         let title = |s| accessible_title_for_clock(NotchState::Expanded, &clock, Some(&media), s);
-        assert!(title(space).ends_with("Home space selected (spaces: Home, Music, Clipboard)"));
+        assert!(
+            title(space).ends_with("Home space selected (spaces: Home, Music, Clipboard, Hop)")
+        );
         space.switch_to(OecaSpace::Music);
-        assert!(title(space).ends_with("Music space selected (spaces: Home, Music, Clipboard)"));
+        assert!(
+            title(space).ends_with("Music space selected (spaces: Home, Music, Clipboard, Hop)")
+        );
         // The media part is identical in both spaces
         let media_part = |t: String| t.split(" - Home space").next().unwrap().to_string();
         assert_eq!(
@@ -6516,8 +7265,7 @@ mod tests {
             classify_click(other, notch, None),
             Some(GraceEvent::OutsideClick)
         );
-        // The sink registers on a real window and is removed again (as on
-        // collapse and shutdown), leaving nothing registered
+        // A test build never registers the desktop-wide sink
         use windows::Win32::UI::Input::{GetRegisteredRawInputDevices, RAWINPUTDEVICE};
         use windows::Win32::UI::WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
@@ -6550,10 +7298,10 @@ mod tests {
             }
             n
         };
-        assert!(watch_outside_clicks(hwnd, true));
-        assert_eq!(registered(), 1);
-        assert!(watch_outside_clicks(hwnd, false));
-        assert_eq!(registered(), 0, "cleaned up");
+        assert!(!watch_outside_clicks(hwnd, true));
+        assert_eq!(registered(), 0, "nothing registered");
+        assert!(!watch_outside_clicks(hwnd, false));
+        assert_eq!(registered(), 0);
         unsafe {
             let _ = DestroyWindow(hwnd);
         }

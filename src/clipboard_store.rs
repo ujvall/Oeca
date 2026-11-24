@@ -1,25 +1,39 @@
 //! Session-scoped clipboard history persistence: the history survives Oeca
 //! quitting (tray Quit, window close, a crash) and relaunching within the
-//! same Windows logon session, and never reaches a later one.
+//! same Windows sign-in, and never reaches a later one.
 //!
-//! Session identity: a volatile registry key (`HKCU\Software\Oeca\Session`,
-//! `REG_OPTION_VOLATILE`) holds this session's id: the logon session's LUID
-//! plus the moment the key was made. Volatile keys live only in memory and
-//! disappear when the user's hive unloads (sign-out) or Windows shuts down /
-//! restarts, so a new session finds no key and starts a new id. The LUID check
-//! covers a hive that stays loaded across a sign-out (LUIDs are unique within
-//! a boot).
+//! Identity: the terminal session and its sign-in time, asked of Windows on
+//! each launch. Normal and elevated Oeca share it (their logon LUIDs differ),
+//! and there is nothing stored that could be lost or damaged.
 //!
-//! Storage: one file, `%LOCALAPPDATA%\Oeca\clipboard-history.bin` (per-user,
-//! outside the install folder; not encrypted), tagged with the session id and
-//! a checksum. It is loaded only when its id matches the current session, so
-//! a stale file (power loss, crash) can never be shown in a new session; a new
-//! session also deletes it. Writes go to a temporary file renamed into place,
+//! Deleting needs proof. A saved file is
+//! - ours: tagged with this sign-in (or, from older versions, with one of its
+//!   two logon LUIDs after it began): loaded, replaced, removed when cleared;
+//! - an earlier sign-in's: intact, tagged before this one began and before
+//!   this process's own logon began (two separate Windows sources), and no
+//!   other sign-in of this user that could own it still exists: deleted at
+//!   launch;
+//! - anything else (damaged, unreadable, unknown): never loaded, replaced or
+//!   deleted. History then stays in memory while it is there.
+//!
+//! Storage: one file, `clipboard-history.bin` in the claimed data folder
+//! (`data_dir`: validated, one writer; not encrypted), tagged with the
+//! sign-in and a checksum. Writes go to a temporary file renamed into place,
 //! so a partial write leaves the previous file (or nothing) behind.
+//!
+//! Two sources: Windows promises nothing about the session's sign-in time
+//! across lock, resume or reconnect. The process's logon session has its own
+//! time, set when it was created. Were the first moved forward, the second
+//! still predates the file, which then stays, unloaded, until a later
+//! sign-in. Limits: a process from a logon made inside the session (runas)
+//! has only the first, in effect; and both are wall-clock times, so a file
+//! of an older version tagged after the clock was set back reads as earlier.
 //!
 //! Privacy: contents are never logged; failures only disable persistence.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::clipboard::{ClipboardHistory, ClipboardItem};
 use crate::config::{CLIPBOARD_MAX_ENTRIES, CLIPBOARD_MAX_IMAGE_BYTES, CLIPBOARD_MAX_TEXT_UNITS};
@@ -37,7 +51,8 @@ const MAX_FILE_BYTES: u64 = (8 + 16 + 4 + 8) as u64
     + (CLIPBOARD_MAX_ENTRIES * (1 + 8 + CLIPBOARD_MAX_TEXT_UNITS * 3)) as u64
     + CLIPBOARD_MAX_IMAGE_BYTES as u64;
 
-/// One Windows logon session: its LUID and when Oeca first saw it.
+/// One Windows sign-in: its terminal session and when it began. (Files from
+/// older versions hold a logon LUID and when Oeca first saw it.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionId {
     pub logon: u64,
@@ -61,21 +76,55 @@ impl SessionId {
     }
 }
 
-/// Whether the session is the one Oeca last ran in (pure).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Session {
-    /// Same logon session: saved history may be restored.
-    Resumed(SessionId),
-    /// A new session: nothing earlier may be shown.
-    Fresh(SessionId),
+/// No real sign-in time is older (2020-01-01, as a FILETIME).
+const OLDEST_STAMP: u64 = 132_223_104_000_000_000;
+
+/// The sign-in this process runs in, and what is needed to judge a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignIn {
+    pub id: SessionId,
+    /// Both halves' logon LUIDs (normal and elevated), for older files.
+    pub logons: [u64; 2],
+    /// When this user's other live sign-ins began (None: unknown).
+    pub others: Option<Vec<u64>>,
+    /// When this process's logon session began (None: unknown, so no file
+    /// can be shown to be an earlier sign-in's).
+    pub logon_began: Option<u64>,
 }
 
-/// The session from the volatile key's id (`stored`, None if the key is new
-/// or empty) and the current logon LUID; `now` stamps a fresh one.
-pub fn decide(stored: Option<SessionId>, logon: u64, now: u64) -> Session {
-    match stored {
-        Some(id) if id.logon == logon => Session::Resumed(id),
-        _ => Session::Fresh(SessionId { logon, stamp: now }),
+/// Whose a saved file is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Owner {
+    Absent,
+    /// This sign-in's.
+    Mine,
+    /// Provably an ended, earlier sign-in's, or holding nothing at all.
+    Disposable,
+    /// Not provable: never loaded, replaced or deleted.
+    Unknown,
+}
+
+impl SignIn {
+    /// Whose a file tagged `saved` is (pure).
+    pub fn owner(&self, saved: SessionId) -> Owner {
+        let start = self.id.stamp;
+        let older_version = self.logons.contains(&saved.logon) && saved.stamp >= start;
+        if saved == self.id || older_version {
+            return Owner::Mine;
+        }
+        let plausible = saved.stamp >= OLDEST_STAMP && saved.stamp < start;
+        // The second source: the session's time alone could have moved
+        let before_logon = self.logon_began.is_some_and(|t| saved.stamp < t);
+        // A sign-in that was already running when the file was made may own it
+        let ended = self
+            .others
+            .as_ref()
+            .is_some_and(|o| o.iter().all(|&began| began > saved.stamp));
+        if plausible && before_logon && ended {
+            Owner::Disposable
+        } else {
+            Owner::Unknown
+        }
     }
 }
 
@@ -201,46 +250,60 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     })
 }
 
-/// The history file for one session in `dir`. `None` session: persistence
-/// is off (the session could not be identified), so nothing is read or kept.
+static SIGN_IN: OnceLock<Option<SignIn>> = OnceLock::new();
+
+/// The saved id of a file, before anything else in it is trusted.
+fn tag(bytes: &[u8]) -> Option<SessionId> {
+    SessionId::from_bytes(bytes.strip_prefix(MAGIC)?.get(..16)?)
+}
+
+/// The history file in `dir`, as seen from one sign-in. No sign-in or no
+/// folder: persistence is off, so nothing is read, kept or deleted.
 pub struct ClipboardStore {
-    dir: PathBuf,
-    session: Option<SessionId>,
+    dir: Option<PathBuf>,
+    me: Option<SignIn>,
+    /// Size and time of the file last verified as ours (no re-read per copy).
+    verified: Cell<Option<(u64, std::time::SystemTime)>>,
 }
 
 impl ClipboardStore {
-    /// This Windows session's store (registry + `%LOCALAPPDATA%\Oeca`). A
-    /// fresh session removes any earlier session's file first.
+    /// This sign-in's store in the claimed data folder, after removing what
+    /// an earlier sign-in provably left there.
     pub fn open() -> Self {
-        let dir = local_app_data().map(|d| d.join("Oeca"));
-        let session = session::current();
-        match (dir, session) {
-            (Some(dir), Some(s)) => Self::at(dir, s),
-            (dir, _) => Self {
-                dir: dir.unwrap_or_default(),
-                session: None,
-            },
-        }
+        let me = SIGN_IN.get_or_init(sign_in::current).clone();
+        Self::at(crate::data_dir::dir(), me)
     }
 
-    /// The store in `dir` for `session` (tests use a temporary `dir`).
-    pub fn at(dir: PathBuf, session: Session) -> Self {
-        let store = Self {
-            dir,
-            session: Some(match session {
-                Session::Resumed(id) | Session::Fresh(id) => id,
-            }),
-        };
-        if matches!(session, Session::Fresh(_)) {
-            store.wipe();
+    /// The store in `dir` for `me` (tests use a temporary `dir`).
+    pub fn at(dir: Option<PathBuf>, me: Option<SignIn>) -> Self {
+        let store = Self::new(dir, me);
+        if let Some((dir, me)) = store.active() {
+            let history = (FILE_NAME, store.history_owner(dir, me));
+            for (name, owner) in [history, (TEMP_NAME, temp_owner(dir, me))] {
+                if owner == Owner::Disposable {
+                    let _ = crate::data_dir::remove(&dir.join(name));
+                }
+            }
         }
         store
     }
 
-    /// The saved history of this session, if any and intact.
+    fn new(dir: Option<PathBuf>, me: Option<SignIn>) -> Self {
+        Self {
+            dir,
+            me,
+            verified: Cell::new(None),
+        }
+    }
+
+    fn active(&self) -> Option<(&PathBuf, &SignIn)> {
+        self.dir.as_ref().zip(self.me.as_ref())
+    }
+
+    /// The saved history of this sign-in, if any and intact.
     pub fn load(&self) -> Result<Vec<ClipboardItem>, LoadError> {
-        let session = self.session.ok_or(LoadError::Missing)?;
-        let path = self.dir.join(FILE_NAME);
+        let (dir, me) = self.active().ok_or(LoadError::Missing)?;
+        let path = dir.join(FILE_NAME);
         let len = std::fs::metadata(&path)
             .map_err(|_| LoadError::Missing)?
             .len();
@@ -248,146 +311,301 @@ impl ClipboardStore {
             return Err(LoadError::TooLarge);
         }
         let bytes = std::fs::read(&path).map_err(|_| LoadError::Missing)?;
-        decode(&bytes, session)
+        let saved = tag(&bytes).ok_or(LoadError::Corrupt)?;
+        let items = decode(&bytes, saved)?;
+        if me.owner(saved) != Owner::Mine {
+            return Err(LoadError::OtherSession);
+        }
+        Ok(items)
+    }
+
+    /// Whose the history file is: intact as a whole, then by its tag.
+    fn history_owner(&self, dir: &Path, me: &SignIn) -> Owner {
+        let path = dir.join(FILE_NAME);
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Owner::Absent,
+            Err(_) => return Owner::Unknown,
+        };
+        if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
+            return Owner::Unknown;
+        }
+        let seen = meta.modified().ok().map(|t| (meta.len(), t));
+        if seen.is_some() && seen == self.verified.get() {
+            return Owner::Mine;
+        }
+        let owner = std::fs::read(&path)
+            .ok()
+            .and_then(|b| tag(&b).filter(|&id| decode(&b, id).is_ok()))
+            .map_or(Owner::Unknown, |id| me.owner(id));
+        if owner == Owner::Mine {
+            self.verified.set(seen);
+        }
+        owner
     }
 
     /// Saves the history (an empty one removes the file). Written to a
-    /// temporary file, flushed, then renamed over the old one.
+    /// temporary file, flushed, then renamed over the old one. Never over a
+    /// file whose owner is unknown: that is an error, and it stays as it is.
     pub fn save(&self, history: &ClipboardHistory) -> std::io::Result<()> {
-        let Some(session) = self.session else {
+        let Some((dir, me)) = self.active() else {
             return Ok(());
         };
         if history.is_empty() {
-            self.wipe();
-            return Ok(());
+            return self.wipe();
         }
-        std::fs::create_dir_all(&self.dir)?;
-        let temp = self.dir.join(TEMP_NAME);
-        {
-            use std::io::Write;
-            let mut f = std::fs::File::create(&temp)?;
-            f.write_all(&encode(session, history))?;
-            f.sync_all()?;
+        if self.history_owner(dir, me) == Owner::Unknown || temp_owner(dir, me) == Owner::Unknown {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
         }
-        std::fs::rename(&temp, self.dir.join(FILE_NAME))
+        let path = dir.join(FILE_NAME);
+        crate::data_dir::replace(&path, &dir.join(TEMP_NAME), &encode(me.id, history))?;
+        let seen = std::fs::symlink_metadata(&path)
+            .and_then(|m| Ok((m.len(), m.modified()?)))
+            .ok();
+        self.verified.set(seen);
+        Ok(())
     }
 
-    /// Removes this store's own files (nothing else in the folder).
-    pub fn wipe(&self) {
-        wipe_dir(&self.dir);
+    /// Removes this sign-in's files and provably stale ones, nothing else.
+    pub fn wipe(&self) -> std::io::Result<()> {
+        let Some((dir, me)) = self.active() else {
+            return Ok(());
+        };
+        let mut result = Ok(());
+        let history = (FILE_NAME, self.history_owner(dir, me));
+        for (name, owner) in [history, (TEMP_NAME, temp_owner(dir, me))] {
+            match owner {
+                Owner::Absent => {}
+                Owner::Mine | Owner::Disposable => {
+                    if let Err(e) = crate::data_dir::remove(&dir.join(name)) {
+                        result = Err(e);
+                    }
+                }
+                Owner::Unknown => result = Err(std::io::ErrorKind::PermissionDenied.into()),
+            }
+        }
+        result
     }
 }
 
-fn wipe_dir(dir: &Path) {
-    if dir.as_os_str().is_empty() {
-        return;
+/// Whose an interrupted write is. It has no checksum yet, but the tag is the
+/// first thing written; one with only zeros (power loss) holds nothing.
+fn temp_owner(dir: &Path, me: &SignIn) -> Owner {
+    let path = dir.join(TEMP_NAME);
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Owner::Absent,
+        Err(_) => return Owner::Unknown,
+    };
+    if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
+        return Owner::Unknown;
     }
-    for name in [FILE_NAME, TEMP_NAME] {
-        let _ = std::fs::remove_file(dir.join(name));
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Owner::Unknown;
+    };
+    if bytes.iter().all(|&b| b == 0) {
+        return Owner::Disposable;
     }
+    tag(&bytes).map_or(Owner::Unknown, |id| me.owner(id))
 }
 
 /// The Windows session is ending (shutdown, restart, sign-out): best effort,
-/// remove the saved history now. Session isolation does not depend on it.
+/// remove this sign-in's saved history now. The sign-in found at launch is
+/// used, as Windows may no longer report it. Isolation does not depend on it.
 pub fn wipe_for_session_end() {
-    if let Some(dir) = local_app_data() {
-        wipe_dir(&dir.join("Oeca"));
+    if let Some(me) = SIGN_IN.get() {
+        let _ = ClipboardStore::new(crate::data_dir::dir(), me.clone()).wipe();
     }
 }
 
-pub(crate) fn local_app_data() -> Option<PathBuf> {
-    use windows::Win32::System::Com::CoTaskMemFree;
-    use windows::Win32::UI::Shell::{FOLDERID_LocalAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
-    unsafe {
-        let p = SHGetKnownFolderPath(&FOLDERID_LocalAppData, KF_FLAG_DEFAULT, None).ok()?;
-        let path = p.to_string().ok().map(PathBuf::from);
-        CoTaskMemFree(Some(p.0 as *const _));
-        path
-    }
-}
-
-/// The volatile registry key and the logon LUID.
-mod session {
-    use super::{Session, SessionId, decide};
-    use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
-    use windows::Win32::Security::{GetTokenInformation, TOKEN_STATISTICS, TokenStatistics};
-    use windows::Win32::System::Registry::{
-        HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_BINARY, REG_OPTION_VOLATILE,
-        RegCloseKey, RegCreateKeyExW, RegQueryValueExW, RegSetValueExW,
+/// This process's Windows sign-in, read from Windows (nothing stored).
+mod sign_in {
+    use super::{SessionId, SignIn};
+    use windows::Win32::Foundation::{CloseHandle, E_ACCESSDENIED, HANDLE, LUID};
+    use windows::Win32::Security::Authentication::Identity::{
+        LsaFreeReturnBuffer, LsaGetLogonSessionData, SECURITY_LOGON_SESSION_DATA,
     };
-    use windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
-    use windows::core::w;
+    use windows::Win32::Security::{
+        GetTokenInformation, LookupAccountSidW, SID_NAME_USE, TOKEN_LINKED_TOKEN, TOKEN_STATISTICS,
+        TOKEN_USER, TokenLinkedToken, TokenStatistics, TokenUser,
+    };
+    use windows::Win32::System::RemoteDesktop::{
+        WTS_CURRENT_SESSION, WTS_SESSION_INFOW, WTSEnumerateSessionsW, WTSFreeMemory, WTSINFOW,
+        WTSQuerySessionInformationW, WTSSessionInfo,
+    };
+    use windows::core::{PWSTR, Result};
 
-    /// This logon session, or None if Windows would not say (persistence
-    /// then stays off rather than risk mixing sessions).
-    pub fn current() -> Option<Session> {
-        let logon = logon_luid()?;
+    /// `GetCurrentProcessToken`'s pseudo-handle.
+    fn own_token() -> HANDLE {
+        HANDLE(-4isize as *mut _)
+    }
+
+    /// The sign-in, or None if Windows would not say or the session is
+    /// someone else's (elevated as another account): then nothing is saved,
+    /// loaded or cleaned up.
+    ///
+    /// It is the terminal session's number plus the time it was signed in,
+    /// which normal and elevated processes share, unlike their logon LUIDs.
+    pub fn current() -> Option<SignIn> {
+        let mine = info(WTS_CURRENT_SESSION).ok()?;
+        let start = u64::try_from(mine.LogonTime).ok().filter(|&t| t != 0)?;
+        let (domain, name) = account()?;
+        // Copies: the fields are compared as NUL-terminated, truncated text
+        if mine.UserName[0] == 0
+            || !same_name(&name, &mine.UserName)
+            || !same_name(&domain, &mine.Domain)
+        {
+            return None;
+        }
+        let own = luid(own_token())?;
+        Some(SignIn {
+            id: SessionId {
+                logon: u64::from(mine.SessionId),
+                stamp: start,
+            },
+            logons: [own, linked_luid().unwrap_or(own)],
+            others: other_sessions(&mine),
+            logon_began: logon_began(own),
+        })
+    }
+
+    /// When this user's other signed-in sessions (disconnected ones too)
+    /// began; None if that cannot be known, so nothing counts as earlier.
+    fn other_sessions(mine: &WTSINFOW) -> Option<Vec<u64>> {
         unsafe {
-            let mut key = HKEY::default();
-            if RegCreateKeyExW(
-                HKEY_CURRENT_USER,
-                w!("Software\\Oeca\\Session"),
-                None,
-                None,
-                REG_OPTION_VOLATILE,
-                KEY_QUERY_VALUE | KEY_SET_VALUE,
-                None,
-                &mut key,
-                None,
-            ) != ERROR_SUCCESS
-            {
+            let mut list: *mut WTS_SESSION_INFOW = std::ptr::null_mut();
+            let mut count = 0u32;
+            WTSEnumerateSessionsW(None, 0, 1, &mut list, &mut count).ok()?;
+            if list.is_null() {
                 return None;
             }
-            let mut buf = [0u8; 16];
-            let mut len = buf.len() as u32;
-            let stored = (RegQueryValueExW(
-                key,
-                w!("Id"),
-                None,
-                None,
-                Some(buf.as_mut_ptr()),
-                Some(&mut len),
-            ) == ERROR_SUCCESS
-                && len == 16)
-                .then(|| SessionId::from_bytes(&buf))
-                .flatten();
-            let ft = GetSystemTimeAsFileTime();
-            let now = (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime);
-            let session = decide(stored, logon, now);
-            let ok = match session {
-                Session::Resumed(_) => true,
-                Session::Fresh(id) => {
-                    RegSetValueExW(key, w!("Id"), None, REG_BINARY, Some(&id.to_bytes()))
-                        == ERROR_SUCCESS
+            let ids: Vec<u32> = std::slice::from_raw_parts(list, count as usize)
+                .iter()
+                .map(|s| s.SessionId)
+                .collect();
+            WTSFreeMemory(list as *mut _);
+            let mut starts = Vec::new();
+            for id in ids.into_iter().filter(|&id| id != mine.SessionId) {
+                match info(id) {
+                    Ok(s) if s.UserName == mine.UserName && s.Domain == mine.Domain => {
+                        starts.push(u64::try_from(s.LogonTime).ok()?);
+                    }
+                    Ok(_) => {}
+                    // Documented: only another user's session needs a permission for this
+                    Err(e) if e.code() == E_ACCESSDENIED => {}
+                    Err(_) => return None,
                 }
-            };
-            let _ = RegCloseKey(key);
-            ok.then_some(session)
+            }
+            Some(starts)
         }
     }
 
-    /// The logon session's LUID (`TOKEN_STATISTICS.AuthenticationId`), from
-    /// this process's token (the `GetCurrentProcessToken` pseudo-handle).
-    fn logon_luid() -> Option<u64> {
-        let mut stats = TOKEN_STATISTICS::default();
-        let mut len = 0u32;
+    fn info(session: u32) -> Result<WTSINFOW> {
+        unsafe {
+            let mut buf = PWSTR::null();
+            let mut bytes = 0u32;
+            WTSQuerySessionInformationW(None, session, WTSSessionInfo, &mut buf, &mut bytes)?;
+            let whole = !buf.is_null() && bytes as usize >= std::mem::size_of::<WTSINFOW>();
+            let info = whole.then(|| (buf.0 as *const WTSINFOW).read_unaligned());
+            WTSFreeMemory(buf.0 as *mut _);
+            info.ok_or_else(windows::core::Error::empty)
+        }
+    }
+
+    /// This process's user: (domain, name).
+    fn account() -> Option<(Vec<u16>, Vec<u16>)> {
+        // A TOKEN_USER and its SID fit in 256 bytes; u64 for its alignment
+        let mut token = [0u64; 32];
+        let (mut name, mut domain) = ([0u16; 256], [0u16; 256]);
+        let (mut name_len, mut domain_len) = (name.len() as u32, domain.len() as u32);
+        let (mut got, mut kind) = (0u32, SID_NAME_USE::default());
         unsafe {
             GetTokenInformation(
-                HANDLE(-4isize as *mut _),
+                own_token(),
+                TokenUser,
+                Some(token.as_mut_ptr().cast()),
+                std::mem::size_of_val(&token) as u32,
+                &mut got,
+            )
+            .ok()?;
+            LookupAccountSidW(
+                None,
+                (*token.as_ptr().cast::<TOKEN_USER>()).User.Sid,
+                Some(PWSTR(name.as_mut_ptr())),
+                &mut name_len,
+                Some(PWSTR(domain.as_mut_ptr())),
+                &mut domain_len,
+                &mut kind,
+            )
+            .ok()?;
+        }
+        Some((
+            domain.get(..domain_len as usize)?.to_vec(),
+            name.get(..name_len as usize)?.to_vec(),
+        ))
+    }
+
+    /// Whether the fixed-size, NUL-terminated `field` holds `full` (cut to fit).
+    pub(super) fn same_name(full: &[u16], field: &[u16]) -> bool {
+        let cut = &full[..full.len().min(field.len() - 1)];
+        let end = field.iter().position(|&c| c == 0).unwrap_or(field.len());
+        let text = |s: &[u16]| String::from_utf16_lossy(s).to_lowercase();
+        text(cut) == text(&field[..end])
+    }
+
+    /// When logon session `id` was created. Its owner may ask.
+    fn logon_began(id: u64) -> Option<u64> {
+        let luid = LUID {
+            LowPart: id as u32,
+            HighPart: (id >> 32) as i32,
+        };
+        let mut data: *mut SECURITY_LOGON_SESSION_DATA = std::ptr::null_mut();
+        unsafe {
+            LsaGetLogonSessionData(&luid, &mut data).ok().ok()?;
+            if data.is_null() {
+                return None;
+            }
+            let began = (*data).LogonTime;
+            let _ = LsaFreeReturnBuffer(data.cast());
+            u64::try_from(began).ok().filter(|&t| t != 0)
+        }
+    }
+
+    /// The other half of a UAC-split sign-in, if there is one.
+    fn linked_luid() -> Option<u64> {
+        let mut linked = TOKEN_LINKED_TOKEN::default();
+        let mut got = 0u32;
+        unsafe {
+            GetTokenInformation(
+                own_token(),
+                TokenLinkedToken,
+                Some((&raw mut linked).cast()),
+                std::mem::size_of::<TOKEN_LINKED_TOKEN>() as u32,
+                &mut got,
+            )
+            .ok()?;
+            let id = luid(linked.LinkedToken);
+            let _ = CloseHandle(linked.LinkedToken);
+            id
+        }
+    }
+
+    /// A token's logon LUID (what older versions tagged files with).
+    fn luid(token: HANDLE) -> Option<u64> {
+        let mut stats = TOKEN_STATISTICS::default();
+        let mut got = 0u32;
+        unsafe {
+            GetTokenInformation(
+                token,
                 TokenStatistics,
-                Some(&mut stats as *mut _ as *mut _),
+                Some((&raw mut stats).cast()),
                 std::mem::size_of::<TOKEN_STATISTICS>() as u32,
-                &mut len,
+                &mut got,
             )
             .ok()?;
         }
         let id = stats.AuthenticationId;
         Some((u64::from(id.HighPart as u32) << 32) | u64::from(id.LowPart))
-    }
-
-    #[cfg(test)]
-    pub fn luid_for_tests() -> Option<u64> {
-        logon_luid()
     }
 }
 
@@ -397,9 +615,40 @@ mod tests {
     use crate::config::ClipboardCapacity;
 
     const S1: SessionId = SessionId {
-        logon: 0x0000_0001_0003_e7a1,
+        logon: 7,
         stamp: 133_000_000_000_000_000,
     };
+    const DAY: u64 = 864_000_000_000;
+    /// A logon session begins this long before its sign-in time (0.3 s).
+    const LOGON_LEAD: u64 = 3_000_000;
+    /// The two logon LUIDs UAC gives one sign-in (normal, elevated).
+    const NORMAL: u64 = 1_209_401_913;
+    const ELEVATED: u64 = 1_209_401_815;
+
+    fn me() -> SignIn {
+        SignIn {
+            id: S1,
+            logons: [NORMAL, ELEVATED],
+            others: Some(Vec::new()),
+            logon_began: Some(S1.stamp - LOGON_LEAD),
+        }
+    }
+
+    fn next_sign_in() -> SignIn {
+        SignIn {
+            id: SessionId {
+                stamp: S1.stamp + DAY,
+                ..S1
+            },
+            logons: [NORMAL + 500, ELEVATED + 500],
+            others: Some(Vec::new()),
+            logon_began: Some(S1.stamp + DAY - LOGON_LEAD),
+        }
+    }
+
+    fn store(dir: &TempDir, me: &SignIn) -> ClipboardStore {
+        ClipboardStore::at(Some(dir.0.clone()), Some(me.clone()))
+    }
 
     fn text(s: &str) -> ClipboardItem {
         ClipboardItem::Text(s.to_owned())
@@ -428,8 +677,8 @@ mod tests {
     struct TempDir(PathBuf);
     impl TempDir {
         fn new(name: &str) -> Self {
-            let p =
-                std::env::temp_dir().join(format!("oeca-store-test-{}-{name}", std::process::id()));
+            let p = crate::data_dir::temp_dir()
+                .join(format!("oeca-store-test-{}-{name}", std::process::id()));
             let _ = std::fs::remove_dir_all(&p);
             std::fs::create_dir_all(&p).unwrap();
             Self(p)
@@ -553,42 +802,53 @@ mod tests {
     }
 
     #[test]
-    fn test_session_decision() {
-        // No key yet (first run, or after sign-out / restart): fresh
-        let s = decide(None, 7, 100);
-        assert_eq!(
-            s,
-            Session::Fresh(SessionId {
-                logon: 7,
-                stamp: 100
-            })
-        );
-        // Same logon session (relaunch, crash): resumed with the same id
-        let id = SessionId {
-            logon: 7,
-            stamp: 100,
+    fn test_ownership_needs_proof() {
+        let id = |logon, stamp| SessionId { logon, stamp };
+        let (start, me) = (S1.stamp, me());
+        // This sign-in
+        assert_eq!(me.owner(S1), Owner::Mine);
+        // An older version's file from this sign-in, saved by either half
+        assert_eq!(me.owner(id(NORMAL, start + 9)), Owner::Mine);
+        assert_eq!(me.owner(id(ELEVATED, start + 9)), Owner::Mine);
+        // An earlier sign-in: the same session number after a restart, an
+        // older version's file, a LUID that repeats across boots
+        for logon in [S1.logon, 978_130_866, NORMAL] {
+            assert_eq!(me.owner(id(logon, start - DAY)), Owner::Disposable);
+        }
+        // No proof: from "later", another session at the same moment, no time
+        for saved in [
+            id(99, start + 1),
+            id(99, start),
+            id(99, 0),
+            id(0, 0),
+            id(99, 5),
+        ] {
+            assert_eq!(me.owner(saved), Owner::Unknown, "{saved:?}");
+        }
+        // An earlier sign-in of this user that still exists may own it
+        let with = |others| SignIn {
+            others,
+            ..me.clone()
         };
-        assert_eq!(decide(Some(id), 7, 999), Session::Resumed(id));
-        // A key left by another logon (hive stayed loaded): fresh, new stamp
+        let saved = id(3, start - DAY);
+        assert_eq!(with(Some(vec![start - DAY])).owner(saved), Owner::Unknown);
         assert_eq!(
-            decide(Some(id), 8, 999),
-            Session::Fresh(SessionId {
-                logon: 8,
-                stamp: 999
-            })
+            with(Some(vec![start - 2 * DAY])).owner(saved),
+            Owner::Unknown
         );
+        assert_eq!(with(Some(vec![start - 5])).owner(saved), Owner::Disposable);
+        assert_eq!(with(None).owner(saved), Owner::Unknown, "sessions unknown");
     }
 
     #[test]
     fn test_close_and_reopen_in_the_same_session() {
         let dir = TempDir::new("reopen");
-        let session = Session::Fresh(S1);
-        let store = ClipboardStore::at(dir.0.clone(), session);
-        assert_eq!(store.load(), Err(LoadError::Missing));
+        let first = store(&dir, &me());
+        assert_eq!(first.load(), Err(LoadError::Missing));
         let mut h = history(&[text("a"), image(4, 3, 50), text("b")]);
-        store.save(&h).unwrap();
+        first.save(&h).unwrap();
         // Quit and relaunch: same session, everything back in order
-        let reopened = ClipboardStore::at(dir.0.clone(), decide(Some(S1), S1.logon, 1));
+        let reopened = store(&dir, &me());
         let mut back = ClipboardHistory::default();
         restore(&mut back, reopened.load().unwrap());
         assert_eq!(items(&back), items(&h));
@@ -607,34 +867,348 @@ mod tests {
     }
 
     #[test]
+    fn test_normal_and_elevated_launches_share_one_history() {
+        let dir = TempDir::new("elevated");
+        let elevated = SignIn {
+            logons: [ELEVATED, NORMAL],
+            ..me()
+        };
+        store(&dir, &me())
+            .save(&history(&[text("normal")]))
+            .unwrap();
+        let up = store(&dir, &elevated);
+        assert_eq!(up.load().unwrap(), [text("normal")]);
+        up.save(&history(&[text("elevated")])).unwrap();
+        assert_eq!(store(&dir, &me()).load().unwrap(), [text("elevated")]);
+        // An older version's file, tagged with either LUID, carries over
+        for logon in [NORMAL, ELEVATED] {
+            let old = SessionId {
+                logon,
+                stamp: S1.stamp + 60,
+            };
+            std::fs::write(
+                dir.0.join(FILE_NAME),
+                encode(old, &history(&[text("old version")])),
+            )
+            .unwrap();
+            let s = store(&dir, &me());
+            assert_eq!(s.load().unwrap(), [text("old version")]);
+            s.save(&history(&[text("saved again")])).unwrap();
+            assert_eq!(
+                tag(&std::fs::read(dir.0.join(FILE_NAME)).unwrap()),
+                Some(S1)
+            );
+        }
+    }
+
+    #[test]
     fn test_new_windows_session_never_sees_old_history() {
         let dir = TempDir::new("isolation");
-        let old = ClipboardStore::at(dir.0.clone(), Session::Fresh(S1));
-        old.save(&history(&[text("secret from yesterday"), image(2, 2, 1)]))
-            .unwrap();
-        // Restart: the volatile key is gone, so the next launch is fresh. Even
-        // with the same LUID value (LUIDs repeat across boots) it gets a new
-        // stamp, and the old file is removed before anything is read
+        let path = dir.0.join(FILE_NAME);
+        let secret = history(&[text("synthetic, from yesterday"), image(2, 2, 1)]);
+        store(&dir, &me()).save(&secret).unwrap();
+        // An interrupted write from then, too
+        std::fs::write(dir.0.join(TEMP_NAME), &encode(S1, &secret)[..40]).unwrap();
         let unrelated = dir.0.join("someone-elses-file.txt");
         std::fs::write(&unrelated, "keep me").unwrap();
-        let next = ClipboardStore::at(dir.0.clone(), decide(None, S1.logon, S1.stamp + 5));
+        std::fs::create_dir(dir.0.join("Recovery")).unwrap();
+        std::fs::write(dir.0.join("Recovery/backup.dpapi"), "keep me").unwrap();
+        let next = store(&dir, &next_sign_in());
         assert_eq!(next.load(), Err(LoadError::Missing));
-        assert!(!dir.0.join(FILE_NAME).exists(), "stale history deleted");
+        assert!(!path.exists(), "stale history deleted");
+        assert!(
+            !dir.0.join(TEMP_NAME).exists(),
+            "stale partial write deleted"
+        );
         assert!(unrelated.exists(), "unrelated files untouched");
+        assert!(
+            dir.0.join("Recovery/backup.dpapi").exists(),
+            "backups untouched"
+        );
         // Even if deleting failed, a stale file is refused by its session id
-        std::fs::write(
-            dir.0.join(FILE_NAME),
-            encode(S1, &history(&[text("stale")])),
-        )
-        .unwrap();
+        std::fs::write(&path, encode(S1, &secret)).unwrap();
         assert_eq!(next.load(), Err(LoadError::OtherSession));
-        // Persistence off (session unknown): nothing read, nothing written
-        let off = ClipboardStore {
-            dir: dir.0.clone(),
-            session: None,
+    }
+
+    #[test]
+    fn test_unknown_ownership_is_never_loaded_replaced_or_deleted() {
+        let good = encode(S1, &history(&[text("synthetic")]));
+        let mut flipped = good.clone();
+        flipped[30] ^= 1;
+        let mut no_identity = good[..good.len() - 8].to_vec();
+        no_identity[8..24].fill(0);
+        let sum = fnv1a(&no_identity);
+        no_identity.extend_from_slice(&sum.to_le_bytes());
+        let future = SessionId {
+            logon: 99,
+            stamp: S1.stamp + 2 * DAY,
         };
-        assert_eq!(off.load(), Err(LoadError::Missing));
-        off.save(&history(&[text("x")])).unwrap();
+        let cases = [
+            ("flipped", flipped),
+            ("truncated", good[..good.len() - 3].to_vec()),
+            ("header-only", good[..24].to_vec()),
+            ("no-identity", no_identity),
+            ("foreign", encode(future, &history(&[text("synthetic")]))),
+            ("empty", Vec::new()),
+            ("zeroed", vec![0; 64]),
+            ("other-format", b"synthetic, some other format".to_vec()),
+            ("too-large", vec![7; MAX_FILE_BYTES as usize + 1]),
+        ];
+        for (name, bytes) in cases {
+            let dir = TempDir::new(name);
+            let path = dir.0.join(FILE_NAME);
+            std::fs::write(&path, &bytes).unwrap();
+            for who in [me(), next_sign_in()] {
+                let s = store(&dir, &who); // launch cleanup
+                assert!(s.load().is_err(), "{name}: not loaded");
+                assert!(
+                    s.save(&history(&[text("new copy")])).is_err(),
+                    "{name}: not replaced"
+                );
+                assert!(
+                    s.save(&ClipboardHistory::default()).is_err(),
+                    "{name}: not cleared"
+                );
+                assert!(s.wipe().is_err(), "{name}: not wiped at sign-out");
+                assert!(std::fs::read(&path).unwrap() == bytes, "{name}: changed");
+            }
+        }
+        // The same for an interrupted write whose tag is unreadable
+        let dir = TempDir::new("unknown-temp");
+        std::fs::write(dir.0.join(TEMP_NAME), "synthetic").unwrap();
+        let s = store(&dir, &me());
+        assert!(s.save(&history(&[text("new copy")])).is_err());
+        assert!(s.wipe().is_err());
+        assert_eq!(std::fs::read(dir.0.join(TEMP_NAME)).unwrap(), b"synthetic");
+    }
+
+    #[test]
+    fn test_another_live_sign_in_keeps_its_history() {
+        let dir = TempDir::new("concurrent");
+        let h = history(&[text("synthetic")]);
+        store(&dir, &me()).save(&h).unwrap();
+        let second = SignIn {
+            others: Some(vec![S1.stamp]),
+            ..next_sign_in()
+        };
+        let unknown_sessions = SignIn {
+            others: None,
+            ..next_sign_in()
+        };
+        for who in [second, unknown_sessions] {
+            let s = store(&dir, &who);
+            assert_eq!(s.load(), Err(LoadError::OtherSession));
+            assert!(s.save(&history(&[text("second's copy")])).is_err());
+            assert!(s.wipe().is_err());
+        }
+        assert_eq!(store(&dir, &me()).load().unwrap(), items(&h));
+    }
+
+    #[test]
+    fn test_a_file_changed_behind_our_back_is_not_overwritten() {
+        let dir = TempDir::new("changed");
+        let s = store(&dir, &me());
+        s.save(&history(&[text("mine")])).unwrap();
+        let path = dir.0.join(FILE_NAME);
+        std::fs::write(&path, "synthetic, written by something else").unwrap();
+        assert!(s.save(&history(&[text("mine again")])).is_err());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"synthetic, written by something else"
+        );
+    }
+
+    #[test]
+    fn test_our_interrupted_writes_do_not_block_saving() {
+        let dir = TempDir::new("interrupted");
+        let h = history(&[text("synthetic")]);
+        for partial in [encode(S1, &h)[..24].to_vec(), Vec::new(), vec![0; 100]] {
+            std::fs::write(dir.0.join(TEMP_NAME), &partial).unwrap();
+            let s = store(&dir, &me());
+            s.save(&h).unwrap();
+            assert_eq!(s.load().unwrap(), items(&h));
+        }
+    }
+
+    #[test]
+    fn test_no_identity_or_no_lock_changes_nothing() {
+        let dir = TempDir::new("off");
+        let path = dir.0.join(FILE_NAME);
+        let bytes = encode(S1, &history(&[text("synthetic")]));
+        std::fs::write(&path, &bytes).unwrap();
+        // Identity unknown; and no folder, which is what a failed lock leaves
+        let no_identity = ClipboardStore::at(Some(dir.0.clone()), None);
+        let no_lock = ClipboardStore::at(crate::data_dir::dir(), Some(next_sign_in()));
+        for off in [no_identity, no_lock] {
+            assert_eq!(off.load(), Err(LoadError::Missing));
+            off.save(&history(&[text("x")])).unwrap();
+            off.save(&ClipboardHistory::default()).unwrap();
+            off.wipe().unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn test_session_end_removes_only_this_sign_ins_history() {
+        let dir = TempDir::new("session-end");
+        let path = dir.0.join(FILE_NAME);
+        store(&dir, &me()).save(&history(&[text("mine")])).unwrap();
+        ClipboardStore::new(Some(dir.0.clone()), Some(me()))
+            .wipe()
+            .unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_a_sign_in_time_moved_forward_deletes_nothing() {
+        let dir = TempDir::new("moved-forward");
+        store(&dir, &me())
+            .save(&history(&[text("synthetic")]))
+            .unwrap();
+        let path = dir.0.join(FILE_NAME);
+        let partial = &encode(S1, &history(&[text("interrupted")]))[..40];
+        std::fs::write(dir.0.join(TEMP_NAME), partial).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        // As if an unlock, resume or reconnect moved it, by a tick or by hours;
+        // for the normal half and the elevated one
+        let elevated = SignIn {
+            logons: [ELEVATED, NORMAL],
+            ..me()
+        };
+        for half in [me(), elevated] {
+            for later in [1, LOGON_LEAD, DAY / 8, 3 * DAY] {
+                let mut moved = half.clone();
+                moved.id.stamp += later;
+                assert_eq!(moved.owner(S1), Owner::Unknown, "+{later}");
+                let s = store(&dir, &moved); // launch cleanup
+                assert_eq!(s.load(), Err(LoadError::OtherSession));
+                assert!(s.save(&history(&[text("new copy")])).is_err());
+                assert!(s.save(&ClipboardHistory::default()).is_err());
+                assert!(s.wipe().is_err(), "nor at sign-out");
+                assert_eq!(std::fs::read(&path).unwrap(), bytes, "+{later}");
+                assert!(dir.0.join(TEMP_NAME).exists(), "nor the partial write");
+            }
+        }
+        // The next real sign-in clears both, as always
+        let _ = store(&dir, &next_sign_in());
+        assert!(!path.exists() && !dir.0.join(TEMP_NAME).exists());
+    }
+
+    #[test]
+    fn test_deleting_needs_both_times_to_agree() {
+        let next = next_sign_in();
+        let (start, began) = (next.id.stamp, next.logon_began.unwrap());
+        let owner = |logon_began, stamp| {
+            SignIn {
+                logon_began,
+                ..next.clone()
+            }
+            .owner(SessionId { logon: 3, stamp })
+        };
+        assert_eq!(owner(Some(began), began - 1), Owner::Disposable);
+        assert_eq!(owner(Some(began), began), Owner::Unknown, "not before it");
+        assert_eq!(owner(Some(began), start - 1), Owner::Unknown, "in between");
+        // A logon made later inside the session proves nothing more
+        assert_eq!(owner(Some(start + DAY), start + 1), Owner::Unknown);
+        assert_eq!(owner(None, start - DAY), Owner::Unknown, "time unknown");
+    }
+
+    #[test]
+    fn test_an_unknown_logon_time_never_stops_this_sign_ins_own_history() {
+        let dir = TempDir::new("no-logon-time");
+        let blind = |who: SignIn| SignIn {
+            logon_began: None,
+            ..who
+        };
+        let h = history(&[text("synthetic")]);
+        let s = store(&dir, &blind(me()));
+        s.save(&h).unwrap();
+        assert_eq!(store(&dir, &blind(me())).load().unwrap(), items(&h));
+        // A later sign-in that cannot learn it neither shows nor deletes it
+        let later = store(&dir, &blind(next_sign_in()));
+        assert_eq!(later.load(), Err(LoadError::OtherSession));
+        assert!(dir.0.join(FILE_NAME).exists());
+    }
+
+    #[test]
+    fn test_a_sign_in_time_moved_back_deletes_nothing() {
+        // A clock set back, or the time reported earlier than it was
+        let dir = TempDir::new("moved-back");
+        store(&dir, &me())
+            .save(&history(&[text("synthetic")]))
+            .unwrap();
+        let mut moved = me();
+        moved.id.stamp -= 1;
+        let s = store(&dir, &moved);
+        assert_eq!(s.load(), Err(LoadError::OtherSession));
+        assert!(s.wipe().is_err());
+        assert!(dir.0.join(FILE_NAME).exists());
+    }
+
+    #[test]
+    fn test_nightly_fast_startup_sign_ins_each_drop_only_the_one_before() {
+        // Fast Startup signs out without rebooting: the session number grows,
+        // the kernel (and every old logon session) lives on
+        let dir = TempDir::new("nights");
+        let mut last: Option<SignIn> = None;
+        for night in 1..=7u64 {
+            let who = SignIn {
+                id: SessionId {
+                    logon: night,
+                    stamp: S1.stamp + night * DAY,
+                },
+                logons: [night * 1000, night * 1000 + 1],
+                others: Some(Vec::new()),
+                logon_began: Some(S1.stamp + night * DAY - LOGON_LEAD),
+            };
+            let s = store(&dir, &who);
+            assert_eq!(s.load(), Err(LoadError::Missing), "night {night}");
+            s.save(&history(&[text("synthetic")])).unwrap();
+            // Relaunches, sleep and wake inside the sign-in: the same answer
+            for _ in 0..3 {
+                assert_eq!(store(&dir, &who).load().unwrap().len(), 1);
+            }
+            if let Some(old) = last.replace(who) {
+                assert_eq!(store(&dir, &old).load(), Err(LoadError::OtherSession));
+            }
+        }
+    }
+
+    #[test]
+    fn test_links_planted_in_the_store_never_reach_their_targets() {
+        let (dir, away) = (TempDir::new("linked"), TempDir::new("linked-target"));
+        let bytes = encode(S1, &history(&[text("synthetic backup")]));
+        let backup = away.0.join("backup.bin");
+        std::fs::write(&backup, &bytes).unwrap();
+        for name in [FILE_NAME, TEMP_NAME] {
+            let link = dir.0.join(name);
+            std::fs::hard_link(&backup, &link).unwrap();
+            // Same sign-in (replace, clear) and a later one (launch cleanup)
+            let s = store(&dir, &me());
+            assert!(s.save(&history(&[text("new")])).is_err(), "{name}");
+            assert!(s.save(&ClipboardHistory::default()).is_err(), "{name}");
+            let _ = store(&dir, &next_sign_in());
+            assert!(link.exists(), "{name}: not removed");
+            assert_eq!(std::fs::read(&backup).unwrap(), bytes, "{name}");
+            std::fs::remove_file(&link).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_account_names_match_windows_fixed_fields() {
+        let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        let field = |s: &str| {
+            let mut f = [0u16; 21];
+            for (to, from) in f.iter_mut().take(20).zip(s.encode_utf16()) {
+                *to = from;
+            }
+            f
+        };
+        assert!(sign_in::same_name(&w("Alex"), &field("alex")));
+        assert!(!sign_in::same_name(&w("Alex"), &field("Alexa")));
+        assert!(!sign_in::same_name(&w("Alexa"), &field("Alex")));
+        let long = "a_very_long_account_name_indeed";
+        assert!(sign_in::same_name(&w(long), &field(long)));
     }
 
     #[test]
@@ -658,25 +1232,20 @@ mod tests {
         assert_eq!(decode(&too_big, S1), Err(LoadError::TooLarge));
     }
 
-    /// The real volatile key and logon LUID (run explicitly:
-    /// `cargo test clipboard_store_live -- --ignored`). Uses the real
-    /// `HKCU\Software\Oeca\Session` key.
+    /// Windows' own answer on this machine (read-only; run explicitly:
+    /// `cargo test clipboard_store_live -- --ignored`).
     #[test]
     #[ignore]
-    fn clipboard_store_live_session_is_stable_within_a_logon() {
-        let luid = session::luid_for_tests().expect("logon LUID");
-        assert_ne!(luid, 0);
-        let first = session::current().expect("volatile key");
-        let second = session::current().expect("volatile key");
-        let id = |s: Session| match s {
-            Session::Resumed(id) | Session::Fresh(id) => id,
-        };
-        assert_eq!(id(first).logon, luid);
-        assert_eq!(
-            second,
-            Session::Resumed(id(first)),
-            "same session on relaunch"
+    fn clipboard_store_live_sign_in_is_stable() {
+        let first = sign_in::current().expect("an interactive sign-in");
+        assert_eq!(sign_in::current(), Some(first.clone()), "same on relaunch");
+        assert!(first.id.stamp >= OLDEST_STAMP);
+        assert!(first.others.is_some(), "sessions could be listed");
+        let began = first.logon_began.expect("the logon session's time");
+        assert!(
+            began >= OLDEST_STAMP && began <= first.id.stamp,
+            "{first:?}"
         );
-        assert!(local_app_data().is_some());
+        println!("{first:?}");
     }
 }

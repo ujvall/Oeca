@@ -8,3 +8,6 @@ skills-lock.json
 /assets/fonts/*.otf
 # Sunghyun Sans (SIL OFL 1.1): may be redistributed, with its licence
 !/assets/fonts/SunghyunSans-Bold.otf
+
+# Python bytecode (assets/icons scripts)
+__pycache__/

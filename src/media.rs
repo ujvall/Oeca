@@ -232,22 +232,30 @@ pub fn badge_pixels(mut px: Vec<u8>, w: u32, h: u32) -> Option<Artwork> {
 /// Accent colour as sRGB bytes `[r, g, b]`.
 pub type Accent = [u8; 3];
 
+/// The player's accent from already-decoded artwork: the cover's own main
+/// colour, exactly as the visualizer shows it (its hue and saturation, only
+/// lifted where too dark to read on black; never washed out). `None` for
+/// neutral (grey/black/white or transparent) artwork. Deterministic.
+pub fn artwork_accent(art: &Artwork) -> Option<Accent> {
+    let (h, s, v) = match palette_clusters(art) {
+        Some((main, _)) => main,
+        // Too little colour for the palette (a dim motif on a dark cover):
+        // the strongest hue still tints the accent, lifted to read on black
+        None => to_hsv(dominant_rgb(
+            &art.pixels,
+            art.width as usize,
+            art.height as usize,
+        )?),
+    };
+    Some(palette_colour(h, s, v))
+}
+
 /// Pixels with less chroma (max - min channel) than this are treated as grey.
 const ACCENT_MIN_CHROMA: f32 = 0.15;
 /// Pixels darker than this (max channel) carry no usable hue.
 const ACCENT_MIN_VALUE: f32 = 0.12;
 /// Mean chroma per sample below which the artwork counts as neutral.
 const ACCENT_MIN_COVERAGE: f32 = 0.02;
-/// Normalized accent range (HSL): premium on pure black, never dark or neon.
-const ACCENT_SATURATION: (f32, f32) = (0.35, 0.75);
-const ACCENT_LIGHTNESS: (f32, f32) = (0.52, 0.68);
-/// Upper bound on the accent's luma (bright hues such as yellow/green are dimmed).
-const ACCENT_MAX_LUMA: f32 = 0.42;
-const ACCENT_MIN_LIGHTNESS: f32 = 0.36;
-
-fn luma([r, g, b]: [f32; 3]) -> f32 {
-    0.2126 * r + 0.7152 * g + 0.0722 * b
-}
 
 /// RGB (0..=1) -> HSL (hue 0..1).
 fn to_hsl([r, g, b]: [f32; 3]) -> (f32, f32, f32) {
@@ -267,42 +275,6 @@ fn to_hsl([r, g, b]: [f32; 3]) -> (f32, f32, f32) {
         (r - g) / c + 4.0
     };
     (h / 6.0, s.min(1.0), l)
-}
-
-fn from_hsl(h: f32, s: f32, l: f32) -> [f32; 3] {
-    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
-    let hp = h.rem_euclid(1.0) * 6.0;
-    let x = c * (1.0 - (hp.rem_euclid(2.0) - 1.0).abs());
-    let (r, g, b) = match hp as u32 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-    let m = l - c / 2.0;
-    [r + m, g + m, b + m]
-}
-
-/// Clamps saturation and lightness into the premium range, then dims hues that
-/// would still read as neon on black.
-fn normalize_accent(rgb: [f32; 3]) -> Accent {
-    let (h, s, l) = to_hsl(rgb);
-    let s = s.clamp(ACCENT_SATURATION.0, ACCENT_SATURATION.1);
-    let mut l = l.clamp(ACCENT_LIGHTNESS.0, ACCENT_LIGHTNESS.1);
-    while luma(from_hsl(h, s, l)) > ACCENT_MAX_LUMA && l > ACCENT_MIN_LIGHTNESS {
-        l -= 0.02;
-    }
-    from_hsl(h, s, l).map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
-}
-
-/// Derives one accent colour from already-decoded artwork (no decoding, no
-/// allocation): a ~64x64 sample grid votes into 24 hue bins weighted by chroma;
-/// the strongest hue (with its neighbours) is averaged and normalized. Returns
-/// `None` for neutral (grey/black/white or transparent) artwork. Deterministic.
-pub fn artwork_accent(art: &Artwork) -> Option<Accent> {
-    dominant_rgb(&art.pixels, art.width as usize, art.height as usize).map(normalize_accent)
 }
 
 /// Chroma-weighted dominant hue of premultiplied BGRA pixels, as averaged RGB
@@ -370,7 +342,7 @@ pub struct VizGradient {
 /// Farther apart, the short way round the hue wheel runs through colours
 /// that are nowhere in the cover (orange and blue blend through pink and
 /// purple), so the dominant colour alone makes the gradient.
-const GRADIENT_SECOND_SHARE: f32 = 0.25;
+const GRADIENT_SECOND_SHARE: f32 = 0.4;
 const GRADIENT_HUE_BINS: (usize, usize) = (3, 9);
 
 /// Samples darker than this (HSV value) are shadows, without usable colour.
@@ -474,6 +446,21 @@ pub fn gradient_mix(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
 /// None for neutral artwork (grey, black and white, transparent): the
 /// caller then uses its usual accent. Deterministic.
 pub fn visualizer_gradient(art: &Artwork) -> Option<VizGradient> {
+    let ((h0, s0, v0), second) = palette_clusters(art)?;
+    let main = palette_colour(h0, s0, v0);
+    Some(VizGradient {
+        top: main,
+        // One main colour: a flat bar in it (no ramp)
+        bottom: second.map_or(main, |(h1, s1, v1)| palette_colour(h1, s1, v1)),
+    })
+}
+
+/// The artwork's main colour cluster (hue, saturation, value) and, when the
+/// cover really has two main colours, the second one (see
+/// `GRADIENT_SECOND_SHARE` / `GRADIENT_HUE_BINS`). None for neutral
+/// artwork. Runs once per artwork on a ~48 x 48 sample grid.
+type Hsv = (f32, f32, f32);
+fn palette_clusters(art: &Artwork) -> Option<(Hsv, Option<Hsv>)> {
     const BINS: usize = 36;
     let (w, h) = (art.width as usize, art.height as usize);
     if w == 0 || h == 0 {
@@ -545,22 +532,7 @@ pub fn visualizer_gradient(art: &Artwork) -> Option<VizGradient> {
         let hh = c[1].atan2(c[0]).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU;
         (hh, s_ / wt, v_ / wt)
     };
-    let (h0, s0, v0) = colour(first);
-    Some(match second {
-        Some(p) => {
-            let (h1, s1, v1) = colour(p);
-            VizGradient {
-                top: palette_colour(h0, s0, v0),
-                bottom: palette_colour(h1, s1, v1),
-            }
-        }
-        // One colour: lighter (a little less saturated) at the top, a little
-        // deeper at the bottom: the same hue throughout
-        None => VizGradient {
-            top: palette_colour(h0, s0 * 0.85, (v0 + 0.1).min(1.0)),
-            bottom: palette_colour(h0, s0, v0 * 0.86),
-        },
-    })
+    Some((colour(first), second.map(colour)))
 }
 
 // ---- Timeline ----------------------------------------------------------------
@@ -1797,6 +1769,10 @@ impl MediaEngine {
     /// as `WM_APP_MEDIA_MANAGER_READY`.
     /// Returns false if the request could not be started (media stays `NoSession`).
     pub fn initialize(&mut self, hwnd: HWND) -> bool {
+        // A test build must not follow or control what the user plays
+        if crate::data_dir::ISOLATED {
+            return false;
+        }
         let (tx, rx) = channel();
         let hwnd_raw = hwnd.0 as usize;
         let started = SessionManager::RequestAsync().and_then(|op| {
@@ -3222,19 +3198,12 @@ mod tests {
         painted(&[(rgb, 255, 1.0)])
     }
 
-    fn hsl_of(a: Accent) -> (f32, f32, f32) {
-        to_hsl(a.map(|v| f32::from(v) / 255.0))
-    }
-
-    /// Every accent is usable on #000: within the normalized range, never dark,
-    /// never neon.
+    /// Every accent is the cover's own colour, readable on #000.
     fn assert_premium(a: Accent) {
-        let (_, s, l) = hsl_of(a);
-        let rgb = a.map(|v| f32::from(v) / 255.0);
-        assert!((0.33..=0.77).contains(&s), "saturation {s} for {a:?}");
-        assert!((0.34..=0.70).contains(&l), "lightness {l} for {a:?}");
-        assert!(luma(rgb) <= 0.6, "too bright: {a:?}");
-        assert!(luma(rgb) >= 0.15, "too dark: {a:?}");
+        assert!(
+            relative_luminance(a.map(|v| f32::from(v) / 255.0)) >= PALETTE_MIN_LUMINANCE - 0.005,
+            "too dark on black: {a:?}"
+        );
     }
 
     /// Premultiplied BGRA artwork from a function of (x, y) -> (rgb, alpha).
@@ -3283,10 +3252,9 @@ mod tests {
             bottom.1 > 0.75 && bottom.2 > 0.7,
             "rich, not muted: {bottom:?}"
         );
-        assert!(top.2 >= bottom.2, "lighter at the top");
-        assert_ne!(g.top, g.bottom, "a gentle ramp, not flat");
-        // The old accent of the same cover is the duller one
-        assert!(hsv_of(artwork_accent(&art).unwrap()).1 < bottom.1);
+        assert_eq!(top, bottom, "one main colour: a flat bar, no ramp");
+        // The player's accent is that same rich colour (not washed out)
+        assert_eq!(artwork_accent(&art), Some(g.top));
         assert!(visible(g.top) && visible(g.bottom));
     }
 
@@ -3340,7 +3308,7 @@ mod tests {
             hue_near(hsv_of(g.top).0, hsv_of(g.bottom).0, 0.03),
             "one hue: {g:?}"
         );
-        // A minor second colour (under a quarter of the main one): one hue
+        // A minor second colour (well under half the main one): one hue
         let minor = cover_of(64, 64, |x, _| {
             if x < 58 {
                 ([30, 80, 230], 255)
@@ -3467,26 +3435,23 @@ mod tests {
     }
 
     #[test]
-    fn test_accent_bright_artwork_is_toned_down() {
+    fn test_accent_keeps_the_covers_own_colour() {
+        // Pastel stays pastel (not pushed to a set saturation)
         let a = artwork_accent(&solid([255, 190, 205])).expect("pastel pink");
         assert_premium(a);
         assert!(a[0] > a[1], "still pink: {a:?}");
-    }
-
-    #[test]
-    fn test_accent_saturated_artwork_is_not_neon() {
-        for rgb in [
-            [0, 255, 0],
-            [255, 255, 0],
-            [0, 255, 255],
-            [255, 0, 255],
-            [0, 0, 255],
-        ] {
+        // Vivid covers stay vivid: the accent is not washed out
+        for rgb in [[0, 200, 0], [235, 160, 20], [255, 0, 255]] {
             let a = artwork_accent(&solid(rgb)).expect("saturated");
             assert_premium(a);
-            let (_, s, _) = hsl_of(a);
-            assert!(s <= 0.77, "saturation capped for {rgb:?}: {a:?}");
+            let (_, s, _) = hsv_of(a);
+            assert!(s >= 0.85, "vivid for {rgb:?}: {a:?}");
         }
+        // Pure blue is too dark on black: lifted just enough, still blue
+        let a = artwork_accent(&solid([0, 0, 255])).unwrap();
+        assert_premium(a);
+        let (h, s, _) = hsv_of(a);
+        assert!(hue_near(h, 0.667, 0.02) && s >= 0.6, "{a:?}");
     }
 
     #[test]

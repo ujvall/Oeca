@@ -1,0 +1,799 @@
+diff -ruN a/src/webrtc/signaling.rs b/src/webrtc/signaling.rs
+--- a/src/webrtc/signaling.rs	2026-11-23 16:20:18.863915000 +0530
++++ b/src/webrtc/signaling.rs	2026-11-23 16:20:18.865925500 +0530
+@@ -1,3 +1,4 @@
++// Modified by Oeca from LocalSend (Apache-2.0): see OECA-VENDOR.txt and OECA-PATCHES.diff.
+ use crate::model::discovery::DeviceType;
+ use crate::util::base64;
+ use anyhow::Result;
+@@ -10,11 +11,19 @@
+ use tokio::sync::{mpsc, Mutex};
+ use tokio::time::Duration;
+ #[cfg(feature = "webrtc-signaling")]
+-use tokio_tungstenite::connect_async;
++use tokio_tungstenite::connect_async_with_config;
+ #[cfg(feature = "webrtc-signaling")]
+-use tungstenite::{Bytes, Message};
++use tungstenite::{protocol::WebSocketConfig, Bytes, Message};
+ use uuid::Uuid;
+ 
++/// oeca: see the read loop in `SignalingConnection::connect`.
++#[cfg(feature = "webrtc-signaling")]
++const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
++
++/// oeca: an SDP is at most 128 KiB as signaled (tungstenite's default is 64 MiB).
++#[cfg(feature = "webrtc-signaling")]
++const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
++
+ /// A message sent by the server to the client.
+ #[derive(Clone, Deserialize, Eq, Serialize, Debug, PartialEq)]
+ #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+@@ -196,7 +205,10 @@
+ 
+         tracing::debug!("Connecting to the signaling server at {uri}");
+ 
+-        let (ws_stream, _) = connect_async(&uri).await?;
++        let limits = WebSocketConfig::default()
++            .max_message_size(Some(MAX_MESSAGE_BYTES))
++            .max_frame_size(Some(MAX_MESSAGE_BYTES));
++        let (ws_stream, _) = connect_async_with_config(&uri, Some(limits), false).await?;
+ 
+         tracing::debug!("Connected to the signaling server. Waiting for hello...");
+ 
+@@ -214,6 +226,10 @@
+                         if write.send(Message::Text(message.into())).await.is_ok() {
+                             return true;
+                         }
++                    } else {
++                        // oeca: every sender is gone: close the socket, so the server
++                        // drops this peer now instead of after its idle timeout
++                        let _ = write.send(Message::Close(None)).await;
+                     }
+ 
+                     false
+@@ -240,7 +256,12 @@
+         let (client_tx, mut client_rx) = mpsc::channel::<ClientInfo>(1);
+ 
+         tokio::spawn(async move {
+-            read.for_each(|message| async {
++            let mut read = read;
++            // oeca: nothing at all (not even the pong to our 120 s ping) for this
++            // long means a dead connection (sleep, network change): end it
++            while let Ok(Some(message)) =
++                tokio::time::timeout(READ_IDLE_TIMEOUT, read.next()).await
++            {
+                 if let Ok(Message::Text(message)) = message {
+                     match serde_json::from_str::<WsServerMessage>(&message) {
+                         Ok(message) => {
+@@ -250,23 +271,25 @@
+                             } = &message
+                             {
+                                 if client_tx.send(client.clone()).await.is_err() {
+-                                    return;
++                                    break;
+                                 }
+                             }
+ 
+-                            match receive_tx.send(message).await {
+-                                Ok(_) => {}
+-                                Err(e) => tracing::error!("{e:?}"),
++                            if receive_tx.send(message).await.is_err() {
++                                break;
+                             }
+                         }
+                         Err(e) => tracing::error!("Error: {e}, Server: {message}"),
+                     }
+                 }
+-            })
+-            .await;
++            }
+         });
+ 
+-        let client = client_rx.recv().await.unwrap();
++        // oeca: the server closes without HELLO when over its limits: an error, not a panic
++        let client = client_rx
++            .recv()
++            .await
++            .ok_or_else(|| anyhow::anyhow!("Signaling server closed before HELLO"))?;
+ 
+         tracing::debug!("Received hello from server: {client:?}");
+ 
+@@ -297,7 +320,9 @@
+                         }
+                     }
+ 
+-                    tx.send(message).await.unwrap();
++                    if tx.send(message).await.is_err() {
++                        break;
++                    }
+                 }
+             });
+         }
+diff -ruN a/src/webrtc/webrtc.rs b/src/webrtc/webrtc.rs
+--- a/src/webrtc/webrtc.rs	2026-11-23 16:20:18.883263600 +0530
++++ b/src/webrtc/webrtc.rs	2026-11-23 16:20:18.884488600 +0530
+@@ -1,3 +1,4 @@
++// Modified by Oeca from LocalSend (Apache-2.0): see OECA-VENDOR.txt and OECA-PATCHES.diff.
+ use crate::crypto;
+ use crate::crypto::token::{SigningTokenKey, VerifyingTokenKey};
+ use crate::model::transfer::FileDto;
+@@ -20,6 +21,7 @@
+ use webrtc::data_channel::data_channel_message::DataChannelMessage;
+ use webrtc::data_channel::RTCDataChannel;
+ use webrtc::ice_transport::ice_server::RTCIceServer;
++use webrtc::peer_connection::certificate::RTCCertificate;
+ use webrtc::peer_connection::configuration::RTCConfiguration;
+ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+@@ -178,9 +180,33 @@
+ 
+ const CHANNEL_LABEL: &str = "data";
+ 
++/// oeca: the most an SDP may inflate to.
++const MAX_SDP_BYTES: u64 = 64 * 1024;
++
++/// oeca: the most one chunked control message (file list, token list) may be.
++const MAX_CONTROL_BYTES: usize = 1024 * 1024;
++
++/// oeca: after the receiver closed, how long its queued answers may take to be read.
++const LAST_ANSWERS_TIMEOUT: Duration = Duration::from_millis(250);
++
++/// oeca: the most channels a peer may open in one session. Each one costs
++/// webrtc-rs a task and a 64 KiB read buffer.
++const MAX_CHANNELS: usize = 4;
++
++/// oeca: aborts the task when the session future ends or is dropped: a
++/// detached one kept its buffers and the connection until the process exited.
++struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
++
++impl<T> Drop for AbortOnDrop<T> {
++    fn drop(&mut self) {
++        self.0.abort();
++    }
++}
++
+ pub async fn send_offer(
+     signaling: &ManagedSignalingConnection,
+     stun_servers: Vec<String>,
++    certificate: Option<RTCCertificate>,
+     target_id: Uuid,
+     signing_key: SigningTokenKey,
+     expecting_public_key: Option<Box<dyn VerifyingTokenKey + Send>>,
+@@ -192,8 +218,16 @@
+     pin_tx: mpsc::Sender<oneshot::Sender<String>>,
+     pair_tx: oneshot::Sender<oneshot::Sender<bool>>,
+     mut sending_rx: mpsc::Receiver<RTCFile>,
++    metadata_gate: Option<oneshot::Receiver<bool>>,
++    extension: Option<Extension>,
+ ) -> Result<()> {
+-    let (peer_connection, mut done_rx) = create_peer_connection(stun_servers).await?;
++    let (peer_connection, done_tx, mut done_rx) =
++        create_peer_connection(stun_servers, certificate).await?;
++    let close = CloseOnDrop::new(Arc::clone(&peer_connection));
++    let mut extension = extension.unwrap_or_default();
++    if let Some(tx) = extension.peer_connection.take() {
++        let _ = tx.send(Arc::clone(&peer_connection));
++    }
+ 
+     let data_channel = peer_connection
+         .create_data_channel(
+@@ -207,6 +241,13 @@
+             }),
+         )
+         .await?;
++    close.set_channel(&data_channel);
++    let mut limit = channel_limit(done_tx.clone());
++    peer_connection.on_data_channel(Box::new(move |_| {
++        let refused = limit();
++        Box::pin(refuse_channel(refused))
++    }));
++    end_on_close(&data_channel, done_tx);
+ 
+     let (connected_tx, mut connected_rx) = mpsc::channel::<()>(1);
+     data_channel.on_open(Box::new(move || {
+@@ -216,11 +257,12 @@
+     }));
+ 
+     let mut receive_rx = to_receive_stream(&data_channel, 16);
++    let file_results = extension.file_results.take();
+ 
+-    let send_task = {
++    let mut send_task = {
+         let data_channel = Arc::clone(&data_channel);
+         let status_tx = status_tx.clone();
+-        tokio::spawn(async move {
++        AbortOnDrop(tokio::spawn(async move {
+             connected_rx
+                 .recv()
+                 .await
+@@ -364,6 +406,15 @@
+ 
+             status_tx.send(RTCStatus::Connected).await?;
+ 
++            // oeca: the caller may hold the file list (names, sizes, types)
++            // until it has authenticated this connection: nothing about the
++            // files is sent before the gate opens
++            if let Some(gate) = metadata_gate {
++                if !matches!(gate.await, Ok(true)) {
++                    return Err(anyhow::anyhow!("Not verified: no file metadata was sent"));
++                }
++            }
++
+             {
+                 // send file list message
+                 let file_list_req = serde_json::to_string(&RTCPinSendingResponse::Ok { files })?;
+@@ -397,7 +448,7 @@
+ 
+             // Receive file tokens
+             let file_list_res = {
+-                let bytes = receive_string_from_chunks(&mut receive_rx).await;
++                let bytes = receive_string_from_chunks(&mut receive_rx).await?;
+                 let parsed: RTCFileListResponse = serde_json::from_slice(&*bytes).map_err(|e| {
+                     anyhow::anyhow!("Failed to deserialize file list response: {e}")
+                 })?;
+@@ -438,7 +489,7 @@
+                     }
+ 
+                     let file_list_res = {
+-                        let bytes = receive_string_from_chunks(&mut receive_rx).await;
++                        let bytes = receive_string_from_chunks(&mut receive_rx).await?;
+                         let parsed: RTCFileListResponse =
+                             serde_json::from_slice(&*bytes).map_err(|e| {
+                                 anyhow::anyhow!("Failed to deserialize file list response: {e}")
+@@ -498,7 +549,13 @@
+ 
+             tracing::debug!("Received file tokens. Sending files...");
+ 
++            // oeca: the receiver answers once per file (when it reads the next header)
++            let mut unconfirmed = HashSet::<String>::new();
+             while let Some(message) = sending_rx.recv().await {
++                // oeca: read as they come: unread, they block the channel and hide its close
++                while let Ok(answer) = receive_rx.try_recv() {
++                    take_file_result(answer, &mut unconfirmed, &file_results).await?;
++                }
+                 let file_token = match file_map.get(&message.file_id) {
+                     Some(file_token) => file_token,
+                     None => {
+@@ -550,16 +607,18 @@
+                         .await;
+                     continue;
+                 }
++                unconfirmed.insert(message.file_id);
+             }
+ 
+             wait_buffer_empty(&data_channel).await;
+ 
+             send_delimiter(&data_channel).await?;
+ 
+-            receive_rx.recv().await;
++            // oeca: one answer whatever the count, then closing, lost the last file
++            take_remaining_results(&mut receive_rx, &mut unconfirmed, &file_results).await?;
+ 
+             Ok(())
+-        })
++        }))
+     };
+ 
+     let offer = peer_connection.create_offer(None).await?;
+@@ -577,7 +636,7 @@
+         .send_offer(
+             session_id.clone(),
+             target_id,
+-            encode_sdp(&local_description.sdp),
++            encode_sdp(&with_session_lines(&local_description.sdp, &extension.sdp_lines)),
+         )
+         .await?;
+ 
+@@ -585,11 +644,16 @@
+ 
+     signaling
+         .on_answer(session_id, |message| {
+-            tx_answer.send(message.sdp).unwrap();
++            // oeca: the session may be gone (cancelled): not a panic, which
++            // ended the signaling listener and so the whole connection
++            let _ = tx_answer.send(message.sdp);
+         })
+         .await;
+ 
+     let remote_desc = rx_answer.await?;
++    if let Some(tx) = extension.applied_answer.take() {
++        let _ = tx.send(remote_desc.clone());
++    }
+ 
+     if let Err(e) = status_tx.send(RTCStatus::SdpExchanged).await {
+         peer_connection.close().await?;
+@@ -601,7 +665,7 @@
+     peer_connection.set_remote_description(answer).await?;
+ 
+     tokio::select! {
+-        result = send_task => {
++        result = &mut send_task.0 => {
+             match result {
+                 Ok(Ok(_)) => tracing::debug!("Sending done."),
+                 Ok(Err(result)) => {
+@@ -613,7 +677,11 @@
+                 }
+             }
+         }
+-        _ = done_rx.recv() => {}
++        _ = done_rx.recv() => {
++            // oeca: a receiver closes right after its last answer (or DECLINED),
++            // which can still be queued
++            let _ = tokio::time::timeout(LAST_ANSWERS_TIMEOUT, &mut send_task.0).await;
++        }
+     }
+ 
+     let _ = status_tx.send(RTCStatus::Finished).await;
+@@ -629,6 +697,7 @@
+ pub async fn accept_offer(
+     signaling: &ManagedSignalingConnection,
+     stun_servers: Vec<String>,
++    certificate: Option<RTCCertificate>,
+     offer: &WsServerSdpMessage,
+     signing_key: SigningTokenKey,
+     expecting_public_key: Option<Box<dyn VerifyingTokenKey + Send>>,
+@@ -640,17 +709,37 @@
+     pin_tx: mpsc::Sender<oneshot::Sender<String>>,
+     receiving_tx: mpsc::Sender<RTCFile>,
+     mut user_error_tx: mpsc::Receiver<RTCSendFileResponse>,
++    extension: Option<Extension>,
+ ) -> Result<()> {
+-    let (peer_connection, mut done_rx) = create_peer_connection(stun_servers).await?;
++    let (peer_connection, done_tx, mut done_rx) =
++        create_peer_connection(stun_servers, certificate).await?;
++    let close = CloseOnDrop::new(Arc::clone(&peer_connection));
++    let channel_slot = Arc::clone(&close.1);
++    let mut extension = extension.unwrap_or_default();
++    if let Some(tx) = extension.peer_connection.take() {
++        let _ = tx.send(Arc::clone(&peer_connection));
++    }
++    let other_channels = extension.channels.take();
+ 
+     let (data_channel_tx, mut data_channel_rx) = mpsc::channel::<Arc<RTCDataChannel>>(1);
+ 
++    let mut limit = channel_limit(done_tx.clone());
+     peer_connection.on_data_channel(Box::new(move |d: Arc<RTCDataChannel>| {
++        if limit() {
++            return Box::pin(refuse_channel(true));
++        }
+         if d.label() != CHANNEL_LABEL {
++            // oeca: not LocalSend's channel: the caller's extension may want it
++            if let Some(tx) = &other_channels {
++                let _ = tx.try_send(d);
++            }
+             return Box::pin(async {});
+         }
+ 
+         let data_channel_tx = data_channel_tx.clone();
++        // oeca: closed with the session; its close ends the session
++        *channel_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&d));
++        end_on_close(&d, done_tx.clone());
+         Box::pin(async move {
+             let d_clone = Arc::clone(&d);
+             d.on_open(Box::new(move || {
+@@ -661,9 +750,9 @@
+         })
+     }));
+ 
+-    let receive_task = {
++    let mut receive_task = {
+         let status_tx = status_tx.clone();
+-        tokio::spawn(async move {
++        AbortOnDrop(tokio::spawn(async move {
+             let Some(data_channel) = data_channel_rx.recv().await else {
+                 return Err::<(), anyhow::Error>(anyhow::anyhow!("Data channel not found"));
+             };
+@@ -773,7 +862,7 @@
+             tracing::debug!("Waiting for sender PIN status...");
+ 
+             let pin_response = {
+-                let bytes = receive_string_from_chunks(&mut receive_rx).await;
++                let bytes = receive_string_from_chunks(&mut receive_rx).await?;
+                 let parsed: RTCPinSendingResponse =
+                     serde_json::from_slice(&*bytes).map_err(|e| {
+                         anyhow::anyhow!("Failed to deserialize file list response: {e}")
+@@ -853,6 +942,13 @@
+ 
+                 send_delimiter(&data_channel).await?;
+ 
++                // oeca: let DECLINED leave before the connection closes (as the
++                // end of a transfer does), or the sender may never get it
++                let _ = tokio::time::timeout(Duration::from_secs(5), async {
++                    wait_buffer_empty(&data_channel).await;
++                })
++                .await;
++
+                 return Ok(());
+             };
+ 
+@@ -1015,7 +1111,7 @@
+             }
+ 
+             Ok(())
+-        })
++        }))
+     };
+ 
+     let remote_desc_sdp = decode_sdp(&offer.sdp)?;
+@@ -1037,7 +1133,7 @@
+         .send_answer(
+             offer.session_id.clone(),
+             offer.peer.id,
+-            encode_sdp(&local_description.sdp),
++            encode_sdp(&with_session_lines(&local_description.sdp, &extension.sdp_lines)),
+         )
+         .await?;
+ 
+@@ -1047,7 +1143,7 @@
+     }
+ 
+     tokio::select! {
+-        result = receive_task => {
++        result = &mut receive_task.0 => {
+             match result {
+                 Ok(Ok(_)) => tracing::debug!("Receiving done."),
+                 Ok(Err(result)) => {
+@@ -1070,31 +1166,192 @@
+     Ok(())
+ }
+ 
++/// oeca: closes the peer connection however the session future ends,
++/// including when the caller drops it (cancel, timeout, shutdown), so its
++/// ICE / DTLS / SCTP tasks and sockets do not outlive the session. The data
++/// channel is closed first: its SCTP stream reset reaches the other side at
++/// once (it ends its session, `end_on_close`), instead of after ICE times out.
++struct CloseOnDrop(
++    Arc<RTCPeerConnection>,
++    Arc<std::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
++);
++
++impl CloseOnDrop {
++    fn new(pc: Arc<RTCPeerConnection>) -> Self {
++        Self(pc, Arc::new(std::sync::Mutex::new(None)))
++    }
++
++    fn set_channel(&self, channel: &Arc<RTCDataChannel>) {
++        *self.1.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(channel));
++    }
++}
++
++impl Drop for CloseOnDrop {
++    fn drop(&mut self) {
++        let pc = Arc::clone(&self.0);
++        let channel = self.1.lock().unwrap_or_else(|e| e.into_inner()).take();
++        if let Ok(rt) = tokio::runtime::Handle::try_current() {
++            rt.spawn(async move {
++                let _ = tokio::time::timeout(Duration::from_secs(5), async {
++                    if let Some(channel) = channel {
++                        let _ = channel.close().await;
++                    }
++                    let _ = pc.close().await;
++                })
++                .await;
++            });
++        }
++    }
++}
++
++/// oeca: what an app-level extension of a session needs, without touching
++/// LocalSend's own messages: SDP lines added to the description this side
++/// signals (peers that do not know them ignore them), the session's peer
++/// connection (to open a channel of its own), and the data channels other
++/// than LocalSend's "data" that the peer opens (ignored otherwise).
++#[derive(Default)]
++pub struct Extension {
++    /// Session-level lines, e.g. "a=x-example:1"; added before the first m= line.
++    pub sdp_lines: Vec<String>,
++    pub peer_connection: Option<oneshot::Sender<Arc<RTCPeerConnection>>>,
++    pub channels: Option<mpsc::Sender<Arc<RTCDataChannel>>>,
++    /// Offer side: the answer this session applies (matched by session id), as
++    /// signaled. Authenticate this one: other ANSWER messages can claim anything.
++    pub applied_answer: Option<oneshot::Sender<String>>,
++    /// Offer side: what the receiver answered for each file sent. Only these
++    /// say that a file was saved.
++    pub file_results: Option<mpsc::Sender<RTCSendFileResponse>>,
++}
++
++fn with_session_lines(sdp: &str, lines: &[String]) -> String {
++    if lines.is_empty() {
++        return sdp.to_string();
++    }
++    let added: String = lines.iter().map(|l| format!("{l}\r\n")).collect();
++    match sdp.find("\nm=") {
++        Some(i) => format!("{}{}{}", &sdp[..i + 1], added, &sdp[i + 1..]),
++        None => format!("{sdp}{added}"),
++    }
++}
++
++/// oeca: the receiver's answer about one file this session sent.
++async fn take_file_result(
++    answer: DataChannelMessage,
++    unconfirmed: &mut HashSet<String>,
++    file_results: &Option<mpsc::Sender<RTCSendFileResponse>>,
++) -> Result<()> {
++    if !answer.is_string {
++        return Err(anyhow::anyhow!("Expected a file confirmation"));
++    }
++    let response: RTCSendFileResponse = serde_json::from_slice(&answer.data)?;
++    if !unconfirmed.remove(&response.id) {
++        return Err(anyhow::anyhow!("Confirmation of a file that was not sent"));
++    }
++    if let Some(tx) = file_results {
++        let _ = tx.send(response).await;
++    }
++    Ok(())
++}
++
++/// oeca: an answer for every file still unconfirmed. A close first is a failure;
++/// answers already queued are read before the close is seen.
++async fn take_remaining_results(
++    receive_rx: &mut mpsc::Receiver<DataChannelMessage>,
++    unconfirmed: &mut HashSet<String>,
++    file_results: &Option<mpsc::Sender<RTCSendFileResponse>>,
++) -> Result<()> {
++    while !unconfirmed.is_empty() {
++        let answer = receive_rx
++            .recv()
++            .await
++            .ok_or_else(|| anyhow::anyhow!("Closed before confirming every file"))?;
++        take_file_result(answer, unconfirmed, file_results).await?;
++    }
++    Ok(())
++}
++
++/// oeca: counts the channels a peer opens; true (and the session ends) once
++/// there are too many.
++fn channel_limit(done_tx: mpsc::Sender<()>) -> impl FnMut() -> bool + Send + Sync {
++    let mut opened = 0usize;
++    move || {
++        opened = opened.saturating_add(1);
++        let refused = opened > MAX_CHANNELS;
++        if refused {
++            let _ = done_tx.try_send(());
++        }
++        refused
++    }
++}
++
++/// oeca: webrtc-rs accepts no further channel until this returns, so a flood
++/// cannot allocate while the session closes.
++async fn refuse_channel(refused: bool) {
++    if refused {
++        tokio::time::sleep(Duration::from_secs(1)).await;
++    }
++}
++
++/// oeca: the other side closed the data channel (it cancelled, or it is
++/// done): end this session now, as a lost connection would.
++fn end_on_close(channel: &Arc<RTCDataChannel>, done_tx: mpsc::Sender<()>) {
++    channel.on_close(Box::new(move || {
++        let _ = done_tx.try_send(());
++        Box::pin(async {})
++    }));
++}
++
++/// oeca: which local addresses may be offered to a peer as ICE host
++/// candidates (every one when unset). The embedding app decides, e.g. to keep
++/// virtual adapters and VPN addresses out of what peers see.
++pub type IpFilter = Arc<dyn Fn(std::net::IpAddr) -> bool + Send + Sync>;
++
++static IP_FILTER: std::sync::RwLock<Option<IpFilter>> = std::sync::RwLock::new(None);
++
++/// Applies to every peer connection made afterwards.
++pub fn set_ip_filter(filter: Option<IpFilter>) {
++    *IP_FILTER.write().unwrap_or_else(|e| e.into_inner()) = filter;
++}
++
+ async fn create_peer_connection(
+     stun: Vec<String>,
+-) -> Result<(Arc<RTCPeerConnection>, mpsc::Receiver<()>)> {
+-    let api = APIBuilder::new().build();
++    certificate: Option<RTCCertificate>,
++) -> Result<(Arc<RTCPeerConnection>, mpsc::Sender<()>, mpsc::Receiver<()>)> {
++    let mut setting = webrtc::api::setting_engine::SettingEngine::default();
++    if let Some(filter) = IP_FILTER.read().unwrap_or_else(|e| e.into_inner()).clone() {
++        setting.set_ip_filter(Box::new(move |ip| filter(ip)));
++    }
++    let api = APIBuilder::new().with_setting_engine(setting).build();
+ 
++    // oeca: a persistent DTLS certificate gives the peer a stable fingerprint
+     let config = RTCConfiguration {
+         ice_servers: vec![RTCIceServer {
+             urls: stun,
+             ..Default::default()
+         }],
++        certificates: certificate.into_iter().collect(),
+         ..Default::default()
+     };
+ 
+     let peer_connection = api.new_peer_connection(config).await?;
+ 
+     let (done_tx, done_rx) = mpsc::channel::<()>(1);
++    let channel_done_tx = done_tx.clone();
+ 
+     peer_connection.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
+-        if s == RTCPeerConnectionState::Disconnected {
++        // oeca: Failed and Closed end the session too (before: only Disconnected)
++        if matches!(
++            s,
++            RTCPeerConnectionState::Disconnected
++                | RTCPeerConnectionState::Failed
++                | RTCPeerConnectionState::Closed
++        ) {
+             let _ = done_tx.try_send(());
+         }
+         Box::pin(async {})
+     }));
+ 
+-    Ok((Arc::new(peer_connection), done_rx))
++    Ok((Arc::new(peer_connection), channel_done_tx, done_rx))
+ }
+ 
+ async fn receive_nonce(receive_rx: &mut mpsc::Receiver<DataChannelMessage>) -> Result<Vec<u8>> {
+@@ -1154,7 +1411,7 @@
+             .await?;
+ 
+         let bytes = match receive_in_chunks {
+-            true => receive_string_from_chunks(receive_rx).await,
++            true => receive_string_from_chunks(receive_rx).await?,
+             false => {
+                 let Some(init_status) = receive_rx.recv().await else {
+                     return Err(anyhow::anyhow!("Failed to receive initial message"));
+@@ -1262,10 +1519,14 @@
+ fn decode_sdp(s: &str) -> Result<String> {
+     let decoded_data =
+         base64::decode(s).map_err(|e| anyhow::anyhow!("Base64 decode of SDP failed: {e}"))?;
+-    let mut d = ZlibDecoder::new(&*decoded_data);
++    // oeca: bounded (the SDP is untrusted; zlib expands about 1000x)
++    let mut d = ZlibDecoder::new(&*decoded_data).take(MAX_SDP_BYTES + 1);
+     let mut result = String::new();
+     d.read_to_string(&mut result)
+         .map_err(|e| anyhow::anyhow!("Failed to decompress SDP: {e}"))?;
++    if result.len() as u64 > MAX_SDP_BYTES {
++        return Err(anyhow::anyhow!("SDP too large"));
++    }
+     Ok(result)
+ }
+ 
+@@ -1340,17 +1601,23 @@
+     process_in_chunks(data_channel, rx, callback).await
+ }
+ 
+-async fn receive_string_from_chunks(receive_rx: &mut mpsc::Receiver<DataChannelMessage>) -> Bytes {
++async fn receive_string_from_chunks(
++    receive_rx: &mut mpsc::Receiver<DataChannelMessage>,
++) -> Result<Bytes> {
+     let mut buffer = BytesMut::new();
+     while let Some(msg) = receive_rx.recv().await {
+         if msg.is_string {
+             break;
+         }
+ 
++        // oeca: the sender may be nobody we trust, and may never send the delimiter
++        if buffer.len() + msg.data.len() > MAX_CONTROL_BYTES {
++            return Err(anyhow::anyhow!("Control message too large"));
++        }
+         buffer.extend_from_slice(&msg.data);
+     }
+ 
+-    buffer.freeze()
++    Ok(buffer.freeze())
+ }
+ 
+ fn to_receive_stream(
+@@ -1405,6 +1672,84 @@
+         assert_eq!(chunks[2].iter().all(|x| *x == 2), true);
+     }
+ 
++    // oeca: the sender's reading of the receiver's per-file answers
++
++    fn answer(text: &str) -> DataChannelMessage {
++        DataChannelMessage {
++            is_string: true,
++            data: Bytes::from(text.to_string()),
++        }
++    }
++
++    fn saved(id: &str, success: bool) -> DataChannelMessage {
++        answer(&format!(r#"{{"id":"{id}","success":{success}}}"#))
++    }
++
++    /// Feeds `answers`, then closes (dropping the sender) unless `open`.
++    async fn read(sent: &[&str], answers: Vec<DataChannelMessage>, open: bool) -> (Result<()>, Vec<(String, bool)>, HashSet<String>) {
++        let (tx, mut rx) = mpsc::channel(16);
++        for a in answers {
++            tx.send(a).await.unwrap();
++        }
++        let _kept = open.then_some(tx);
++        let mut unconfirmed: HashSet<String> = sent.iter().map(|s| s.to_string()).collect();
++        let (results_tx, mut results) = mpsc::channel(16);
++        let results_tx = Some(results_tx);
++        // Bounded: a reading that waits for an answer never coming fails here
++        let reading = take_remaining_results(&mut rx, &mut unconfirmed, &results_tx);
++        let r = tokio::time::timeout(Duration::from_secs(5), reading)
++            .await
++            .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out")));
++        drop(results_tx);
++        let mut got = Vec::new();
++        while let Some(result) = results.recv().await {
++            got.push((result.id, result.success));
++        }
++        (r, got, unconfirmed)
++    }
++
++    #[tokio::test]
++    async fn every_sent_file_gets_its_own_answer() {
++        let answers = vec![saved("1", true), saved("0", false), saved("2", true)];
++        let (r, got, left) = read(&["0", "1", "2"], answers, true).await;
++        assert!(r.is_ok());
++        assert!(left.is_empty());
++        let want = [("1", true), ("0", false), ("2", true)].map(|(id, ok)| (id.to_string(), ok));
++        assert_eq!(got, want, "each answer passed on, a failure as a failure");
++    }
++
++    #[tokio::test]
++    async fn a_missing_answer_is_a_failure() {
++        let (r, got, left) = read(&["0", "1"], vec![saved("0", true)], false).await;
++        assert!(r.is_err());
++        assert_eq!(got, [("0".to_string(), true)]);
++        assert_eq!(left, HashSet::from(["1".to_string()]));
++    }
++
++    #[tokio::test]
++    async fn the_last_answer_before_the_close_counts() {
++        // Queued, then the receiver closes at once: read, not lost
++        let (r, got, _) = read(&["0"], vec![saved("0", true)], false).await;
++        assert!(r.is_ok());
++        assert_eq!(got, [("0".to_string(), true)]);
++    }
++
++    #[tokio::test]
++    async fn duplicate_unexpected_and_malformed_answers_fail() {
++        for (what, answers) in [
++            ("duplicate", vec![saved("0", true), saved("0", true)]),
++            ("unexpected", vec![saved("7", true)]),
++            ("binary", vec![DataChannelMessage { is_string: false, data: Bytes::from_static(b"{}") }]),
++            ("not json", vec![answer("saved")]),
++            ("no success", vec![answer(r#"{"id":"0"}"#)]),
++            ("success not a bool", vec![answer(r#"{"id":"0","success":"true"}"#)]),
++        ] {
++            let (r, got, _) = read(&["0", "1"], answers, true).await;
++            assert!(r.is_err(), "{what}");
++            assert!(got.len() <= 1 && got.iter().all(|(id, _)| id == "0"), "{what}: {got:?}");
++        }
++    }
++
+     #[test]
+     fn rtc_file_list_response_encoding() {
+         let response = RTCFileListResponse::Pair {
+@@ -1425,4 +1770,30 @@
+ 
+         assert_eq!(response, decoded);
+     }
++
++    /// The SDP's host candidates after gathering, under the filter set now.
++    async fn host_candidates() -> usize {
++        let (pc, _, _) = create_peer_connection(vec![], None).await.unwrap();
++        pc.create_data_channel("probe", None).await.unwrap();
++        let offer = pc.create_offer(None).await.unwrap();
++        let mut gathered = pc.gathering_complete_promise().await;
++        pc.set_local_description(offer).await.unwrap();
++        let _ = gathered.recv().await;
++        let sdp = pc.local_description().await.unwrap().sdp;
++        pc.close().await.unwrap();
++        sdp.matches("typ host").count()
++    }
++
++    #[tokio::test]
++    async fn the_ip_filter_decides_which_host_candidates_are_offered() {
++        set_ip_filter(Some(Arc::new(|_| false)));
++        let none = host_candidates().await;
++        set_ip_filter(Some(Arc::new(|ip: std::net::IpAddr| ip.is_loopback())));
++        let loopback_only = host_candidates().await;
++        set_ip_filter(None);
++        let all = host_candidates().await;
++        assert_eq!(none, 0, "everything filtered: no host candidate");
++        assert!(loopback_only <= all, "{loopback_only} of {all}");
++        assert!(all > 0, "unset: the default (every address)");
++    }
+ }

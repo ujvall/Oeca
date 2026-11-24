@@ -26,12 +26,16 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Devices::HumanInterfaceDevice::{
+    HIDP_STATUS_SUCCESS, HidP_GetUsages, HidP_Input, PHIDP_PREPARSED_DATA,
+};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, PROPERTYKEY, RECT, WPARAM};
 use windows::Win32::Media::Audio::Endpoints::{
     IAudioEndpointVolume, IAudioEndpointVolumeCallback, IAudioEndpointVolumeCallback_Impl,
 };
 use windows::Win32::Media::Audio::{
-    AUDIO_VOLUME_NOTIFICATION_DATA, IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender,
+    AUDIO_VOLUME_NOTIFICATION_DATA, DEVICE_STATE, EDataFlow, ERole, IMMDeviceEnumerator,
+    IMMNotificationClient, IMMNotificationClient_Impl, MMDeviceEnumerator, eConsole, eRender,
 };
 use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
@@ -47,12 +51,17 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_KEYUP, RegisterHotKey, SendInput, UnregisterHotKey, VIRTUAL_KEY, VK_VOLUME_DOWN,
     VK_VOLUME_MUTE, VK_VOLUME_UP,
 };
+use windows::Win32::UI::Input::{
+    GetRawInputData, GetRawInputDeviceInfoW, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
+    RID_INPUT, RIDEV_INPUTSINK, RIDEV_REMOVE, RIDI_PREPARSEDDATA, RIM_TYPEHID,
+    RegisterRawInputDevices,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     DEVICE_NOTIFY_WINDOW_HANDLE, EVENT_OBJECT_SHOW, GetClassNameW, GetShellWindow, GetWindowRect,
     GetWindowThreadProcessId, OBJID_WINDOW, PostMessageW, SW_HIDE, SW_SHOWNA, SetTimer, ShowWindow,
     WINEVENT_OUTOFCONTEXT,
 };
-use windows::core::{GUID, Result, implement};
+use windows::core::{GUID, PCWSTR, Result, implement};
 
 use crate::config::{
     BASE_HUD_EXTRA_WIDTH, BASE_HUD_STRETCH_WIDTH, COLLAPSE_SPRING, HUD_DIGIT_SPRING,
@@ -676,7 +685,7 @@ impl VolumeKey {
         }
     }
 
-    fn vk(self) -> VIRTUAL_KEY {
+    pub fn vk(self) -> VIRTUAL_KEY {
         match self {
             Self::Up => VK_VOLUME_UP,
             Self::Down => VK_VOLUME_DOWN,
@@ -685,19 +694,26 @@ impl VolumeKey {
     }
 }
 
+/// Takes `keys` for `hwnd` under `mods`, taking one already ours again (so a
+/// key lost meanwhile is won back too, and nothing is registered twice).
+/// Returns how many another app holds.
+fn register_keys(hwnd: HWND, keys: &[VIRTUAL_KEY], mods: HOT_KEY_MODIFIERS) -> usize {
+    keys.iter()
+        .filter(|vk| unsafe {
+            let _ = UnregisterHotKey(Some(hwnd), i32::from(vk.0));
+            RegisterHotKey(Some(hwnd), i32::from(vk.0), mods, u32::from(vk.0)).is_err()
+        })
+        .count()
+}
+
 /// Takes the volume keys (unmodified only: with Shift, Ctrl... they stay
-/// Windows'). A key another app holds is left to it.
-pub fn take_volume_keys(hwnd: HWND) {
-    for vk in VOLUME_KEYS {
-        unsafe {
-            let _ = RegisterHotKey(
-                Some(hwnd),
-                i32::from(vk.0),
-                HOT_KEY_MODIFIERS(0),
-                u32::from(vk.0),
-            );
-        }
+/// Windows'). A key another app holds is left to it (counted in the result;
+/// it is tried again at the next audio device change).
+pub fn take_volume_keys(hwnd: HWND) -> usize {
+    if crate::data_dir::ISOLATED {
+        return 0; // the keys stay Windows' and the real Oeca's
     }
+    register_keys(hwnd, &VOLUME_KEYS, HOT_KEY_MODIFIERS(0))
 }
 
 /// Hands the volume keys back to Windows (no-op for keys not taken).
@@ -706,6 +722,169 @@ pub fn release_volume_keys(hwnd: HWND) {
         unsafe {
             let _ = UnregisterHotKey(Some(hwnd), i32::from(vk.0));
         }
+    }
+}
+
+/// HID consumer-control usages (usage page 0x0C) of the volume buttons.
+const CONSUMER_PAGE: u16 = 0x0C;
+
+fn volume_usage(usage: u16) -> Option<VolumeKey> {
+    match usage {
+        0xE9 => Some(VolumeKey::Up),
+        0xEA => Some(VolumeKey::Down),
+        0xE2 => Some(VolumeKey::Mute),
+        _ => None,
+    }
+}
+
+/// When (tick count) a consumer-control volume report last arrived.
+static RAW_VOLUME_AT: AtomicU64 = AtomicU64::new(NEVER);
+/// A headset's volume button and Windows' flyout for it arrive this close.
+const RAW_VOLUME_FLYOUT_MS: u64 = 400;
+
+/// The flyout shown at `flyout` is a headset volume button's.
+fn is_volume_flyout(flyout: u64) -> bool {
+    let raw = RAW_VOLUME_AT.load(Ordering::Relaxed);
+    raw != NEVER && flyout != NEVER && flyout.abs_diff(raw) <= RAW_VOLUME_FLYOUT_MS
+}
+
+/// Registers (`on`) or removes the Raw Input sink for consumer-control HID
+/// reports (media / volume buttons of keyboards and headsets), delivered to
+/// `hwnd` as `WM_INPUT` in any app's foreground. Read-only: the input still
+/// reaches Windows and everyone else unchanged.
+pub fn watch_consumer_keys(hwnd: HWND, on: bool) -> bool {
+    if crate::data_dir::ISOLATED {
+        return false;
+    }
+    let device = RAWINPUTDEVICE {
+        usUsagePage: CONSUMER_PAGE,
+        usUsage: 0x01, // consumer control
+        dwFlags: if on { RIDEV_INPUTSINK } else { RIDEV_REMOVE },
+        hwndTarget: if on { hwnd } else { HWND::default() },
+    };
+    unsafe {
+        RegisterRawInputDevices(&[device], std::mem::size_of::<RAWINPUTDEVICE>() as u32).is_ok()
+    }
+}
+
+/// The volume button a consumer-control `WM_INPUT` reports pressed (a report
+/// with a volume usage down; the release is an empty report), if any. The
+/// usages come from the device's own report descriptor, so any layout works
+/// (a keyboard's usage code, a headset's button bits).
+///
+/// # Safety
+/// `lparam` is the `WM_INPUT` one, handled before returning from it.
+pub unsafe fn raw_volume_key(lparam: LPARAM) -> Option<VolumeKey> {
+    let handle = HRAWINPUT(lparam.0 as *mut _);
+    let header = std::mem::size_of::<RAWINPUTHEADER>() as u32;
+    let mut size = 0;
+    unsafe { GetRawInputData(handle, RID_INPUT, None, &mut size, header) };
+    // 8-aligned, as RAWINPUT is
+    let mut buffer = vec![0u64; (size as usize).div_ceil(8)];
+    let read = unsafe {
+        GetRawInputData(
+            handle,
+            RID_INPUT,
+            Some(buffer.as_mut_ptr().cast()),
+            &mut size,
+            header,
+        )
+    };
+    if size == 0 || read == u32::MAX {
+        return None;
+    }
+    let raw = unsafe { &*buffer.as_ptr().cast::<RAWINPUT>() };
+    if raw.header.dwType != RIM_TYPEHID.0 {
+        return None;
+    }
+    let mut needed = 0;
+    unsafe {
+        GetRawInputDeviceInfoW(
+            Some(raw.header.hDevice),
+            RIDI_PREPARSEDDATA,
+            None,
+            &mut needed,
+        )
+    };
+    let mut preparsed = vec![0u64; (needed as usize).div_ceil(8)];
+    let read = unsafe {
+        GetRawInputDeviceInfoW(
+            Some(raw.header.hDevice),
+            RIDI_PREPARSEDDATA,
+            Some(preparsed.as_mut_ptr().cast()),
+            &mut needed,
+        )
+    };
+    if needed == 0 || read == u32::MAX {
+        return None;
+    }
+    let hid = unsafe { &raw.data.hid };
+    let report_len = hid.dwSizeHid as usize;
+    (0..hid.dwCount as usize)
+        .filter(|_| report_len > 0)
+        .find_map(|i| {
+            let mut report = unsafe {
+                std::slice::from_raw_parts(hid.bRawData.as_ptr().add(i * report_len), report_len)
+            }
+            .to_vec();
+            let mut usages = [0u16; 16];
+            let mut count = usages.len() as u32;
+            let status = unsafe {
+                HidP_GetUsages(
+                    HidP_Input,
+                    CONSUMER_PAGE,
+                    Some(0),
+                    usages.as_mut_ptr(),
+                    &mut count,
+                    PHIDP_PREPARSED_DATA(preparsed.as_mut_ptr() as isize),
+                    &mut report,
+                )
+            };
+            (status == HIDP_STATUS_SUCCESS)
+                .then(|| {
+                    usages[..count as usize]
+                        .iter()
+                        .find_map(|&u| volume_usage(u))
+                })
+                .flatten()
+        })
+        .inspect(|_| RAW_VOLUME_AT.store(unsafe { GetTickCount64() }, Ordering::Relaxed))
+}
+
+/// Windows applies a headset's volume buttons itself (no key reaches Oeca's
+/// hotkeys); a keyboard's arrive as the hotkey too, which Oeca applies. A
+/// report with no hotkey beside it is the headset's: the HUD shows, the step
+/// is not repeated.
+const HEADSET_PAIR_MS: u64 = 50;
+
+#[derive(Default)]
+pub struct HeadsetKeys {
+    pending: Option<VolumeKey>,
+    hotkey_at: Option<u64>,
+}
+
+impl HeadsetKeys {
+    /// A volume report at `now` (ms): true if it may be a headset's, to be
+    /// settled `HEADSET_PAIR_MS` later (`due`).
+    pub fn report(&mut self, key: VolumeKey, now: u64) -> bool {
+        let keyboard = self
+            .hotkey_at
+            .is_some_and(|at| now.saturating_sub(at) <= HEADSET_PAIR_MS);
+        if !keyboard {
+            self.pending = Some(key);
+        }
+        !keyboard
+    }
+
+    /// A volume hotkey at `now`: the keyboard's, with any report beside it.
+    pub fn hotkey(&mut self, now: u64) {
+        self.hotkey_at = Some(now);
+        self.pending = None;
+    }
+
+    /// The headset press left after the wait, once.
+    pub fn due(&mut self) -> Option<VolumeKey> {
+        self.pending.take()
     }
 }
 
@@ -745,6 +924,9 @@ fn is_brightness_flyout(change: u64, flyout: u64, level: u32) -> bool {
 /// The brightness setting's registration (the same message window as the
 /// savers; each is told the current level at once, then on every change).
 pub fn watch_brightness(hwnd: HWND) -> Option<HPOWERNOTIFY> {
+    if crate::data_dir::ISOLATED {
+        return None;
+    }
     unsafe {
         RegisterPowerSettingNotification(
             HANDLE(hwnd.0),
@@ -821,6 +1003,9 @@ fn is_flyout_shape(width: i32, height: i32) -> bool {
 /// None without a shell (Explorer not running): the hook is made again when
 /// Explorer announces itself.
 pub fn hide_native_flyout(hwnd: HWND, message: u32) -> Option<HWINEVENTHOOK> {
+    if crate::data_dir::ISOLATED {
+        return None; // Windows' flyouts are the desktop's
+    }
     OECA_WINDOW.store(hwnd.0 as isize, Ordering::Relaxed);
     BRIGHTNESS_MESSAGE.store(message, Ordering::Relaxed);
     let mut explorer = 0;
@@ -875,6 +1060,11 @@ unsafe extern "system" fn flyout_shown(
     let now = unsafe { GetTickCount64() };
     FLYOUT_AT.store(now, Ordering::Relaxed);
     FLYOUT_WINDOW.store(hwnd.0 as isize, Ordering::Relaxed);
+    // A headset's volume button: Windows' flyout for it stays hidden (the
+    // notch shows the volume), and is not brightness's
+    if is_volume_flyout(now) {
+        return;
+    }
     let oeca = HWND(OECA_WINDOW.load(Ordering::Relaxed) as *mut _);
     let level = BRIGHTNESS_LEVEL.load(Ordering::Relaxed);
     if is_brightness_flyout(CHANGE_AT.load(Ordering::Relaxed), now, level) {
@@ -895,6 +1085,10 @@ unsafe extern "system" fn flyout_shown(
 /// The flyout hidden was not brightness's (see `is_brightness_flyout`): shown
 /// again.
 pub fn restore_unpaired_flyout() {
+    // The volume report may have come after the flyout
+    if is_volume_flyout(FLYOUT_AT.load(Ordering::Relaxed)) {
+        return;
+    }
     if is_brightness_flyout(
         CHANGE_AT.load(Ordering::Relaxed),
         FLYOUT_AT.load(Ordering::Relaxed),
@@ -910,9 +1104,17 @@ pub fn restore_unpaired_flyout() {
     }
 }
 
+/// A press Oeca could not handle goes to Windows, flyout included.
+pub fn volume_given_back() {
+    RAW_VOLUME_AT.store(NEVER, Ordering::Relaxed);
+}
+
 /// Gives Windows a press Oeca could not handle (after `release_volume_keys`,
 /// so it reaches Windows' own handling).
 pub fn replay(key: VolumeKey) {
+    if crate::data_dir::ISOLATED {
+        return; // never types into the desktop
+    }
     let input = |flags: KEYBD_EVENT_FLAGS| INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
@@ -938,6 +1140,10 @@ const OECA_CHANGE: GUID = GUID::from_u128(0x5e2c_7a41_93d8_4f0b_8a6e_1c4b_d27f_0
 const MAX_QUEUED_KEYS: usize = 32;
 
 fn default_endpoint() -> Result<IAudioEndpointVolume> {
+    // The user's real volume: neither read, followed nor changed by a test build
+    if crate::data_dir::ISOLATED {
+        return Err(windows::Win32::Foundation::E_ACCESSDENIED.into());
+    }
     unsafe {
         let devices: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
         devices
@@ -1064,6 +1270,94 @@ unsafe extern "system" fn volume_work(_: PTP_CALLBACK_INSTANCE, context: *mut co
     shared.run(None);
     if com {
         unsafe { CoUninitialize() };
+    }
+}
+
+/// Tells the notch the audio output devices changed (default switched,
+/// plugged / unplugged, Bluetooth (dis)connected): a burst posts one message
+/// until the notch has read it (`DeviceWatch::seen`).
+#[implement(IMMNotificationClient)]
+struct DevicesChanged {
+    hwnd: isize,
+    msg: u32,
+    pending: Arc<AtomicBool>,
+}
+
+impl DevicesChanged {
+    fn post(&self) -> Result<()> {
+        if !self.pending.swap(true, Ordering::AcqRel) {
+            let hwnd = HWND(self.hwnd as *mut _);
+            if unsafe { PostMessageW(Some(hwnd), self.msg, WPARAM(0), LPARAM(0)) }.is_err() {
+                self.pending.store(false, Ordering::Release);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl IMMNotificationClient_Impl for DevicesChanged_Impl {
+    fn OnDeviceStateChanged(&self, _: &PCWSTR, _: DEVICE_STATE) -> Result<()> {
+        self.post()
+    }
+    fn OnDeviceAdded(&self, _: &PCWSTR) -> Result<()> {
+        self.post()
+    }
+    fn OnDeviceRemoved(&self, _: &PCWSTR) -> Result<()> {
+        self.post()
+    }
+    fn OnDefaultDeviceChanged(&self, flow: EDataFlow, role: ERole, _: &PCWSTR) -> Result<()> {
+        if flow == eRender && role == eConsole {
+            return self.post();
+        }
+        Ok(())
+    }
+    fn OnPropertyValueChanged(&self, _: &PCWSTR, _: &PROPERTYKEY) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The audio output devices' change registration (event-driven, no polling).
+pub struct DeviceWatch {
+    enumerator: IMMDeviceEnumerator,
+    client: IMMNotificationClient,
+    pending: Arc<AtomicBool>,
+}
+
+impl DeviceWatch {
+    pub fn start(hwnd: HWND, msg: u32) -> Result<Self> {
+        if crate::data_dir::ISOLATED {
+            return Err(windows::Win32::Foundation::E_ACCESSDENIED.into());
+        }
+        let pending = Arc::new(AtomicBool::new(false));
+        let client: IMMNotificationClient = DevicesChanged {
+            hwnd: hwnd.0 as isize,
+            msg,
+            pending: pending.clone(),
+        }
+        .into();
+        let enumerator: IMMDeviceEnumerator =
+            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
+        unsafe { enumerator.RegisterEndpointNotificationCallback(&client)? };
+        Ok(Self {
+            enumerator,
+            client,
+            pending,
+        })
+    }
+
+    /// The notch is handling the change: a later one posts again.
+    pub fn seen(&self) {
+        self.pending.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for DeviceWatch {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self
+                .enumerator
+                .UnregisterEndpointNotificationCallback(&self.client);
+        }
     }
 }
 
@@ -1412,6 +1706,135 @@ mod tests {
         data.guidEventContext = OECA_CHANGE;
         unsafe { callback.OnNotify(&mut data).unwrap() };
         assert_eq!(count(), 0, "Oeca's own steps are not echoed");
+    }
+
+    #[test]
+    fn test_device_changes_post_one_message_until_seen() {
+        use windows::Win32::Media::Audio::{eCapture, eCommunications};
+        use windows::Win32::UI::WindowsAndMessaging::{MSG, PM_REMOVE, PeekMessageW};
+        const MSG_ID: u32 = 0x8000 + 0x3F1;
+        let count = || {
+            let mut n = 0;
+            let mut m = MSG::default();
+            while unsafe { PeekMessageW(&mut m, None, MSG_ID, MSG_ID, PM_REMOVE) }.as_bool() {
+                n += 1;
+            }
+            n
+        };
+        let pending = Arc::new(AtomicBool::new(false));
+        let client: IMMNotificationClient = DevicesChanged {
+            hwnd: 0,
+            msg: MSG_ID,
+            pending: pending.clone(),
+        }
+        .into();
+        let id = windows::core::w!("device");
+        unsafe {
+            // Not the output the system plays on: ignored
+            client
+                .OnDefaultDeviceChanged(eCapture, eConsole, id)
+                .unwrap();
+            client
+                .OnDefaultDeviceChanged(eRender, eCommunications, id)
+                .unwrap();
+            assert_eq!(count(), 0);
+            // Default switched, a plug and a Bluetooth reconnect in a burst: one
+            client
+                .OnDefaultDeviceChanged(eRender, eConsole, id)
+                .unwrap();
+            client.OnDeviceRemoved(id).unwrap();
+            client.OnDeviceAdded(id).unwrap();
+            client.OnDeviceStateChanged(id, DEVICE_STATE(1)).unwrap();
+            assert_eq!(count(), 1, "a burst posts once");
+            pending.store(false, Ordering::Release); // the notch handled it
+            client.OnDeviceRemoved(id).unwrap();
+            assert_eq!(count(), 1, "the next change posts again");
+        }
+    }
+
+    #[test]
+    #[ignore = "takes real global hotkeys on the desktop"]
+    fn test_hotkey_registration_failure_is_counted_and_recovers() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            MOD_ALT, MOD_CONTROL, MOD_SHIFT, VK_F23, VK_F24,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, HWND_MESSAGE, WINDOW_EX_STYLE, WS_OVERLAPPED,
+        };
+        use windows::core::w;
+        // An odd chord, so the user's own keys are never touched
+        let mods = MOD_ALT | MOD_CONTROL | MOD_SHIFT;
+        let keys = [VK_F23, VK_F24];
+        let window = || unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                None,
+                WS_OVERLAPPED,
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let (a, b) = (window(), window());
+        assert_eq!(register_keys(a, &keys, mods), 0);
+        assert_eq!(register_keys(a, &keys, mods), 0, "again is not a failure");
+        assert_eq!(register_keys(b, &keys, mods), 2, "held by another: counted");
+        unsafe {
+            let _ = UnregisterHotKey(Some(a), i32::from(VK_F23.0));
+        }
+        assert_eq!(register_keys(b, &keys, mods), 1, "a freed key is won");
+        for k in keys {
+            unsafe {
+                let _ = UnregisterHotKey(Some(a), i32::from(k.0));
+                let _ = UnregisterHotKey(Some(b), i32::from(k.0));
+            }
+        }
+        assert_eq!(register_keys(a, &keys, mods), 0, "recovered once released");
+        for k in keys {
+            unsafe {
+                let _ = UnregisterHotKey(Some(a), i32::from(k.0));
+            }
+        }
+        unsafe {
+            let _ = DestroyWindow(a);
+            let _ = DestroyWindow(b);
+        }
+    }
+
+    #[test]
+    fn test_volume_usages_and_headset_pairing() {
+        assert_eq!(volume_usage(0xE9), Some(VolumeKey::Up));
+        assert_eq!(volume_usage(0xEA), Some(VolumeKey::Down));
+        assert_eq!(volume_usage(0xE2), Some(VolumeKey::Mute));
+        assert_eq!(volume_usage(0xCD), None, "play / pause is not volume");
+        let mut h = HeadsetKeys::default();
+        // Headset only: a report, nothing beside it, one press when due
+        assert!(h.report(VolumeKey::Up, 1000));
+        assert_eq!(h.due(), Some(VolumeKey::Up));
+        assert_eq!(h.due(), None, "once");
+        // Keyboard, report first: its hotkey cancels the pending press
+        assert!(h.report(VolumeKey::Down, 2000));
+        h.hotkey(2005);
+        assert_eq!(h.due(), None, "applied by Oeca, not repeated");
+        // Keyboard, hotkey first: the report beside it is not a headset's
+        h.hotkey(3000);
+        assert!(!h.report(VolumeKey::Up, 3010));
+        assert_eq!(h.due(), None);
+        // A headset press later is its own
+        assert!(h.report(VolumeKey::Mute, 3500));
+        assert_eq!(h.due(), Some(VolumeKey::Mute));
+        // Repeated presses: each settles once
+        for t in [5000u64, 5200, 5400] {
+            assert!(h.report(VolumeKey::Up, t));
+            assert_eq!(h.due(), Some(VolumeKey::Up));
+        }
     }
 
     #[test]

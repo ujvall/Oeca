@@ -587,7 +587,7 @@ fn is_release_page(url: &str, version: (u64, u64, u64)) -> bool {
 pub fn open_release(release: &Release) {
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-    if !is_release_page(&release.url, release.version) {
+    if crate::data_dir::ISOLATED || !is_release_page(&release.url, release.version) {
         return;
     }
     let url: Vec<u16> = release.url.encode_utf16().chain([0]).collect();

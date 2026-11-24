@@ -1,0 +1,12 @@
+dtls 0.13.0 (crates.io, MIT OR Apache-2.0; LICENSE-MIT and LICENSE-APACHE here),
+vendored for Oeca Nearby. Oeca's changes (OECA-PATCHES.diff, marked `oeca:`):
+
+1. Security: X25519 is the only key-exchange curve (KEY_EXCHANGE_CURVES in
+   src/curve/named_curve.rs). P-256 and P-384 key exchange run through
+   crypto-bigint (RUSTSEC-2026-0387, a timing advisory) and either side could
+   pick one: as server it chose the client's first curve (src/flight/flight0.rs),
+   as client it took the server's choice (src/flight/flight3.rs). Now the
+   server chooses X25519 or fails, and the client refuses anything else. The
+   hellos list X25519 and P-256 (OFFERED_CURVES; flight1, flight3, flight4):
+   P-256 only because DTLS 1.2 ties the list to the ECDSA P-256 certificates,
+   which Chrome checks. Tested in src/curve/named_curve.rs, and against Chrome.

@@ -1,0 +1,637 @@
+/* oeca: Oeca Nearby's design system. Hardware you can hold: this browser's
+   identity is a brushed-metal card, the status is the black Oeca notch with
+   one ember dot (the only accent: live, on), controls are black capsules and
+   round buttons on a grey ground. Sheets float with concentric corners
+   (sheet 38, card 28, group 24, control round). Colors are tokens (RGB
+   triplets) so one class works in both themes: the system's choice, or
+   Settings' (`light` / `dark` on <html>). Type: General Sans (Oeca's
+   typeface, when the build has it) everywhere; without it, Hubot Sans
+   (bundled, OFL) for titles and the system face for the rest. */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* General Sans (ITF Free Font License): Oeca's typeface, present when the
+   build had it (nuxt.config.ts); otherwise the stacks fall back below */
+@font-face {
+  font-family: "General Sans";
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/general-sans-regular.otf") format("opentype");
+}
+@font-face {
+  font-family: "General Sans";
+  font-weight: 500;
+  font-display: swap;
+  src: url("/fonts/general-sans-medium.otf") format("opentype");
+}
+@font-face {
+  font-family: "General Sans";
+  font-weight: 600;
+  font-display: swap;
+  src: url("/fonts/general-sans-semibold.otf") format("opentype");
+}
+@font-face {
+  font-family: "Hubot Sans";
+  font-style: normal;
+  font-weight: 200 900;
+  font-display: swap;
+  src: url("/fonts/hubot-sans-latin.woff2") format("woff2-variations");
+  /* Digits come from the system face (Hubot's zero is slashed) */
+  unicode-range: U+0000-002F, U+003A-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329,
+    U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "Hubot Sans";
+  font-style: normal;
+  font-weight: 200 900;
+  font-display: swap;
+  src: url("/fonts/hubot-sans-latin-ext.woff2") format("woff2-variations");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329,
+    U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+:root {
+  /* A damped spring (about 2% overshoot), the one curve for motion that
+     answers a touch; --settle for things that leave */
+  --spring: linear(0, 0.006, 0.025 2.8%, 0.101 6.1%, 0.539 18.9%, 0.721 25.3%, 0.849 31.5%, 0.937 38.1%, 0.968 41.8%,
+      0.991 45.7%, 1.006 50.1%, 1.015 55%, 1.017 63.9%, 1.001);
+  --settle: cubic-bezier(0.32, 0.72, 0, 1);
+  --bg: 237 238 241;
+  --object: 255 255 255;
+  --object-2: 228 230 234;
+  --sheet: 247 247 248;
+  --group: 255 255 255;
+  --sunk: 238 239 242;
+  --ink: 12 13 15;
+  --ink-2: 95 99 108;
+  --ink-3: 145 149 158;
+  --line: 12 13 15;
+  --cta: 12 13 15;
+  --on-cta: 255 255 255;
+  --notch: 0 0 0;
+  --rim: 0 0 0;
+  --signal: 226 80 26;
+  --warn: 166 94 0;
+  --warn-bg: 255 242 217;
+  --bad: 214 48 37;
+  --bad-bg: 255 233 230;
+  --on-bad: 255 255 255;
+  --good: 22 142 78;
+  --good-bg: 221 246 231;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not(.light) {
+    --bg: 0 0 0;
+    --object: 26 26 29;
+    --object-2: 44 45 49;
+    --sheet: 22 22 24;
+    --group: 33 33 36;
+    --sunk: 44 44 48;
+    --ink: 245 245 247;
+    --ink-2: 160 163 171;
+    --ink-3: 122 125 133;
+    --line: 255 255 255;
+    --cta: 245 245 247;
+    --on-cta: 0 0 0;
+    --rim: 255 255 255;
+    --signal: 255 112 54;
+    --warn: 255 196 102;
+    --warn-bg: 54 39 14;
+    --bad: 255 114 104;
+    --bad-bg: 62 21 18;
+    --on-bad: 0 0 0;
+    --good: 96 214 140;
+    --good-bg: 16 48 31;
+    color-scheme: dark;
+  }
+}
+
+:root.dark {
+  --bg: 0 0 0;
+  --object: 26 26 29;
+  --object-2: 44 45 49;
+  --sheet: 22 22 24;
+  --group: 33 33 36;
+  --sunk: 44 44 48;
+  --ink: 245 245 247;
+  --ink-2: 160 163 171;
+  --ink-3: 122 125 133;
+  --line: 255 255 255;
+  --cta: 245 245 247;
+  --on-cta: 0 0 0;
+  --rim: 255 255 255;
+  --signal: 255 112 54;
+  --warn: 255 196 102;
+  --warn-bg: 54 39 14;
+  --bad: 255 114 104;
+  --bad-bg: 62 21 18;
+  --on-bad: 0 0 0;
+  --good: 96 214 140;
+  --good-bg: 16 48 31;
+  color-scheme: dark;
+}
+
+@layer base {
+  /* Native on a phone: no tap flash, no font inflation, no pull-to-refresh
+     or rubber band on the page itself (sheets contain their own scroll) */
+  html {
+    -webkit-text-size-adjust: 100%;
+    -webkit-tap-highlight-color: transparent;
+  }
+  html,
+  body {
+    overscroll-behavior: none;
+  }
+  /* Controls: click at once (no double-tap wait), and a long press selects
+     nothing; text that is content stays selectable */
+  button,
+  a,
+  [role="button"],
+  label {
+    touch-action: manipulation;
+  }
+  button,
+  [role="button"],
+  [role="radio"],
+  [role="switch"] {
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+  }
+  body {
+    @apply bg-bg text-ink antialiased;
+    font-family: "General Sans", -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI Variable Text", "Segoe UI", Roboto,
+      "Helvetica Neue", Arial, sans-serif;
+  }
+  :focus-visible {
+    outline: 2px solid rgb(var(--signal));
+    outline-offset: 2px;
+  }
+  input,
+  button {
+    font: inherit;
+  }
+}
+
+@layer components {
+  /* Titles and numbers */
+  .display {
+    font-family: "General Sans", "Hubot Sans", -apple-system, system-ui, sans-serif;
+    letter-spacing: -0.02em;
+  }
+  .num {
+    font-family: "General Sans", "Hubot Sans", -apple-system, system-ui, sans-serif;
+  }
+  /* Subtitles and captions: the title's face, regular, quiet */
+  .sub {
+    font-family: "General Sans", "Hubot Sans", -apple-system, system-ui, sans-serif;
+    @apply font-normal text-ink-3;
+  }
+
+  /* Controls: pills (52), round buttons (44), all press-down */
+  .press {
+    @apply disabled:cursor-not-allowed disabled:opacity-35;
+    transition: transform 0.5s var(--spring), background-color 0.15s ease, opacity 0.15s ease, box-shadow 0.15s ease;
+  }
+  .press:active:not(:disabled) {
+    transform: scale(0.96);
+    transition-duration: 0.1s;
+    transition-timing-function: ease-out;
+  }
+  .pill {
+    @apply press inline-flex h-[52px] select-none items-center justify-center gap-2 rounded-full px-6 text-[16px] font-semibold tracking-[-0.01em];
+  }
+  .pill-cta {
+    @apply pill bg-cta text-on-cta;
+  }
+  .pill-soft {
+    @apply pill bg-ink/[0.07] text-ink;
+  }
+  .pill-warn {
+    @apply pill bg-warn-bg text-warn;
+  }
+  .pill-bad {
+    @apply pill bg-bad text-on-bad;
+  }
+  .pill-sm {
+    @apply press inline-flex h-9 shrink-0 select-none items-center justify-center gap-1.5 rounded-full bg-ink/[0.07] px-4 text-[14px] font-semibold;
+  }
+  .round {
+    @apply press inline-flex size-11 shrink-0 items-center justify-center rounded-full bg-group text-ink;
+    box-shadow: 0 0 0 1px rgb(var(--line) / 0.06), 0 1px 2px rgb(0 0 0 / 0.06);
+  }
+
+  /* Objects on the page (device tiles, the facts): lifted, with a rim */
+  .object {
+    @apply bg-object;
+    box-shadow: 0 0 0 1px rgb(var(--line) / 0.06), 0 1px 1px rgb(0 0 0 / 0.04), 0 12px 28px -18px rgb(0 0 0 / 0.35);
+  }
+
+  /* Inside a sheet: one group (24), its rows separated by hairlines */
+  .list-group {
+    @apply overflow-hidden rounded-[24px] bg-group;
+  }
+  .list-group > * + * {
+    box-shadow: inset 0 1px 0 rgb(var(--line) / 0.07);
+  }
+  .row {
+    @apply flex min-h-[56px] w-full items-center gap-3 px-4 text-start;
+  }
+  /* A leading icon in a row: a squircle (concentric with the row), monochrome */
+  .tile-icon {
+    @apply flex size-8 shrink-0 items-center justify-center rounded-[10px] bg-ink/[0.07] text-ink;
+  }
+
+  .field {
+    @apply block h-[52px] w-full min-w-0 rounded-full bg-sunk px-5 text-[17px] text-ink outline-none transition-shadow placeholder:text-ink-3 disabled:opacity-50;
+  }
+  .field:focus {
+    box-shadow: inset 0 0 0 2px rgb(var(--signal));
+  }
+
+  /* A short callout: one line of what matters, with its glyph */
+  .callout {
+    @apply flex items-start gap-3 rounded-[20px] px-4 py-3.5 text-[15px] leading-snug;
+  }
+
+  /* This browser's identity: a brushed-metal card (a neutral material, the
+     page's one object) */
+  .metal {
+    color: #111214;
+    background: repeating-linear-gradient(90deg, rgb(255 255 255 / 0.025) 0 1px, transparent 1px 4px),
+      linear-gradient(118deg, #c6c9cf 0%, #f3f4f6 24%, #b3b7bf 46%, #e8eaed 63%, #a2a7b0 84%, #d3d6db 100%);
+    box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.75), inset 0 -1px 0 rgb(0 0 0 / 0.14), 0 0 0 1px rgb(0 0 0 / 0.08),
+      0 28px 44px -24px rgb(0 0 0 / 0.6);
+  }
+  .metal-ink {
+    text-shadow: 0 1px 0 rgb(255 255 255 / 0.45);
+  }
+
+  /* A tray for files: a quiet dot grid */
+  .dots {
+    background-image: radial-gradient(rgb(var(--ink) / 0.13) 1px, transparent 1.4px);
+    background-size: 14px 14px;
+    background-position: center;
+  }
+
+  /* Sticker icons: bold black glyphs with a white die-cut edge */
+  .sticker {
+    color: #111214;
+    filter: drop-shadow(2px 0 0 #fff) drop-shadow(-2px 0 0 #fff) drop-shadow(0 2px 0 #fff) drop-shadow(0 -2px 0 #fff)
+      drop-shadow(0 6px 8px rgb(0 0 0 / 0.18));
+  }
+
+  /* A black capsule of choices (one of them selected) */
+  .segmented {
+    @apply relative grid h-12 items-stretch gap-1 rounded-full bg-notch p-1 text-white;
+    box-shadow: 0 0 0 1px rgb(var(--rim) / 0.12);
+  }
+  .segment {
+    @apply press relative flex items-center justify-center gap-1.5 rounded-full text-[14px] font-medium text-white/55;
+  }
+  .segment[aria-checked="true"] {
+    @apply text-white;
+  }
+  .segment-thumb {
+    @apply pointer-events-none absolute inset-y-1 start-1 w-[calc((100%-1rem)/3)] rounded-full bg-white/[0.16];
+    box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.12);
+    transition: transform 0.55s var(--spring);
+  }
+
+  /* The notch */
+  .notch {
+    @apply bg-notch text-white;
+    box-shadow: 0 0 0 1px rgb(var(--rim) / 0.14), 0 10px 30px -14px rgb(0 0 0 / 0.55);
+  }
+
+  /* Progress (the native element: its value is an attribute, so the page sets
+     no inline style, which the policy refuses) */
+  .meter {
+    @apply block h-1 w-full overflow-hidden rounded-full;
+    appearance: none;
+    border: none;
+    background: rgb(var(--ink) / 0.1);
+    color: rgb(var(--ink));
+  }
+  .meter::-webkit-progress-bar {
+    background: rgb(var(--ink) / 0.1);
+    border-radius: 9999px;
+  }
+  .meter::-webkit-progress-value {
+    background: rgb(var(--ink));
+    border-radius: 9999px;
+    transition: width 0.3s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  .meter::-moz-progress-bar {
+    background: rgb(var(--ink));
+    border-radius: 9999px;
+  }
+  .meter.is-good::-webkit-progress-value {
+    background: rgb(var(--good));
+  }
+  .meter.is-good::-moz-progress-bar {
+    background: rgb(var(--good));
+  }
+}
+
+/* Sheets: float up from below (phones), rise in place (wide screens) */
+.sheet-enter-active,
+.sheet-leave-active {
+  transition: opacity 0.28s ease;
+}
+.sheet-enter-active .sheet-panel {
+  transition: transform 0.6s var(--spring);
+}
+.sheet-leave-active .sheet-panel {
+  transition: transform 0.26s cubic-bezier(0.4, 0, 1, 1);
+}
+.sheet-enter-from,
+.sheet-leave-to {
+  opacity: 0;
+}
+.sheet-enter-from .sheet-panel,
+.sheet-leave-to .sheet-panel {
+  transform: translateY(calc(100% + 24px));
+}
+@media (min-width: 640px) {
+  .sheet-enter-from .sheet-panel,
+  .sheet-leave-to .sheet-panel {
+    transform: translateY(28px) scale(0.97);
+  }
+}
+
+/* Pages inside a sheet (Settings): push forward, pop back */
+.push-enter-active,
+.push-leave-active,
+.pop-enter-active,
+.pop-leave-active {
+  transition: transform 0.38s cubic-bezier(0.32, 0.72, 0, 1), opacity 0.25s ease;
+}
+.push-leave-active,
+.pop-leave-active {
+  position: absolute;
+  inset: 0;
+}
+.push-enter-from {
+  transform: translateX(40%);
+  opacity: 0;
+}
+.push-leave-to {
+  transform: translateX(-20%);
+  opacity: 0;
+}
+.pop-enter-from {
+  transform: translateX(-20%);
+  opacity: 0;
+}
+.pop-leave-to {
+  transform: translateX(40%);
+  opacity: 0;
+}
+
+/* Swapping content in place (the notch label) */
+.swap-enter-active,
+.swap-leave-active {
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+.swap-leave-active {
+  position: absolute;
+}
+.swap-enter-from {
+  opacity: 0;
+  transform: translateY(6px);
+}
+.swap-leave-to {
+  opacity: 0;
+  transform: translateY(-6px);
+}
+
+/* Things that arrive (devices, files): settle into place */
+.arrive-enter-active {
+  transition: opacity 0.35s ease, transform 0.6s var(--spring);
+}
+/* A list arrives as a waterfall (CSS: the policy refuses inline delays) */
+.arrive-enter-active:nth-child(2) {
+  transition-delay: 50ms;
+}
+.arrive-enter-active:nth-child(3) {
+  transition-delay: 100ms;
+}
+.arrive-enter-active:nth-child(4) {
+  transition-delay: 150ms;
+}
+.arrive-enter-active:nth-child(5) {
+  transition-delay: 200ms;
+}
+.arrive-enter-active:nth-child(n + 6) {
+  transition-delay: 250ms;
+}
+.arrive-leave-active {
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+.arrive-enter-from {
+  opacity: 0;
+  transform: translateY(8px) scale(0.97);
+}
+.arrive-leave-to {
+  opacity: 0;
+  transform: scale(0.92);
+}
+.arrive-move {
+  transition: transform 0.5s var(--spring);
+}
+
+/* The page's one entrance: the card, then what follows it */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.98);
+  }
+}
+.rise {
+  animation: rise 0.8s var(--spring) backwards;
+}
+.rise-2 {
+  animation-delay: 90ms;
+}
+.rise-3 {
+  animation-delay: 180ms;
+}
+.rise-4 {
+  animation-delay: 270ms;
+}
+
+/* The metal card: it tilts toward the pointer (--rx/--ry, --mx/--my set by
+   IdentityCard through the CSSOM), a highlight follows, and light sweeps
+   across it now and then */
+.tilt {
+  perspective: 900px;
+}
+.tilt .metal {
+  transform: rotateX(var(--rx, 0deg)) rotateY(var(--ry, 0deg));
+  transition: transform 0.9s var(--spring);
+  will-change: transform;
+}
+.tilt.is-tracking .metal {
+  transition: transform 0.12s ease-out;
+}
+.metal::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: radial-gradient(circle at var(--mx, 30%) var(--my, 20%), rgb(255 255 255 / 0.55), transparent 55%);
+  mix-blend-mode: soft-light;
+  opacity: var(--glare, 0.6);
+  transition: opacity 0.4s ease;
+}
+.metal::before {
+  content: "";
+  position: absolute;
+  inset: -20% -60%;
+  pointer-events: none;
+  background: linear-gradient(105deg, transparent 40%, rgb(255 255 255 / 0.55) 50%, transparent 60%);
+  mix-blend-mode: overlay;
+  transform: translateX(-70%);
+  animation: sweep 7s cubic-bezier(0.45, 0, 0.2, 1) 1.2s infinite;
+}
+@keyframes sweep {
+  0% {
+    transform: translateX(-70%);
+  }
+  22%,
+  100% {
+    transform: translateX(70%);
+  }
+}
+
+/* Stickers drift a little, each on its own beat */
+@keyframes drift {
+  0%,
+  100% {
+    transform: translateY(0) rotate(0deg);
+  }
+  50% {
+    transform: translateY(-5px) rotate(-3deg);
+  }
+}
+.drift {
+  animation: drift 4.2s ease-in-out infinite;
+}
+.drift-2 {
+  animation-duration: 5s;
+  animation-delay: -1.4s;
+}
+.drift-3 {
+  animation-duration: 4.6s;
+  animation-delay: -2.6s;
+}
+
+/* Searching: the rings breathe out from you */
+@keyframes ring-out {
+  0% {
+    transform: scale(0.7);
+    opacity: 0.55;
+  }
+  100% {
+    transform: scale(1.9);
+    opacity: 0;
+  }
+}
+.ring-out {
+  animation: ring-out 3s cubic-bezier(0.2, 0.6, 0.3, 1) infinite;
+}
+.ring-out-2 {
+  animation-delay: 1s;
+}
+.ring-out-3 {
+  animation-delay: 2s;
+}
+@keyframes breathe {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.breathe {
+  animation: breathe 2.2s ease-in-out infinite;
+}
+.breathe-2 {
+  animation-delay: 0.35s;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.spin {
+  animation: spin 0.9s linear infinite;
+}
+/* A request that needs the user: the notch nudges, twice */
+@keyframes attention {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.05);
+  }
+}
+.attention {
+  animation: attention 0.5s cubic-bezier(0.22, 1, 0.36, 1) 2;
+}
+/* Live: one ring leaves the ember dot */
+@keyframes live {
+  0% {
+    transform: scale(1);
+    opacity: 0.6;
+  }
+  100% {
+    transform: scale(2.6);
+    opacity: 0;
+  }
+}
+.live {
+  animation: live 1.8s cubic-bezier(0.22, 1, 0.36, 1) infinite;
+}
+/* Completion: the check draws itself */
+@keyframes draw {
+  from {
+    stroke-dashoffset: 24;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+.draw {
+  stroke-dasharray: 24;
+  animation: draw 0.5s 0.15s cubic-bezier(0.65, 0, 0.35, 1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+  .ring-out,
+  .live,
+  .metal::before {
+    display: none;
+  }
+  .tilt .metal {
+    transform: none;
+  }
+  .breathe {
+    opacity: 1;
+  }
+}

@@ -108,13 +108,14 @@ pub struct CollapsedLayout {
     pub artwork_bounds: RectF,
 }
 
-/// Space selector capsules (Home, Music, Clipboard) in the expanded notch's
-/// top band, and the Settings icon at the band's right end.
+/// Space selector capsules (Home, Music, Clipboard, Nearby) in the expanded
+/// notch's top band, and the Settings icon at the band's right end.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpaceSelectorLayout {
     pub home: RectF,
     pub music: RectF,
     pub clipboard: RectF,
+    pub nearby: RectF,
     /// Settings icon (a band-height square at the right content edge).
     pub settings: RectF,
 }
@@ -125,6 +126,7 @@ impl SpaceSelectorLayout {
             OecaSpace::Home => self.home,
             OecaSpace::Music => self.music,
             OecaSpace::Clipboard | OecaSpace::Convert => self.clipboard,
+            OecaSpace::Nearby => self.nearby,
         }
     }
 
@@ -133,6 +135,7 @@ impl SpaceSelectorLayout {
             home: f(self.home),
             music: f(self.music),
             clipboard: f(self.clipboard),
+            nearby: f(self.nearby),
             settings: f(self.settings),
         }
     }
@@ -167,7 +170,7 @@ pub fn resolve_space_selector_in(
     let inset = match space {
         OecaSpace::Home => BASE_MEDIA_ARTWORK_INSET,
         OecaSpace::Music => BASE_MUSIC_SIDE_INSET,
-        OecaSpace::Clipboard => BASE_CLIPBOARD_SIDE_INSET,
+        OecaSpace::Clipboard | OecaSpace::Nearby => BASE_CLIPBOARD_SIDE_INSET,
         OecaSpace::Convert => crate::config::BASE_CONVERT_SIDE_INSET,
     };
     let left = (wall + px(inset)).round();
@@ -183,6 +186,7 @@ pub fn resolve_space_selector_in(
         home,
         music: pill(1.0),
         clipboard: pill(2.0),
+        nearby: pill(3.0),
         settings: RectF::new(right - h, top, right, top + h),
     })
 }
@@ -222,6 +226,7 @@ pub fn blended_selector(
         home: a.home.lerp(b.home, mix),
         music: a.music.lerp(b.music, mix),
         clipboard: a.clipboard.lerp(b.clipboard, mix),
+        nearby: a.nearby.lerp(b.nearby, mix),
         settings: a.settings.lerp(b.settings, mix),
     };
     Some((pills, ha.lerp(hb, mix)))
@@ -328,6 +333,8 @@ pub enum PanelHit {
     TimerMode(crate::timer::Mode),
     /// A control of the conversion workspace.
     Convert(ConvertHit),
+    /// A control of the Nearby space.
+    Nearby(NearbyHit),
 }
 
 impl PanelHit {
@@ -337,6 +344,200 @@ impl PanelHit {
     pub fn is_button(self) -> bool {
         !matches!(self, Self::Row(_) | Self::TimerScale | Self::TimerMode(_))
     }
+}
+
+/// What a click in the Nearby space lands on. Indices are of what is on
+/// show (`NearbyLayout`), resolved against the model that drew them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NearbyHit {
+    /// Off: opens Settings on its Nearby page.
+    OpenSettings,
+    /// A device row's Send button (index into the rows on show).
+    Send(usize),
+    /// A transfer card's button (index into its buttons, left to right).
+    Button(usize),
+}
+
+/// The Nearby space, in the Clipboard space's panel. The header band holds
+/// the status line right of the pills; the content area shows one of: device
+/// rows, a message (title, note, optional button), or a transfer card
+/// (title with the identity at its right, a note, two lines for the code,
+/// progress or files, then the summary left of the buttons).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NearbyLayout {
+    pub status: RectF,
+    pub area: RectF,
+    pub rows: [RectF; NEARBY_ROWS],
+    pub row_names: [RectF; NEARBY_ROWS],
+    pub row_details: [RectF; NEARBY_ROWS],
+    pub row_buttons: [RectF; NEARBY_ROWS],
+    pub message_title: RectF,
+    pub message_note: RectF,
+    pub message_button: RectF,
+    pub card_title: RectF,
+    pub card_identity: RectF,
+    pub card_note: RectF,
+    /// The code (both lines), the progress bar (first line) or file lines.
+    pub card_code: RectF,
+    pub card_lines: [RectF; 2],
+    pub card_progress: RectF,
+    /// Left of the buttons: the files' summary.
+    pub card_footer: RectF,
+    /// Right-aligned, the last at the right edge; `card_buttons(n)` picks.
+    pub buttons: [RectF; 3],
+    pub scale: f32,
+}
+
+/// Device rows on show at once (the list scrolls a row per wheel notch).
+pub const NEARBY_ROWS: usize = 4;
+
+/// What the Nearby space has on show, for hit testing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NearbyShown {
+    Off,
+    Nothing,
+    Peers(usize),
+    Card(usize),
+}
+
+impl NearbyLayout {
+    /// The rects of `n` buttons (n <= 3), left to right, at the right edge.
+    pub fn card_buttons(&self, n: usize) -> &[RectF] {
+        &self.buttons[3 - n.min(3)..]
+    }
+
+    /// What (x, y) lands on, for what is on show.
+    pub fn hit(&self, x: f32, y: f32, shown: NearbyShown) -> Option<NearbyHit> {
+        match shown {
+            NearbyShown::Off => self
+                .message_button
+                .contains(x, y)
+                .then_some(NearbyHit::OpenSettings),
+            NearbyShown::Nothing => None,
+            NearbyShown::Peers(rows) => (0..rows.min(NEARBY_ROWS))
+                .find(|i| self.row_buttons[*i].contains(x, y))
+                .map(NearbyHit::Send),
+            NearbyShown::Card(buttons) => self
+                .card_buttons(buttons)
+                .iter()
+                .position(|r| r.contains(x, y))
+                .map(NearbyHit::Button),
+        }
+    }
+}
+
+/// Resolves the Nearby space for expanded dimensions (None when collapsed).
+pub fn resolve_nearby_layout(dimensions: &NotchDimensions) -> Option<NearbyLayout> {
+    let ResolvedLayout::Expanded { components, .. } = resolve_layout(dimensions) else {
+        return None;
+    };
+    let sel = resolve_space_selector_in(dimensions, OecaSpace::Nearby)?;
+    let px = |v: f32| (v * dimensions.scale).round();
+    let wall = dimensions.shadow_margin_x + dimensions.curvature.top_transition_radius;
+    let inset = px(BASE_CLIPBOARD_SIDE_INSET);
+    let (left, right) = (
+        (wall + inset).round(),
+        (dimensions.width as f32 - wall - inset).round(),
+    );
+    let status = RectF::new(
+        sel.nearby.right + px(12.0),
+        sel.nearby.top,
+        sel.settings.left - px(8.0),
+        sel.nearby.bottom,
+    );
+    // The same content area as the Clipboard space
+    let top = components.content_bounds.top.round();
+    let n = CLIPBOARD_VISIBLE_ROWS as f32;
+    let area_h = n * px(BASE_CLIPBOARD_ROW_HEIGHT) + (n - 1.0) * px(BASE_CLIPBOARD_ROW_GAP);
+    let area = RectF::new(left, top, right, top + area_h);
+    // Device rows: whole-pixel rows filling the area
+    let gap = px(4.0);
+    let rh = ((area_h - (NEARBY_ROWS as f32 - 1.0) * gap) / NEARBY_ROWS as f32).floor();
+    let rows: [RectF; NEARBY_ROWS] = std::array::from_fn(|i| {
+        let t = top + i as f32 * (rh + gap);
+        RectF::new(left, t, right, t + rh)
+    });
+    let (bw, bh) = (px(96.0), px(24.0).min(rh));
+    let row_buttons = rows.map(|r| {
+        let t = (r.top + (r.height() - bh) / 2.0).round();
+        RectF::new(r.right - px(4.0) - bw, t, r.right - px(4.0), t + bh)
+    });
+    let name_w = px(170.0);
+    let row_names = rows.map(|r| {
+        RectF::new(
+            r.left + px(12.0),
+            r.top,
+            r.left + px(12.0) + name_w,
+            r.bottom,
+        )
+    });
+    let row_details = std::array::from_fn(|i| {
+        RectF::new(
+            row_names[i].right + px(8.0),
+            rows[i].top,
+            row_buttons[i].left - px(12.0),
+            rows[i].bottom,
+        )
+    });
+    // Message: title 20, note 18, gap 12, button 28, centred in the area
+    let (line, note, mgap, button) = (px(20.0), px(18.0), px(12.0), px(28.0));
+    let block_top = (top + (area_h - (line + note + mgap + button)) / 2.0).round();
+    let message_title = RectF::new(left, block_top, right, block_top + line);
+    let message_note = RectF::new(
+        left,
+        message_title.bottom,
+        right,
+        message_title.bottom + note,
+    );
+    let cx = ((left + right) / 2.0).round();
+    let mb = px(150.0);
+    let message_button = RectF::new(
+        cx - mb / 2.0,
+        message_note.bottom + mgap,
+        cx + mb / 2.0,
+        message_note.bottom + mgap + button,
+    );
+    // Card
+    let id_w = px(130.0);
+    let card_title = RectF::new(left, top, right - id_w - px(8.0), top + line);
+    let card_identity = RectF::new(right - id_w, top, right, top + line);
+    let card_note = RectF::new(left, card_title.bottom, right, card_title.bottom + note);
+    let lines_top = card_note.bottom + px(6.0);
+    let card_lines = std::array::from_fn(|i| {
+        let t = lines_top + i as f32 * note;
+        RectF::new(left, t, right, t + note)
+    });
+    let card_code = RectF::new(left, lines_top, right, lines_top + 2.0 * note);
+    let bar = px(4.0).max(2.0);
+    let bar_top = (lines_top + (note - bar) / 2.0).round();
+    let card_progress = RectF::new(left, bar_top, right, bar_top + bar);
+    let btop = area.bottom - button;
+    let (cbw, cgap) = (px(104.0), px(8.0));
+    let buttons = std::array::from_fn(|i| {
+        let l = right - (3 - i) as f32 * cbw - (2 - i) as f32 * cgap;
+        RectF::new(l, btop, l + cbw, area.bottom)
+    });
+    let card_footer = RectF::new(left, btop, buttons[0].left - cgap, area.bottom);
+    Some(NearbyLayout {
+        status,
+        area,
+        rows,
+        row_names,
+        row_details,
+        row_buttons,
+        message_title,
+        message_note,
+        message_button,
+        card_title,
+        card_identity,
+        card_note,
+        card_code,
+        card_lines,
+        card_progress,
+        card_footer,
+        buttons,
+        scale: dimensions.scale,
+    })
 }
 
 /// What a click in the conversion workspace lands on. Row indices are into the
@@ -886,6 +1087,8 @@ pub struct ConvertLayout {
     pub confirm_note: RectF,
     pub keep: RectF,
     pub discard: RectF,
+    /// Rows carry a check (two or more files; see `set_convert_shape`).
+    pub checks: bool,
     pub scale: f32,
 }
 
@@ -924,18 +1127,23 @@ impl ConvertLayout {
         let square = |left: f32, size: f32| {
             RectF::new(left, mid - size / 2.0, left + size, mid + size / 2.0)
         };
-        let pad = px(4.0);
+        let pad = px(12.0);
         let check = square(row.left + pad, px(BASE_CONVERT_CHECK_SIZE));
-        let icon = square(check.right + px(8.0), px(BASE_CONVERT_FILE_ICON));
+        let tile_left = if self.checks {
+            check.right + px(10.0)
+        } else {
+            row.left + pad
+        };
+        let icon = square(tile_left, px(BASE_CONVERT_FILE_TILE));
         let b = px(BASE_CONVERT_ROW_BUTTON);
-        let remove = square(row.right - pad - b, b);
+        let remove = square(row.right - px(8.0) - b, b);
         let action = RectF::new(
             remove.left - px(4.0) - px(46.0),
             mid - px(10.0),
             remove.left - px(4.0),
             mid + px(10.0),
         );
-        let text_left = icon.right + px(8.0);
+        let text_left = icon.right + px(10.0);
         let text_right = action.left - px(6.0);
         let line = px(15.0);
         let name = RectF::new(text_left, mid - line - px(2.0), text_right, mid - px(2.0));
@@ -981,7 +1189,7 @@ impl ConvertLayout {
         if let Some(i) = (0..live.chips.min(2)).find(|&i| self.chips[i].contains(px, py)) {
             return h(H::Chip(i));
         }
-        if self.select.contains(px, py) {
+        if self.checks && self.select.contains(px, py) {
             return h(H::SelectAll);
         }
         if self.primary.contains(px, py) {
@@ -1003,12 +1211,36 @@ impl ConvertLayout {
                 h(H::Save(i))
             } else if live.show[i] && p.action.contains(px, py) {
                 h(H::Show(i))
-            } else {
+            } else if self.checks {
                 h(H::Row(i))
+            } else {
+                // One file: nothing to tick, the row is not a toggle
+                None
             };
         }
         None
     }
+}
+
+thread_local! {
+    /// The conversion workspace's shape: how many file rows it shows (1..=3,
+    /// so the panel's height steps with the batch instead of leaving empty
+    /// rows) and whether rows carry a check (only with two or more files).
+    /// The UI thread sets it from the batch; elsewhere it stays the full
+    /// three-row shape.
+    static CONVERT_SHAPE: std::cell::Cell<(usize, bool)> =
+        const { std::cell::Cell::new((crate::convert_batch::VISIBLE_ROWS, true)) };
+}
+
+/// Sets the workspace's shape (rows clamped to 1..=3); true if it changed.
+pub fn set_convert_shape(rows: usize, checks: bool) -> bool {
+    let shape = (rows.clamp(1, crate::convert_batch::VISIBLE_ROWS), checks);
+    CONVERT_SHAPE.with(|c| c.replace(shape) != shape)
+}
+
+/// The workspace's shape (see `set_convert_shape`).
+pub fn convert_shape() -> (usize, bool) {
+    CONVERT_SHAPE.with(|c| c.get())
 }
 
 /// Resolves the conversion workspace for its expanded dimensions.
@@ -1025,42 +1257,27 @@ pub fn resolve_convert_layout(dimensions: &NotchDimensions) -> Option<ConvertLay
         (wall + inset).round(),
         (dimensions.width as f32 - wall - inset).round(),
     );
-    // Toolbar, in the header band
+    let (shown, checks) = convert_shape();
+    // Toolbar, in the header band: one row of 28 DIP controls on the band's
+    // centre line; the count is plain text at the left (clicking it selects
+    // all), the chips and the two icon buttons at the right
+    let c = px(BASE_CONVERT_CONTROL_HEIGHT);
+    let mid = ((band.top + band.bottom) / 2.0).round();
+    let row = |l: f32, r: f32| RectF::new(l, mid - c / 2.0, r, mid + c / 2.0);
     let check_size = px(BASE_CONVERT_CHECK_SIZE);
-    let mid = (band.top + band.bottom) / 2.0;
     let check = RectF::new(
         left,
         mid - check_size / 2.0,
         left + check_size,
         mid + check_size / 2.0,
     );
-    let count = RectF::new(
-        check.right + px(8.0),
-        band.top,
-        left + px(132.0),
-        band.bottom,
-    );
-    let select = RectF::new(left - px(4.0), band.top, count.right, band.bottom);
-    let close = RectF::new(right - band.height(), band.top, right, band.bottom);
-    let folder = RectF::new(
-        close.left - px(4.0) - band.height(),
-        band.top,
-        close.left - px(4.0),
-        band.bottom,
-    );
-    let chip_w = px(BASE_CONVERT_CHIP_WIDTH);
-    let chip1 = RectF::new(
-        folder.left - px(6.0) - chip_w,
-        band.top,
-        folder.left - px(6.0),
-        band.bottom,
-    );
-    let chip0 = RectF::new(
-        chip1.left - px(4.0) - chip_w,
-        band.top,
-        chip1.left - px(4.0),
-        band.bottom,
-    );
+    let count = row(left, left + px(132.0));
+    let select = count;
+    let close = row(right - c, right);
+    let folder = row(close.left - px(4.0) - c, close.left - px(4.0));
+    let [w0, w1] = BASE_CONVERT_CHIP_WIDTHS.map(px);
+    let chip1 = row(folder.left - px(8.0) - w1, folder.left - px(8.0));
+    let chip0 = row(chip1.left - px(6.0) - w0, chip1.left - px(6.0));
     // Rows
     let top = components.content_bounds.top.round();
     let (rh, rg) = (px(BASE_CONVERT_ROW_HEIGHT), px(BASE_CONVERT_ROW_GAP));
@@ -1068,7 +1285,7 @@ pub fn resolve_convert_layout(dimensions: &NotchDimensions) -> Option<ConvertLay
         let t = top + i as f32 * (rh + rg);
         RectF::new(left, t, right, t + rh)
     });
-    let rows_bottom = rows[rows.len() - 1].bottom;
+    let rows_bottom = rows[shown - 1].bottom;
     // Action bar
     let bar_top = rows_bottom + px(BASE_CONVERT_BAR_GAP);
     let bar_bottom = bar_top + px(BASE_CONVERT_BAR_HEIGHT);
@@ -1078,11 +1295,14 @@ pub fn resolve_convert_layout(dimensions: &NotchDimensions) -> Option<ConvertLay
         right,
         bar_bottom,
     );
-    let (pw, pg) = (px(BASE_CONVERT_PILL_WIDTH), px(BASE_CONVERT_PILL_GAP));
-    let pill_h = px(24.0);
-    let pill_top = bar_top + (px(BASE_CONVERT_BAR_HEIGHT) - pill_h) / 2.0;
+    // The format selector: segments side by side in one track as tall as the
+    // bar, each inset by the track's padding
+    let pw = px(BASE_CONVERT_PILL_WIDTH);
+    let pad = px(BASE_CONVERT_TRACK_PAD);
+    let pill_h = px(BASE_CONVERT_BAR_HEIGHT) - 2.0 * pad;
+    let pill_top = bar_top + pad;
     let pills = std::array::from_fn(|i| {
-        let l = left + i as f32 * (pw + pg);
+        let l = left + pad + i as f32 * pw;
         RectF::new(l, pill_top, l + pw, pill_top + pill_h)
     });
     let pills_area = RectF::new(left, bar_top, primary.left - px(8.0), bar_bottom);
@@ -1117,6 +1337,7 @@ pub fn resolve_convert_layout(dimensions: &NotchDimensions) -> Option<ConvertLay
         confirm_note,
         keep,
         discard,
+        checks,
         scale: dimensions.scale,
     })
 }
@@ -1433,7 +1654,8 @@ impl MediaShape {
 pub fn expanded_width(space: OecaSpace) -> f32 {
     match space {
         OecaSpace::Home => BASE_EXPANDED_WIDTH,
-        OecaSpace::Clipboard => BASE_CLIPBOARD_WIDTH,
+        // Nearby takes the Clipboard (panel) size: no geometry of its own
+        OecaSpace::Clipboard | OecaSpace::Nearby => BASE_CLIPBOARD_WIDTH,
         OecaSpace::Convert => crate::config::BASE_CONVERT_WIDTH,
         OecaSpace::Music => {
             // Side walls, the player column's inset on both sides, and the
@@ -1454,12 +1676,18 @@ pub fn space_dimensions(state: NotchState, dpi: u32, space: OecaSpace) -> NotchD
     match (state, space) {
         (NotchState::Expanded, OecaSpace::Music) => {
             let dims = dims.with_width_dip(expanded_width(space));
+            let r = crate::config::BASE_MUSIC_BOTTOM_CORNER_RADIUS * dims.scale;
             NotchDimensions {
                 height: music_height_px(&dims),
+                corner_radius: r,
+                curvature: crate::config::HardwareNotchCurvature {
+                    bottom_radius: r,
+                    ..dims.curvature
+                },
                 ..dims
             }
         }
-        (NotchState::Expanded, OecaSpace::Clipboard) => {
+        (NotchState::Expanded, OecaSpace::Clipboard | OecaSpace::Nearby) => {
             let dims = dims.with_width_dip(expanded_width(space));
             NotchDimensions {
                 height: clipboard_height_px(&dims),
@@ -1518,7 +1746,7 @@ fn clipboard_height_px(d: &NotchDimensions) -> i32 {
 fn convert_height_px(d: &NotchDimensions) -> i32 {
     use crate::config::*;
     let px = |v: f32| (v * d.scale).round();
-    let n = crate::convert_batch::VISIBLE_ROWS as f32;
+    let n = convert_shape().0 as f32;
     let rows = n * px(BASE_CONVERT_ROW_HEIGHT)
         + (n - 1.0) * px(BASE_CONVERT_ROW_GAP)
         + px(BASE_CONVERT_BAR_GAP)
@@ -1802,7 +2030,7 @@ fn resolve_music_layout(dimensions: &NotchDimensions, shape: MediaShape, c: Rect
 pub fn expanded_height(space: OecaSpace) -> f32 {
     match space {
         OecaSpace::Home => BASE_EXPANDED_HEIGHT,
-        OecaSpace::Clipboard => {
+        OecaSpace::Clipboard | OecaSpace::Nearby => {
             let n = CLIPBOARD_VISIBLE_ROWS as f32;
             BASE_EXPANDED_TOP_TRANSITION_HEIGHT
                 + crate::config::BASE_EXPANDED_HEADER_EXTRA
@@ -1814,7 +2042,7 @@ pub fn expanded_height(space: OecaSpace) -> f32 {
         }
         OecaSpace::Convert => {
             use crate::config::*;
-            let n = crate::convert_batch::VISIBLE_ROWS as f32;
+            let n = convert_shape().0 as f32;
             BASE_EXPANDED_TOP_TRANSITION_HEIGHT
                 + BASE_EXPANDED_HEADER_EXTRA
                 + BASE_EXPANDED_PADDING_V
@@ -2950,13 +3178,115 @@ mod tests {
     }
 
     #[test]
-    fn test_selector_shows_three_spaces_in_every_space() {
+    fn test_nearby_takes_the_panel_size_and_fits_at_all_dpis() {
+        let centre = |r: RectF| ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
+        let inside = |outer: RectF, r: RectF| {
+            r.left >= outer.left - 0.5
+                && r.right <= outer.right + 0.5
+                && r.top >= outer.top - 0.5
+                && r.bottom <= outer.bottom + 0.5
+        };
+        for dpi in ALL_DPIS {
+            let dims = space_dimensions(NotchState::Expanded, dpi, OecaSpace::Nearby);
+            let panel = space_dimensions(NotchState::Expanded, dpi, OecaSpace::Clipboard);
+            assert_eq!(
+                (dims.width, dims.height),
+                (panel.width, panel.height),
+                "no geometry of its own"
+            );
+            let l = resolve_nearby_layout(&dims).unwrap();
+            let sel = resolve_space_selector_in(&dims, OecaSpace::Nearby).unwrap();
+            assert!(l.status.left > sel.nearby.right && l.status.right < sel.settings.left);
+            let parts = l
+                .rows
+                .iter()
+                .chain(&l.row_names)
+                .chain(&l.row_details)
+                .chain(&l.row_buttons)
+                .chain(&l.buttons)
+                .chain(&l.card_lines)
+                .chain([
+                    &l.message_title,
+                    &l.message_note,
+                    &l.message_button,
+                    &l.card_title,
+                    &l.card_identity,
+                    &l.card_note,
+                    &l.card_code,
+                    &l.card_progress,
+                    &l.card_footer,
+                ]);
+            for r in parts {
+                assert!(inside(l.area, *r), "{r:?} in the area at {dpi}");
+                for (x, y) in corners(r) {
+                    assert!(dims.contains_point(x, y), "{r:?} in the notch at {dpi}");
+                }
+            }
+            for i in 0..NEARBY_ROWS {
+                assert!(inside(l.rows[i], l.row_buttons[i]));
+                assert!(l.row_names[i].right < l.row_details[i].left);
+                assert!(l.row_details[i].right < l.row_buttons[i].left);
+                if i > 0 {
+                    assert!(l.rows[i - 1].bottom <= l.rows[i].top);
+                }
+            }
+            // The card: title / identity side by side, lines above the buttons
+            assert!(l.card_title.right < l.card_identity.left);
+            assert!(l.card_note.bottom <= l.card_lines[0].top);
+            assert!(l.card_lines[1].bottom <= l.buttons[0].top);
+            assert!(l.card_footer.right < l.buttons[0].left);
+            assert!(
+                l.buttons[0].right < l.buttons[1].left && l.buttons[1].right < l.buttons[2].left
+            );
+            // Hits: only what is on show
+            let at = |r: RectF, shown| {
+                let (x, y) = centre(r);
+                l.hit(x, y, shown)
+            };
+            assert_eq!(
+                at(l.row_buttons[2], NearbyShown::Peers(3)),
+                Some(NearbyHit::Send(2))
+            );
+            assert_eq!(
+                at(l.row_buttons[3], NearbyShown::Peers(3)),
+                None,
+                "no fourth row"
+            );
+            assert_eq!(
+                at(l.rows[0], NearbyShown::Peers(3)),
+                None,
+                "only the button"
+            );
+            assert_eq!(
+                at(l.buttons[2], NearbyShown::Card(2)),
+                Some(NearbyHit::Button(1))
+            );
+            assert_eq!(
+                at(l.buttons[1], NearbyShown::Card(2)),
+                Some(NearbyHit::Button(0))
+            );
+            assert_eq!(at(l.buttons[0], NearbyShown::Card(2)), None);
+            assert_eq!(
+                at(l.message_button, NearbyShown::Off),
+                Some(NearbyHit::OpenSettings)
+            );
+            assert_eq!(at(l.message_button, NearbyShown::Nothing), None);
+            assert_eq!(
+                at(l.row_buttons[0], NearbyShown::Peers(0)),
+                None,
+                "no devices"
+            );
+        }
+    }
+
+    #[test]
+    fn test_selector_shows_every_space_in_every_space() {
         for dpi in ALL_DPIS {
             for active in OecaSpace::ALL {
                 let dims = space_dimensions(NotchState::Expanded, dpi, active);
                 let sel = resolve_space_selector_in(&dims, active).unwrap();
                 let pills = OecaSpace::ALL.map(|s| sel.bounds(s));
-                assert_eq!(pills.len(), 3);
+                assert_eq!(pills.len(), 4);
                 for (i, s) in OecaSpace::ALL.into_iter().enumerate() {
                     let r = pills[i];
                     for (x, y) in corners(&r) {
@@ -3119,13 +3449,15 @@ mod tests {
                 sel.music.right < sel.clipboard.left,
                 "then Clipboard at {dpi}"
             );
+            assert!(sel.clipboard.right < sel.nearby.left, "then Hop at {dpi}");
             assert!(!overlaps(&sel.home, &sel.music));
             assert!(!overlaps(&sel.music, &sel.clipboard));
+            assert!(!overlaps(&sel.clipboard, &sel.nearby));
             // Only the capsules are interactive
             let gap_x = (sel.home.right + sel.music.left) / 2.0;
             assert_eq!(sel.space_at(gap_x, sel.home.top + 2.0), None);
             assert_eq!(
-                sel.space_at(sel.clipboard.right + 5.0, sel.home.top + 2.0),
+                sel.space_at(sel.nearby.right + 5.0, sel.home.top + 2.0),
                 None
             );
             assert_eq!(
@@ -3218,11 +3550,11 @@ mod tests {
             384.0,
             "derived Music width: 48 walls + 32 insets + 64 labels + 240 track"
         );
-        // 14 shoulder + 12 pad + 40 cover row + 6 + 14 scrubber + 4 + 34 controls
-        // + 6 pad + 18 shadow margin + 10 header band
+        // 14 shoulder + 12 pad + 48 cover row + 9 + 14 scrubber + 9 + 34 controls
+        // + 15 pad + 18 shadow margin + 10 header band
         assert_eq!(
             expanded_height(OecaSpace::Music),
-            158.0,
+            183.0,
             "derived Music height"
         );
         for dpi in ALL_DPIS {
@@ -3236,10 +3568,10 @@ mod tests {
                 music.width < home.width && music.height > home.height,
                 "{dpi}"
             );
-            // Derived from the rows as they round at this DPI (~158 DIP)
+            // Derived from the rows as they round at this DPI (~183 DIP)
             let h = music.height as f32 / music.scale;
             assert!(
-                (157.0..=161.0).contains(&h),
+                (182.0..=186.0).contains(&h),
                 "Music height {h} DIP at {dpi}"
             );
             assert_eq!(music.shadow_margin_bottom, home.shadow_margin_bottom);
@@ -3247,11 +3579,15 @@ mod tests {
                 NotchDimensions {
                     width: home.width,
                     height: home.height,
+                    corner_radius: home.corner_radius,
+                    curvature: home.curvature,
                     ..music
                 },
                 home,
-                "only width/height differ at {dpi}"
+                "only width/height and the bottom radius differ at {dpi}"
             );
+            let r = crate::config::BASE_MUSIC_BOTTOM_CORNER_RADIUS * music.scale;
+            assert_eq!(music.curvature.bottom_radius, r, "{dpi}");
             for space in OecaSpace::ALL {
                 assert_eq!(
                     space_dimensions(NotchState::Collapsed, dpi, space),

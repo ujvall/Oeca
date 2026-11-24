@@ -101,8 +101,13 @@ pub struct TrayIcon {
 }
 
 impl TrayIcon {
-    /// Adds the icon (no-op if already shown); false if the shell refused.
+    /// Adds the icon (no-op if already shown); false if the shell refused,
+    /// and always in a test build (Explorer also remembers every icon's exe).
     pub fn add(&mut self, hwnd: HWND) -> bool {
+        !crate::data_dir::ISOLATED && self.show(hwnd)
+    }
+
+    fn show(&mut self, hwnd: HWND) -> bool {
         if self.shown.is_some() {
             return true;
         }
@@ -352,23 +357,24 @@ mod tests {
             unsafe { Shell_NotifyIconGetRect(&id) }.is_ok()
         };
         let mut tray = TrayIcon::default();
-        assert!(tray.add(owner), "shell accepted the icon");
+        assert!(tray.show(owner), "shell accepted the icon");
         assert!(tray.icon.is_some(), "embedded icon resource loaded");
         assert!(in_tray(), "icon present");
-        assert!(tray.add(owner), "adding again is a no-op");
+        assert!(tray.show(owner), "adding again is a no-op");
         // Explorer restart: the shell forgot the icon; restore re-adds it
         unsafe {
             let _ = Shell_NotifyIconW(NIM_DELETE, &base_data(owner));
         }
         assert!(!in_tray());
-        assert!(tray.restore(owner));
+        tray.shown = None; // as `restore` does
+        assert!(tray.show(owner));
         assert!(in_tray(), "icon restored");
         tray.remove();
         assert!(!in_tray(), "icon removed");
         tray.remove();
         // Dropping a shown icon removes it too
         let mut again = TrayIcon::default();
-        assert!(again.add(owner));
+        assert!(again.show(owner));
         drop(again);
         assert!(!in_tray(), "removed on drop");
         unsafe {

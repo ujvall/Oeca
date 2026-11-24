@@ -74,6 +74,25 @@ impl Item {
 
 /// The quality / background choices the option chips cycle through.
 pub const JPEG_QUALITIES: [u8; 4] = [95, 90, 80, 70];
+/// A row's file name is shortened in the middle past this many characters,
+/// so its extension stays in view (`Gemini_Generated_I…kq7.png`).
+pub const NAME_CHARS: usize = 22;
+
+/// `name` cut to at most `max` characters by an ellipsis in the middle:
+/// more of the start than of the end, and the end keeps the extension.
+pub fn middle_ellipsis(name: &str, max: usize) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() <= max || max < 5 {
+        return name.to_string();
+    }
+    let keep = max - 1;
+    let tail = (keep * 2 / 5).max(1);
+    let head = keep - tail;
+    let start: String = chars[..head].iter().collect();
+    let end: String = chars[chars.len() - tail..].iter().collect();
+    format!("{start}…{end}")
+}
+
 pub const BACKGROUNDS: [(&str, [u8; 3]); 3] = [
     ("White", [255, 255, 255]),
     ("Black", [0, 0, 0]),
@@ -547,12 +566,24 @@ impl Batch {
     pub fn chips(&self) -> Vec<String> {
         match self.target {
             Some(Format::Jpeg) => vec![
-                format!("Q {}", JPEG_QUALITIES[self.options.jpeg]),
+                format!("Quality {}", JPEG_QUALITIES[self.options.jpeg]),
                 BACKGROUNDS[self.options.background].0.to_string(),
             ],
             Some(Format::Ogg) => vec![VORBIS_QUALITIES[self.options.vorbis].0.to_string()],
             _ => Vec::new(),
         }
+    }
+
+    /// The background chip's colour (its swatch), while it shows.
+    pub fn background_rgb(&self) -> Option<[u8; 3]> {
+        (self.target == Some(Format::Jpeg)).then(|| BACKGROUNDS[self.options.background].1)
+    }
+
+    /// Every output format of the selection's family, in a fixed order: the
+    /// format selector shows all of them (so it keeps its width), and those
+    /// not in `formats()` (the file's own format) are shown disabled.
+    pub fn format_choices(&self) -> Vec<Format> {
+        convert::bulk_outputs(&self.selected_formats())
     }
 
     /// Files sharing a name with another row (their folder is shown too).
@@ -666,8 +697,13 @@ pub struct View {
     pub selected: usize,
     pub all_selected: bool,
     pub any_selectable: bool,
+    /// The format selector's options (`format_choices`), and which of them
+    /// can be chosen now (the others show disabled).
     pub formats: Vec<Format>,
+    pub offered: Vec<Format>,
     pub target: Option<Format>,
+    /// The background chip's swatch colour, while it shows.
+    pub background: Option<[u8; 3]>,
     /// Said in place of the format pills when there are none to offer.
     pub hint: Option<&'static str>,
     pub chips: Vec<String>,
@@ -682,8 +718,13 @@ impl Batch {
     pub fn view(&self) -> View {
         let selected = self.selected_count();
         let primary = self.primary();
-        let formats = self.formats();
-        let hint = if !formats.is_empty() {
+        let offered = self.formats();
+        let formats = if offered.is_empty() {
+            Vec::new()
+        } else {
+            self.format_choices()
+        };
+        let hint = if !offered.is_empty() {
             None
         } else if self.mixed() {
             Some("Convert images and audio separately")
@@ -708,7 +749,7 @@ impl Batch {
             .take(VISIBLE_ROWS)
             .map(|i| RowView {
                 id: i.id,
-                name: i.name.clone(),
+                name: middle_ellipsis(&i.name, NAME_CHARS),
                 detail: self.detail(i),
                 family: i.info.as_ref().map(|n| n.format.family()).or_else(|| {
                     crate::dragdrop::is_audio(&i.path)
@@ -736,7 +777,6 @@ impl Batch {
             .collect();
         let n = self.selectable_count();
         let primary_label = match primary {
-            Primary::Convert if n > 1 && selected == n => "Convert all".to_string(),
             Primary::Convert if selected > 1 => format!("Convert {selected}"),
             Primary::Convert => "Convert".to_string(),
             Primary::Cancel => "Cancel".to_string(),
@@ -747,6 +787,9 @@ impl Batch {
         let count_label = if self.running {
             let busy = self.items.iter().filter(|i| i.busy()).count();
             format!("Converting {busy}")
+        } else if self.items.len() == 1 {
+            // One file: nothing to choose between
+            "1 file".to_string()
         } else if selected == 0 {
             "None selected".to_string()
         } else {
@@ -762,7 +805,9 @@ impl Batch {
             all_selected: self.all_selected(),
             any_selectable: n > 0 && !self.running,
             formats,
+            offered,
             target: self.target,
+            background: self.background_rgb(),
             hint,
             chips: self.chips(),
             primary,
@@ -935,7 +980,7 @@ pub fn show_in_folder(path: &Path) {
 /// gone are touched, only their plain files are deleted (never a symlink or
 /// subfolder), and the folder itself goes only if that emptied it.
 pub fn cleanup_stale_staging() {
-    cleanup_stale_in(&std::env::temp_dir(), std::process::id());
+    cleanup_stale_in(&crate::data_dir::temp_dir(), std::process::id());
 }
 
 pub fn cleanup_stale_in(root: &Path, own_pid: u32) -> usize {
@@ -994,7 +1039,7 @@ fn process_alive(pid: u32) -> bool {
 
 /// The folder staged outputs live in until saved.
 pub fn staging_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("Oeca-convert-{}", std::process::id()))
+    crate::data_dir::temp_dir().join(format!("Oeca-convert-{}", std::process::id()))
 }
 
 #[cfg(test)]
@@ -1248,6 +1293,15 @@ mod tests {
     }
 
     #[test]
+    fn test_long_names_are_cut_in_the_middle_keeping_the_extension() {
+        let long = "Gemini_Generated_Image_kq7x9a2b4c.png";
+        let cut = middle_ellipsis(long, NAME_CHARS);
+        assert_eq!(cut.chars().count(), NAME_CHARS);
+        assert!(cut.starts_with("Gemini_Gen") && cut.ends_with(".png") && cut.contains('…'));
+        assert_eq!(middle_ellipsis("photo.png", NAME_CHARS), "photo.png");
+    }
+
+    #[test]
     fn test_the_view_labels_what_the_buttons_will_do() {
         let mut b = batch_of(&[
             ("a.png", Format::Png),
@@ -1258,7 +1312,7 @@ mod tests {
         assert_eq!(v.rows.len(), VISIBLE_ROWS);
         assert_eq!(
             (v.count_label.as_str(), v.primary_label.as_str()),
-            ("3 of 3 selected", "Convert all")
+            ("3 of 3 selected", "Convert 3")
         );
         assert!(v.all_selected && v.hint.is_none() && !v.formats.is_empty());
         b.toggle(0);
@@ -1353,7 +1407,7 @@ mod tests {
 
     #[test]
     fn test_stale_staging_cleanup_only_touches_dead_oeca_staging_folders() {
-        let root = std::env::temp_dir().join(format!("oeca-stale-{}", std::process::id()));
+        let root = crate::data_dir::temp_dir().join(format!("oeca-stale-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let own = std::process::id();
@@ -1449,7 +1503,7 @@ mod tests {
     #[test]
     fn test_bulk_run_with_matching_unsupported_and_failing_files_then_save_all() {
         use std::fs;
-        let dir = std::env::temp_dir().join(format!("oeca-bulk-{}", std::process::id()));
+        let dir = crate::data_dir::temp_dir().join(format!("oeca-bulk-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let img = image::RgbImage::from_pixel(8, 8, image::Rgb([200, 30, 30]));
