@@ -37,7 +37,7 @@ export function ReleaseTimeline({ releases }: { releases: Release[] }) {
       <nav aria-label="Releases" className="z-30 mb-10 lg:absolute lg:top-0 lg:bottom-6 lg:left-6 lg:mb-0">
         <div
           style={{ width: RAIL_W }}
-          className="flex flex-col overflow-hidden rounded-[1.75rem] bg-raised shadow-[inset_0_0_0_1px_var(--color-line-strong)] lg:sticky lg:top-[7.5rem] lg:h-[min(calc(100dvh-9rem),calc(100%-7.5rem))]"
+          className="flex flex-col overflow-hidden rounded-[1.25rem] bg-raised shadow-[inset_0_0_0_1px_var(--color-line-strong)] lg:sticky lg:top-[7.5rem] lg:h-[min(calc(100dvh-9rem),calc(100%-7.5rem))]"
         >
           <div data-lenis-prevent className="lg:min-h-0 lg:flex-1 lg:overflow-y-auto">
             <ol className="grid gap-0.5 p-3">
@@ -48,7 +48,7 @@ export function ReleaseTimeline({ releases }: { releases: Release[] }) {
                     <a
                       href={`#${releaseId(r)}`}
                       aria-current={on ? "location" : undefined}
-                      className={`group flex h-9 items-center gap-3 rounded-2xl px-3 whitespace-nowrap transition-colors ${on ? "bg-surface" :"hover:bg-white/[0.04]"}`}
+                      className={`group flex h-9 items-center gap-3 rounded-xl px-3 whitespace-nowrap transition-colors ${on ? "bg-surface" :"hover:bg-white/[0.04]"}`}
                     >
                       <span
                         aria-hidden
