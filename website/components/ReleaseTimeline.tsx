@@ -37,7 +37,7 @@ export function ReleaseTimeline({ releases }: { releases: Release[] }) {
       <nav aria-label="Releases" className="z-30 mb-10 lg:absolute lg:top-0 lg:bottom-6 lg:left-6 lg:mb-0">
         <div
           style={{ width: RAIL_W }}
-          className="flex flex-col overflow-hidden rounded-[1.75rem] bg-[#15121d] shadow-[inset_0_0_0_1px_rgb(167_139_250/0.18)] lg:sticky lg:top-[7.5rem] lg:h-[min(calc(100dvh-9rem),calc(100%-7.5rem))]"
+          className="flex flex-col overflow-hidden rounded-[1.75rem] bg-raised shadow-[inset_0_0_0_1px_var(--color-line-strong)] lg:sticky lg:top-[7.5rem] lg:h-[min(calc(100dvh-9rem),calc(100%-7.5rem))]"
         >
           <div data-lenis-prevent className="lg:min-h-0 lg:flex-1 lg:overflow-y-auto">
             <ol className="grid gap-0.5 p-3">
@@ -48,19 +48,21 @@ export function ReleaseTimeline({ releases }: { releases: Release[] }) {
                     <a
                       href={`#${releaseId(r)}`}
                       aria-current={on ? "location" : undefined}
-                      className={`group flex h-9 items-center gap-3 rounded-2xl px-3 whitespace-nowrap transition-colors ${on ? "bg-[#231d33]" : "hover:bg-white/[0.04]"}`}
+                      className={`group flex h-9 items-center gap-3 rounded-2xl px-3 whitespace-nowrap transition-colors ${on ? "bg-surface" :"hover:bg-white/[0.04]"}`}
                     >
                       <span
                         aria-hidden
                         className={`block h-px transition-[width,background-color] duration-300 ease-out motion-reduce:transition-none ${
-                          on ? "w-6 bg-[#a78bfa]" :"w-3 bg-paper/30 group-hover:bg-paper"
+                          on ? "w-6 bg-accent" : "w-3 bg-paper/30 group-hover:bg-paper"
                         }`}
                       />
                       <span
                         className={`t-mono ${on ? "text-paper" : "text-muted group-hover:text-paper"}`}
                       >
                         <span className="sr-only">Oeca </span>
-                        {r.version}                      </span>
+                        {r.version}
+                        {i === 0 && <span className="ml-2 text-[0.6875rem] text-[#a78bfa]">Latest</span>}
+                      </span>
                     </a>
                   </li>
                 );
