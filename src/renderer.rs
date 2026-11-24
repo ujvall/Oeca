@@ -13062,10 +13062,13 @@ mod tests {
         let _ = player_frame(&renderer, &dims, &c);
         renderer.step_scrub(16.0);
         let first = frac(played_to(&renderer));
-        assert!(
-            first > 0.5 && first < 0.75,
-            "the playhead moves with weight, not a jump ({first})"
-        );
+        // The glide needs system animations, which CI runners turn off (then it snaps)
+        if crate::window::is_client_animation_enabled() {
+            assert!(
+                first > 0.5 && first < 0.75,
+                "the playhead moves with weight, not a jump ({first})"
+            );
+        }
         settle(&renderer);
         assert!(
             (frac(played_to(&renderer)) - 0.8).abs() < 0.04,

@@ -4215,7 +4215,8 @@ a=sctp-port:5000
 
     #[test]
     fn sending_counts_a_file_once_towards_the_idle_deadline() {
-        let source = include_str!("nearby.rs");
+        // CI checks out with CRLF line endings
+        let source = include_str!("nearby.rs").replace("\r\n", "\n");
         let send =
             &source[source.find("    fn send(").unwrap()..source.find("    fn receive(").unwrap()];
         assert_eq!(
